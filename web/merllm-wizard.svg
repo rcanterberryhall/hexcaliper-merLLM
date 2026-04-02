@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" fill="none">
+
+  <!-- Outer decorative ring -->
+  <circle cx="100" cy="100" r="89" stroke="#7c3aed" stroke-width="1.2" fill="none" opacity="0.5"/>
+  <circle cx="100" cy="100" r="84" stroke="#a78bfa" stroke-width="0.6" fill="none"
+          stroke-dasharray="2.5 4" opacity="0.3"/>
+
+  <!-- Dark background -->
+  <circle cx="100" cy="100" r="76" fill="#0a0014" opacity="0.6"/>
+
+  <!-- ── Staff ── -->
+  <!-- Staff shaft — diagonal, lower-right quadrant -->
+  <line x1="108" y1="130" x2="148" y2="172"
+        stroke="#a78bfa" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/>
+  <!-- Staff shine -->
+  <line x1="107" y1="131" x2="147" y2="170"
+        stroke="#e9d5ff" stroke-width="1" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- Staff orb at top -->
+  <circle cx="106" cy="127" r="7.5" fill="#0a0014" stroke="#a78bfa" stroke-width="1.8"/>
+  <circle cx="106" cy="127" r="4.5" fill="#7c3aed" opacity="0.7"/>
+  <circle cx="104" cy="125" r="1.8" fill="#e9d5ff" opacity="0.6"/>
+
+  <!-- ── Wizard hat ── -->
+  <!-- Brim shadow / base -->
+  <ellipse cx="97" cy="142" rx="42" ry="9"
+           fill="#0a0014" stroke="#7c3aed" stroke-width="1.6" opacity="0.9"/>
+  <!-- Brim highlight -->
+  <path d="M57 141 Q97 134 137 141" stroke="#a78bfa" stroke-width="0.9" fill="none" opacity="0.5"/>
+
+  <!-- Hat cone -->
+  <path d="M57 142 L97 46 L137 142 Z"
+        fill="#1a0040" stroke="#7c3aed" stroke-width="1.8"/>
+
+  <!-- Hat cone inner shading -->
+  <path d="M68 142 L97 60 L126 142 Z" fill="#0a0014" opacity="0.4"/>
+
+  <!-- Band around hat base -->
+  <path d="M61 138 Q97 131 133 138 L137 142 Q97 136 57 142 Z"
+        fill="#7c3aed" opacity="0.55"/>
+  <!-- Band gold trim -->
+  <path d="M61 138 Q97 131 133 138" stroke="#a78bfa" stroke-width="1.1" fill="none" opacity="0.7"/>
+
+  <!-- ── Stars on hat ── -->
+  <!-- Large star -->
+  <g transform="translate(88,95)">
+    <polygon points="0,-7 1.6,-2.2 6.6,-2.2 2.8,0.8 4.3,5.8 0,3 -4.3,5.8 -2.8,0.8 -6.6,-2.2 -1.6,-2.2"
+             fill="#a78bfa" opacity="0.85"/>
+  </g>
+  <!-- Small star left -->
+  <g transform="translate(76,118)">
+    <polygon points="0,-4.5 1,−1.4 4.2,-1.4 1.7,0.5 2.7,3.7 0,1.9 -2.7,3.7 -1.7,0.5 -4.2,-1.4 -1,-1.4"
+             fill="#7c3aed" opacity="0.7"/>
+  </g>
+  <!-- Crescent moon on hat -->
+  <path d="M108 82 Q115 88 112 98 Q105 94 104 86 Q106 79 108 82 Z"
+        fill="#a78bfa" opacity="0.6"/>
+  <circle cx="112" cy="91" r="7" fill="#0a0014" opacity="0.85"/>
+
+  <!-- ── Sparkles / magic ── -->
+  <!-- Radiating from staff orb -->
+  <line x1="97"  y1="119" x2="91"  y2="110" stroke="#a78bfa" stroke-width="0.9" opacity="0.5" stroke-linecap="round"/>
+  <line x1="114" y1="119" x2="121" y2="110" stroke="#a78bfa" stroke-width="0.9" opacity="0.5" stroke-linecap="round"/>
+  <line x1="99"  y1="117" x2="97"  y2="106" stroke="#e9d5ff" stroke-width="0.7" opacity="0.35" stroke-linecap="round"/>
+
+  <!-- Small sparkle dots -->
+  <circle cx="91"  cy="108" r="1.5" fill="#e9d5ff" opacity="0.6"/>
+  <circle cx="122" cy="109" r="1.2" fill="#a78bfa" opacity="0.55"/>
+  <circle cx="97"  cy="104" r="1"   fill="#e9d5ff" opacity="0.45"/>
+
+  <!-- Hat tip star glow -->
+  <circle cx="97" cy="46" r="3" fill="#a78bfa" opacity="0.5"/>
+  <circle cx="97" cy="46" r="1.5" fill="#e9d5ff" opacity="0.7"/>
+
+</svg>
