@@ -22,6 +22,7 @@
   <button data-tab="terminal">SSH</button>
   <button data-tab="vnc">VNC</button>
   <button data-tab="settings">Settings</button>
+  <button data-tab="help">Help</button>
 </nav>
 
 <main>
@@ -225,6 +226,154 @@
   </div>
 
 </main>
+
+  <!-- ── Help ── -->
+  <div id="tab-help" class="tab">
+    <div class="grid-2">
+
+      <div class="card">
+        <h2>Day / Night Mode</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          <strong style="color:var(--text)">Day mode</strong> runs two Ollama instances simultaneously — one per GPU —
+          and routes requests by model name. The model assigned to GPU 1 (<code>DAY_MODEL_GPU1</code>) goes to that
+          instance; everything else goes to GPU 0.<br><br>
+          <strong style="color:var(--text)">Night mode</strong> activates automatically when both conditions are met:
+          no interactive requests for <code>INACTIVITY_TIMEOUT_MIN</code> minutes <em>and</em> the current time is
+          past the schedule hint (<code>BASE_DAY_END_LOCAL</code>, optionally adjusted for your timezone via GeoIP).
+          In night mode, merLLM switches to a dual-GPU Ollama instance and drains the batch queue with extended
+          context (<code>NIGHT_NUM_CTX</code>).<br><br>
+          Any interactive request during night mode triggers an immediate return to day mode.<br><br>
+          <strong style="color:var(--text)">Manual override</strong> — use the Day / Night / Auto buttons on the
+          Overview tab. Auto clears the override and returns to schedule-driven behaviour.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Batch Jobs</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          Batch jobs are generation requests that run during night mode with a larger context window.
+          They're useful for deep-analysis tasks that would block interactive use during the day.<br><br>
+          Submit a job from the <strong style="color:var(--text)">Batch Jobs</strong> tab or via the API:
+        </p>
+        <pre style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;margin-top:8px;overflow-x:auto">POST /api/batch/submit
+{
+  "source_app": "parsival",
+  "prompt": "Analyze...",
+  "model": "qwen3:32b"   // optional
+}
+
+GET  /api/batch/status/&lt;id&gt;
+GET  /api/batch/results/&lt;id&gt;
+POST /api/batch/&lt;id&gt;/cancel
+POST /api/batch/&lt;id&gt;/requeue</pre>
+        <p style="color:var(--muted);font-size:13px;margin-top:8px">
+          Jobs stay in <code>queued</code> status until night mode activates, then run sequentially.
+          Failed jobs can be requeued; cancelled jobs can only be resubmitted.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Ollama Proxy</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          merLLM is a drop-in <code>OLLAMA_BASE_URL</code> replacement. Point LanceLLMot and Parsival at
+          <code>http://&lt;host&gt;:11400</code> and they require no other changes.<br><br>
+          Supported endpoints:
+        </p>
+        <table style="margin-top:8px;font-size:12px">
+          <tr><td><code>POST /api/generate</code></td><td class="muted">Routed by model name</td></tr>
+          <tr><td><code>POST /api/chat</code></td><td class="muted">Same routing</td></tr>
+          <tr><td><code>POST /api/embeddings</code></td><td class="muted">Always GPU 0</td></tr>
+          <tr><td><code>GET  /api/tags</code></td><td class="muted">Model list (GPU 0)</td></tr>
+          <tr><td><code>POST /api/show</code></td><td class="muted">GPU 0</td></tr>
+          <tr><td><code>POST /api/pull</code></td><td class="muted">GPU 0 (shared store)</td></tr>
+          <tr><td><code>GET  /api/ps</code></td><td class="muted">Aggregated from both</td></tr>
+        </table>
+        <p style="color:var(--muted);font-size:13px;margin-top:8px">
+          Add <code>X-Priority: batch</code> to a request to place it in the low-priority queue
+          without submitting a formal batch job.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Settings</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          All settings can be changed live from the Settings tab — no restart required. Changes are
+          persisted in SQLite and applied immediately to the running process.<br><br>
+          Key settings:
+        </p>
+        <table style="margin-top:8px;font-size:12px">
+          <tr><td><code>ollama_0_url</code> / <code>ollama_1_url</code></td><td class="muted">Ollama instance URLs</td></tr>
+          <tr><td><code>day_model_gpu0</code> / <code>day_model_gpu1</code></td><td class="muted">Model routing in day mode</td></tr>
+          <tr><td><code>night_model</code></td><td class="muted">Model for batch jobs</td></tr>
+          <tr><td><code>night_num_ctx</code></td><td class="muted">Context size for batch jobs</td></tr>
+          <tr><td><code>inactivity_timeout_min</code></td><td class="muted">Idle time before night mode</td></tr>
+          <tr><td><code>base_day_end_local</code></td><td class="muted">Schedule hint (HH:MM local time)</td></tr>
+          <tr><td><code>geoip_offset_override</code></td><td class="muted">Force UTC offset (e.g. <code>-5</code>)</td></tr>
+          <tr><td><code>ollama_manage_via</code></td><td class="muted"><code>none</code> or <code>systemctl</code></td></tr>
+          <tr><td><code>drain_timeout_sec</code></td><td class="muted">Max wait before forced transition</td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>SSH Terminal</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          The SSH tab provides a full browser terminal via xterm.js. To enable it:<br><br>
+          1. Set <code>SSH_USER</code> in <code>docker-compose.yml</code> (or via Settings).<br>
+          2. Place your private key at <code>./data/ssh_key</code> on the host
+             (mounted as <code>/data/ssh_key</code> inside the container).<br>
+          3. The key must be accepted by the target host's <code>authorized_keys</code>.<br><br>
+          The connection is authenticated by SSH key — no passwords are stored or transmitted.
+          Access is gated by Cloudflare Access at the nginx layer when deployed behind a tunnel.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>VNC Viewer</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          The VNC tab proxies a WebSocket connection to the configured VNC server. To use it:<br><br>
+          1. Start a VNC server on the host (e.g. TigerVNC or x11vnc).<br>
+          2. Set <code>VNC_HOST</code> and <code>VNC_PORT</code> in settings if different from defaults
+             (<code>host.docker.internal:5900</code>).<br>
+          3. noVNC's <code>rfb.js</code> must be available — either served from the host or loaded via CDN.
+             Without it the viewer shows a placeholder message.<br><br>
+          merLLM acts only as a WebSocket-to-TCP proxy; it does not start or manage the VNC server.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>GeoIP Scheduling</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          When a MaxMind GeoLite2-City database is present at <code>GEOIP_DB_PATH</code>, merLLM uses
+          the client's IP address to determine their local timezone and adjusts the day-end schedule
+          hint accordingly.<br><br>
+          Without the database, <code>BASE_DAY_END_LOCAL</code> is used as-is with no adjustment.<br><br>
+          To override the timezone lookup entirely, set <code>GEOIP_OFFSET_OVERRIDE</code> to a UTC
+          offset (e.g. <code>-5</code> for EST, <code>5.5</code> for IST).<br><br>
+          The effective adjusted schedule is shown in the Overview tab status area and is also available
+          from <code>GET /api/merllm/geoip</code>.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>API Reference</h2>
+        <table style="font-size:12px">
+          <tr><th>Endpoint</th><th>Description</th></tr>
+          <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">Mode, GPUs, queue, health</td></tr>
+          <tr><td><code>POST /api/merllm/mode</code></td><td class="muted">Set day/night/auto</td></tr>
+          <tr><td><code>GET  /api/merllm/settings</code></td><td class="muted">View current config</td></tr>
+          <tr><td><code>POST /api/merllm/settings</code></td><td class="muted">Update config live</td></tr>
+          <tr><td><code>GET  /api/merllm/metrics/current</code></td><td class="muted">Latest system snapshot</td></tr>
+          <tr><td><code>GET  /api/merllm/metrics/history</code></td><td class="muted">Time-series data</td></tr>
+          <tr><td><code>GET  /api/merllm/diagnostics</code></td><td class="muted">Connectivity + container health</td></tr>
+          <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines</td></tr>
+          <tr><td><code>GET  /api/merllm/transitions</code></td><td class="muted">Mode transition history</td></tr>
+          <tr><td><code>GET  /api/merllm/geoip</code></td><td class="muted">GeoIP schedule info</td></tr>
+          <tr><td><code>GET  /health</code></td><td class="muted">Liveness check</td></tr>
+        </table>
+      </div>
+
+    </div>
+  </div>
 
 <!-- xterm.js from CDN -->
 <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
