@@ -1,0 +1,19 @@
+[Unit]
+Description=Ollama Service (Night — dual GPU, hexcaliper)
+After=network-online.target
+# Must not run at the same time as the per-GPU day instances.
+Conflicts=ollama-gpu0.service ollama-gpu1.service
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=/home/lobulus/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="CUDA_VISIBLE_DEVICES=0,1"
+Environment="OLLAMA_MODELS=/usr/share/ollama/.ollama/models"
+
+[Install]
+WantedBy=default.target
