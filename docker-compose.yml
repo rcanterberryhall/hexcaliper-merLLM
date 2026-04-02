@@ -1,0 +1,82 @@
+services:
+
+  merllm-api:
+    build: ./api
+    container_name: merllm-api
+    restart: unless-stopped
+    environment:
+      # ── Ollama instances (GPU-pinned systemd services on host) ────────────
+      OLLAMA_0_URL: "http://host.docker.internal:11434"
+      OLLAMA_1_URL: "http://host.docker.internal:11435"
+
+      # ── Model assignment ──────────────────────────────────────────────────
+      DAY_MODEL_GPU0: "qwen3:32b"
+      DAY_MODEL_GPU1: "qwen3:30b-a3b"
+      NIGHT_MODEL:    "qwen3:32b"
+      NIGHT_NUM_CTX:  "32768"
+
+      # ── Scheduling ────────────────────────────────────────────────────────
+      INACTIVITY_TIMEOUT_MIN: "90"
+      BASE_DAY_END_LOCAL:     "22:00"
+
+      # ── GeoIP ─────────────────────────────────────────────────────────────
+      # Download GeoLite2-City.mmdb from MaxMind and place in ./data/
+      GEOIP_DB_PATH: "/data/GeoLite2-City.mmdb"
+      # GEOIP_OFFSET_OVERRIDE: "-5"   # uncomment to force a UTC offset
+
+      # ── Ollama lifecycle ──────────────────────────────────────────────────
+      # Set to "systemctl" to allow merLLM to start/stop ollama-gpu* services.
+      # Requires the Docker socket mounted and appropriate host permissions.
+      OLLAMA_MANAGE_VIA: "none"
+      GPU0_SERVICE:   "ollama-gpu0"
+      GPU1_SERVICE:   "ollama-gpu1"
+      NIGHT_SERVICE:  "ollama-night"
+      DRAIN_TIMEOUT_SEC: "300"
+
+      # ── Storage ───────────────────────────────────────────────────────────
+      DB_PATH:              "/data/merllm.db"
+      METRICS_RETAIN_DAYS:  "7"
+      METRICS_INTERVAL_SEC: "10"
+
+      # ── SSH proxy (optional) ──────────────────────────────────────────────
+      SSH_HOST:     "host.docker.internal"
+      SSH_PORT:     "22"
+      SSH_USER:     ""        # set to your username to enable SSH terminal
+      SSH_KEY_PATH: "/data/ssh_key"
+
+      # ── VNC proxy (optional) ──────────────────────────────────────────────
+      VNC_HOST: "host.docker.internal"
+      VNC_PORT: "5900"
+
+    volumes:
+      - merllm-data:/data
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - merllm-net
+
+    expose:
+      - "11400"
+
+  merllm-nginx:
+    image: nginx:1.27-alpine
+    container_name: merllm-nginx
+    restart: unless-stopped
+    ports:
+      - "11400:11400"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./web:/usr/share/nginx/html/web:ro
+    depends_on:
+      - merllm-api
+    networks:
+      - merllm-net
+
+volumes:
+  merllm-data:
+
+networks:
+  merllm-net:
+    driver: bridge

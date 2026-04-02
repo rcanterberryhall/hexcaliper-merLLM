@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>merLLM</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header>
+  <h1>merLLM</h1>
+  <span id="mode-badge" class="badge-day">day</span>
+  <span id="refresh-indicator">refreshing&hellip;</span>
+</header>
+
+<nav>
+  <button class="active" data-tab="overview">Overview</button>
+  <button data-tab="batch">Batch Jobs</button>
+  <button data-tab="metrics">Metrics</button>
+  <button data-tab="logs">Logs</button>
+  <button data-tab="terminal">SSH</button>
+  <button data-tab="vnc">VNC</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+
+<main>
+  <!-- Warnings banner -->
+  <div id="warnings"></div>
+
+  <!-- ── Overview ── -->
+  <div id="tab-overview" class="tab active">
+    <div class="grid-3">
+
+      <div class="card">
+        <h2>Mode</h2>
+        <div class="stat-row">
+          <span class="stat-label">Current</span>
+          <span id="ov-mode" class="stat-value">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Override</span>
+          <span id="ov-override" class="stat-value muted">none</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Last activity</span>
+          <span id="ov-activity" class="stat-value">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Inactivity timeout</span>
+          <span id="ov-timeout" class="stat-value">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Queue depth</span>
+          <span id="ov-queue" class="stat-value">—</span>
+        </div>
+        <div class="mt" id="mode-controls">
+          <button class="btn primary" onclick="setMode('day')">Day</button>
+          <button class="btn" style="color:#a78bfa;border-color:#7c3aed" onclick="setMode('night')">Night</button>
+          <button class="btn" onclick="setMode('auto')">Auto</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Ollama Instances</h2>
+        <div id="ollama-status">Loading&hellip;</div>
+        <div class="mt">
+          <h2>Batch Jobs</h2>
+          <div id="batch-counts"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>GPUs</h2>
+        <div id="gpu-status">Loading&hellip;</div>
+      </div>
+
+      <div class="card span-2">
+        <h2>Recent Transitions</h2>
+        <div id="transitions-list"></div>
+      </div>
+
+      <div class="card">
+        <h2>System</h2>
+        <div id="system-metrics">Loading&hellip;</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Batch Jobs ── -->
+  <div id="tab-batch" class="tab">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Submit Job</h2>
+        <div class="batch-form">
+          <input id="b-source" type="text" placeholder="Source app (e.g. lancellmot)" value="merllm-ui" />
+          <input id="b-model" type="text" placeholder="Model (leave blank for default night model)" />
+          <textarea id="b-prompt" placeholder="Prompt text…"></textarea>
+          <div>
+            <button class="btn primary" onclick="submitBatchJob()">Submit</button>
+          </div>
+          <div id="b-result" class="muted" style="font-size:12px"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Job Queue</h2>
+        <div style="margin-bottom:8px;display:flex;gap:8px">
+          <button class="btn" onclick="loadBatchJobs()">Refresh</button>
+        </div>
+        <div id="batch-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>Source</th><th>Model</th><th>Status</th><th>Submitted</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="batch-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Metrics ── -->
+  <div id="tab-metrics" class="tab">
+    <div class="grid-3">
+
+      <div class="card">
+        <h2>CPU</h2>
+        <div id="cpu-metrics"></div>
+      </div>
+
+      <div class="card">
+        <h2>Memory</h2>
+        <div id="mem-metrics"></div>
+      </div>
+
+      <div class="card">
+        <h2>Disk</h2>
+        <div id="disk-metrics"></div>
+      </div>
+
+      <div class="card span-2">
+        <h2>GPU 0</h2>
+        <div id="gpu0-metrics"></div>
+      </div>
+
+      <div class="card">
+        <h2>GPU 1</h2>
+        <div id="gpu1-metrics"></div>
+      </div>
+
+      <div class="card span-2">
+        <h2>Network</h2>
+        <div id="net-metrics"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Logs ── -->
+  <div id="tab-logs" class="tab">
+    <div class="card">
+      <h2>Service Logs</h2>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <select id="log-service">
+          <option value="ollama-gpu0">ollama-gpu0</option>
+          <option value="ollama-gpu1">ollama-gpu1</option>
+          <option value="ollama-night">ollama-night</option>
+          <option value="hexcaliper-api">hexcaliper-api</option>
+          <option value="hexcaliper-squire-page-api">hexcaliper-squire-page-api</option>
+        </select>
+        <input id="log-lines" type="number" value="100" min="10" max="500" style="width:80px;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" />
+        <button class="btn primary" onclick="fetchLogs()">Fetch</button>
+      </div>
+      <pre id="log-output" class="log-output">Select a service and click Fetch.</pre>
+    </div>
+  </div>
+
+  <!-- ── SSH Terminal ── -->
+  <div id="tab-terminal" class="tab">
+    <div class="card">
+      <h2>SSH Terminal</h2>
+      <p class="muted" style="margin-bottom:12px;font-size:12px">
+        Connects to the host via WebSocket SSH. Requires SSH_USER and SSH_KEY_PATH configured.
+      </p>
+      <div style="margin-bottom:10px;display:flex;gap:8px">
+        <button class="btn primary" onclick="connectSSH()">Connect</button>
+        <button class="btn" onclick="disconnectSSH()">Disconnect</button>
+      </div>
+      <div id="terminal-container"></div>
+    </div>
+  </div>
+
+  <!-- ── VNC ── -->
+  <div id="tab-vnc" class="tab">
+    <div class="card">
+      <h2>VNC Viewer</h2>
+      <p class="muted" style="margin-bottom:12px;font-size:12px">
+        Browser-based VNC via noVNC. Requires VNC_HOST and VNC_PORT configured on the server
+        and a running VNC server (e.g. TigerVNC).
+      </p>
+      <div style="margin-bottom:10px;display:flex;gap:8px">
+        <button class="btn primary" onclick="connectVNC()">Connect</button>
+        <button class="btn" onclick="disconnectVNC()">Disconnect</button>
+      </div>
+      <div id="vnc-container">
+        <span class="muted">VNC not connected</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Settings ── -->
+  <div id="tab-settings" class="tab">
+    <div class="card">
+      <h2>Configuration</h2>
+      <div class="settings-form" id="settings-form"></div>
+      <div class="settings-actions">
+        <button class="btn primary" onclick="saveSettings()">Save</button>
+        <button class="btn" onclick="loadSettings()">Reset</button>
+        <span id="settings-msg" class="muted" style="font-size:12px;align-self:center"></span>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- xterm.js from CDN -->
+<link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+psutil==6.1.1
+pynvml==11.5.0
+docker==7.1.0
+geoip2==4.8.1
+asyncssh==2.18.0
+python-multipart==0.0.20
+pytest==9.0.2
+pytest-asyncio==0.25.3
+httpx==0.28.1
