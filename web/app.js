@@ -29,11 +29,14 @@ async function post(path, body) {
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 
-let _pollTimer = null;
+let _pollTimer     = null;
+let _activityTimer = null;
 
 function startPolling() {
   refresh();
   _pollTimer = setInterval(refresh, 10000);
+  refreshActivity();
+  _activityTimer = setInterval(refreshActivity, 2000);
 }
 
 async function refresh() {
@@ -56,6 +59,16 @@ async function refresh() {
   if (document.getElementById("tab-fans").classList.contains("active")) {
     loadFans().catch(() => {});
   }
+}
+
+async function refreshActivity() {
+  // Only poll when Overview tab is visible
+  if (!document.getElementById("tab-overview").classList.contains("active")) return;
+  try {
+    const a = await api("/api/merllm/activity");
+    renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
+    renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
+  } catch (_) {}
 }
 
 // ── Overview ──────────────────────────────────────────────────────────────────
@@ -87,16 +100,20 @@ function renderOverview(s) {
   set("ov-timeout", (s.inactivity_timeout_min || "—") + " min");
   set("ov-queue", s.queue ? s.queue.total : "—");
 
-  // Ollama
-  const ol = document.getElementById("ollama-status");
+  // Ollama health dots (just up/down; detail comes from refreshActivity)
   if (s.ollama) {
-    ol.innerHTML = Object.entries(s.ollama).map(([k, v]) =>
-      `<div class="ollama-row">
-         <span class="dot ${v.ok ? "dot-ok" : "dot-fail"}"></span>
-         <span>${esc(k)}</span>
-         <span class="muted" style="font-size:11px;margin-left:auto">${esc(v.url)}</span>
-       </div>`
-    ).join("");
+    for (const [key, v] of Object.entries(s.ollama)) {
+      const el = document.getElementById(`ollama-${key}`);
+      if (el && el.dataset.activityReady !== "1") {
+        // Show minimal health dot until first activity poll arrives
+        el.innerHTML =
+          `<div class="instance-header">
+             <span class="dot ${v.ok ? "dot-ok" : "dot-fail"}"></span>
+             <span class="instance-label">${esc(key.replace("gpu", "GPU "))}</span>
+             <span class="muted instance-url">${esc(v.url)}</span>
+           </div>`;
+      }
+    }
   }
 
   // Batch counts
@@ -156,6 +173,63 @@ function gpuCard(i, g) {
         <span class="stat-value">${g.power_w != null ? g.power_w + " W" : "—"}</span>
       </div>
     </div>`;
+}
+
+function renderInstanceCard(elId, label, inst) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.dataset.activityReady = "1";
+
+  const reachable = inst.loaded !== null && inst.loaded !== undefined;
+  const dot = reachable ? "dot-ok" : "dot-fail";
+
+  // Loaded models section
+  let loadedHtml = "";
+  if (!reachable) {
+    loadedHtml = `<span class="muted instance-idle">unreachable</span>`;
+  } else if (inst.loaded && inst.loaded.length) {
+    loadedHtml = inst.loaded.map(m =>
+      `<div class="instance-model">
+         <span class="instance-model-name">${esc(m.name)}</span>
+         <span class="muted">${m.size_vram_mb ? m.size_vram_mb.toLocaleString() + " MB VRAM" : ""}</span>
+       </div>`
+    ).join("");
+  } else {
+    loadedHtml = `<span class="muted instance-idle">no model loaded</span>`;
+  }
+
+  // Active request section
+  let activeHtml = "";
+  const act = inst.active;
+  if (act) {
+    const endpoint  = act.endpoint.replace("/api/", "");
+    const elapsed   = act.elapsed_sec;
+    const elapsedFmt = elapsed >= 60
+      ? `${Math.floor(elapsed / 60)}m ${Math.round(elapsed % 60)}s`
+      : `${elapsed}s`;
+    const chunksLabel = endpoint === "embeddings"
+      ? ""
+      : `<span class="instance-chunks">${act.chunks} chunks</span>`;
+    activeHtml = `
+      <div class="instance-active">
+        <span class="instance-active-dot"></span>
+        <span class="instance-active-model">${esc(act.model)}</span>
+        <span class="instance-active-ep muted">${esc(endpoint)}</span>
+        <span class="instance-elapsed muted">${elapsedFmt}</span>
+        ${chunksLabel}
+      </div>`;
+  } else if (reachable) {
+    activeHtml = `<span class="muted instance-idle">idle</span>`;
+  }
+
+  el.innerHTML = `
+    <div class="instance-header">
+      <span class="dot ${dot}"></span>
+      <span class="instance-label">${esc(label)}</span>
+      <span class="muted instance-url">${esc(inst.url)}</span>
+    </div>
+    <div class="instance-loaded">${loadedHtml}</div>
+    ${activeHtml ? `<div class="instance-active-wrap">${activeHtml}</div>` : ""}`;
 }
 
 // ── Mode control ──────────────────────────────────────────────────────────────

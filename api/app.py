@@ -9,6 +9,7 @@ Additional endpoints:
   GET/POST  /api/merllm/status    — current mode, GPU layout, queue depth
   POST      /api/merllm/mode      — manual override (day/night/auto)
   GET/POST  /api/merllm/settings  — view/update configuration
+  GET       /api/merllm/activity  — live per-instance request state + loaded models
   POST      /api/batch/submit     — queue a job for night-mode processing
   GET       /api/batch/status     — poll job status
   GET       /api/batch/results/{id} — retrieve completed output
@@ -38,6 +39,46 @@ import geoip
 import metrics
 import mode_manager
 import queue_manager
+
+# ── Per-instance activity tracking ───────────────────────────────────────────
+# Keyed by "gpu0" / "gpu1". Each entry is either None (idle) or a dict with:
+#   model, endpoint, started_at (epoch float), chunks (NDJSON lines received).
+# Single-threaded asyncio — no lock needed.
+_activity: dict[str, dict | None] = {"gpu0": None, "gpu1": None}
+
+
+def _gpu_label(url: str) -> str:
+    return "gpu0" if url == config.OLLAMA_0_URL else "gpu1"
+
+
+def _activity_set(url: str, model: str, endpoint: str) -> None:
+    _activity[_gpu_label(url)] = {
+        "model":      model,
+        "endpoint":   endpoint,
+        "started_at": time.time(),
+        "chunks":     0,
+    }
+
+
+def _activity_inc(url: str) -> None:
+    entry = _activity.get(_gpu_label(url))
+    if entry is not None:
+        entry["chunks"] += 1
+
+
+def _activity_clear(url: str) -> None:
+    _activity[_gpu_label(url)] = None
+
+
+def _activity_snapshot() -> dict:
+    now = time.time()
+    result = {}
+    for key, entry in _activity.items():
+        if entry is None:
+            result[key] = None
+        else:
+            result[key] = {**entry, "elapsed_sec": round(now - entry["started_at"], 1)}
+    return result
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 
@@ -91,23 +132,37 @@ def _priority(request: Request) -> int:
 
 
 async def _stream_proxy(target: str, path: str, body: dict) -> StreamingResponse:
-    """Stream an Ollama response through to the caller."""
+    """Stream an Ollama response, tracking activity per instance."""
+    model = body.get("model", "")
+    _activity_set(target, model, path)
+
     async def generate():
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
-            async with client.stream("POST", f"{target}{path}", json=body) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+                async with client.stream("POST", f"{target}{path}", json=body) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        # Each newline-delimited JSON object = one token/chunk
+                        if b"\n" in chunk:
+                            _activity_inc(target)
+                        yield chunk
+        finally:
+            _activity_clear(target)
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 async def _proxy(target: str, path: str, body: dict) -> Response:
-    """Non-streaming Ollama proxy."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
-        resp = await client.post(f"{target}{path}", json=body)
-    return Response(content=resp.content,
-                    media_type=resp.headers.get("content-type", "application/json"),
-                    status_code=resp.status_code)
+    """Non-streaming Ollama proxy (e.g. embeddings), tracking activity per instance."""
+    model = body.get("model", "")
+    _activity_set(target, model, path)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+            resp = await client.post(f"{target}{path}", json=body)
+        return Response(content=resp.content,
+                        media_type=resp.headers.get("content-type", "application/json"),
+                        status_code=resp.status_code)
+    finally:
+        _activity_clear(target)
 
 
 async def _proxy_get(target: str, path: str) -> Response:
@@ -262,6 +317,49 @@ def _build_warnings(ollama_health: dict, latest: dict) -> list[str]:
         if temp and temp > 85:
             warnings.append(f"GPU {i} temperature {temp:.0f}°C — thermal throttle risk")
     return warnings
+
+
+@app.get("/api/merllm/activity")
+async def merllm_activity():
+    """
+    Per-instance live activity state: what model is running, on which endpoint,
+    for how long, and how many response chunks have been received so far.
+    Also fetches loaded models from each instance via /api/ps.
+    """
+    snapshot = _activity_snapshot()
+
+    loaded: dict[str, list[dict] | None] = {}
+    for label, url in [("gpu0", config.OLLAMA_0_URL), ("gpu1", config.OLLAMA_1_URL)]:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(f"{url}/api/ps")
+                if r.status_code == 200:
+                    models = r.json().get("models", [])
+                    loaded[label] = [
+                        {
+                            "name":        m.get("name", ""),
+                            "size_vram_mb": round(m.get("size_vram", 0) / 1024 ** 2),
+                            "expires_at":  m.get("expires_at"),
+                        }
+                        for m in models
+                    ]
+                else:
+                    loaded[label] = []
+        except Exception:
+            loaded[label] = None  # instance unreachable
+
+    return {
+        "gpu0": {
+            "url":    config.OLLAMA_0_URL,
+            "loaded": loaded.get("gpu0"),
+            "active": snapshot.get("gpu0"),
+        },
+        "gpu1": {
+            "url":    config.OLLAMA_1_URL,
+            "loaded": loaded.get("gpu1"),
+            "active": snapshot.get("gpu1"),
+        },
+    }
 
 
 @app.post("/api/merllm/mode")

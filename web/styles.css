@@ -177,6 +177,43 @@ main { padding: 20px; }
 .dot-ok   { background: var(--green); }
 .dot-fail { background: var(--red); }
 
+/* Instance activity cards */
+.instance-card { font-size: 13px; }
+.instance-header {
+  display: flex; align-items: center; gap: 7px;
+  padding-bottom: 5px; border-bottom: 1px solid var(--border);
+  margin-bottom: 5px;
+}
+.instance-label { font-weight: 600; }
+.instance-url   { font-size: 11px; margin-left: auto; }
+.instance-loaded { padding: 3px 0 4px; }
+.instance-model {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 1px 0;
+}
+.instance-model-name { font-family: monospace; font-size: 12px; }
+.instance-idle { font-size: 12px; }
+.instance-active-wrap {
+  padding-top: 5px; border-top: 1px solid var(--border); margin-top: 3px;
+}
+.instance-active {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+/* Pulsing green dot for active generation */
+.instance-active-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--green);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.instance-active-model { font-family: monospace; font-size: 12px; font-weight: 600; }
+.instance-active-ep    { font-size: 11px; }
+.instance-elapsed      { font-size: 11px; margin-left: auto; }
+.instance-chunks       { font-size: 11px; color: var(--accent); }
+
 /* Tables */
 table {
   width: 100%;
@@ -299,6 +336,20 @@ tr:hover td { background: #1c2330; }
 .batch-form input:focus, .batch-form textarea:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* CPU heatmap grid */
+.cpu-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 3px;
+  margin-top: 4px;
+}
+.cpu-cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  cursor: default;
+  transition: opacity .4s;
 }
 
 /* Util */
