@@ -202,14 +202,18 @@ function renderInstanceCard(elId, label, inst) {
   let activeHtml = "";
   const act = inst.active;
   if (act) {
-    const endpoint  = act.endpoint.replace("/api/", "");
-    const elapsed   = act.elapsed_sec;
+    const endpoint   = act.endpoint.replace("/api/", "");
+    const elapsed    = act.elapsed_sec;
     const elapsedFmt = elapsed >= 60
       ? `${Math.floor(elapsed / 60)}m ${Math.round(elapsed % 60)}s`
       : `${elapsed}s`;
-    const chunksLabel = endpoint === "embeddings"
-      ? ""
-      : `<span class="instance-chunks">${act.chunks} chunks</span>`;
+    const isText     = endpoint !== "embeddings";
+    const chunksLabel = isText
+      ? `<span class="instance-chunks">${act.chunks} tok</span>`
+      : "";
+    const textPreview = isText && act.text
+      ? `<div class="instance-text-preview">${esc(act.text)}</div>`
+      : "";
     activeHtml = `
       <div class="instance-active">
         <span class="instance-active-dot"></span>
@@ -217,7 +221,8 @@ function renderInstanceCard(elId, label, inst) {
         <span class="instance-active-ep muted">${esc(endpoint)}</span>
         <span class="instance-elapsed muted">${elapsedFmt}</span>
         ${chunksLabel}
-      </div>`;
+      </div>
+      ${textPreview}`;
   } else if (reachable) {
     activeHtml = `<span class="muted instance-idle">idle</span>`;
   }

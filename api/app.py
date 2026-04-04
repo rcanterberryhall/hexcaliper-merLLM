@@ -70,6 +70,30 @@ def _activity_clear(url: str) -> None:
     _activity[_gpu_label(url)] = None
 
 
+_TEXT_TAIL = 600   # characters kept in the rolling text buffer
+
+
+def _activity_append_token(url: str, line: bytes, path: str) -> None:
+    """Parse one NDJSON line and append its token text to the rolling buffer."""
+    entry = _activity.get(_gpu_label(url))
+    if entry is None:
+        return
+    try:
+        obj = json.loads(line)
+        if obj.get("done"):
+            return
+        if path == "/api/generate":
+            token = obj.get("response", "")
+        elif path == "/api/chat":
+            token = obj.get("message", {}).get("content", "")
+        else:
+            return
+        if token:
+            entry["text"] = (entry.get("text", "") + token)[-_TEXT_TAIL:]
+    except Exception:
+        pass
+
+
 def _activity_snapshot() -> dict:
     now = time.time()
     result = {}
@@ -137,13 +161,19 @@ async def _stream_proxy(target: str, path: str, body: dict) -> StreamingResponse
     _activity_set(target, model, path)
 
     async def generate():
+        # Line buffer: raw byte chunks from Ollama don't align with JSON lines.
+        # We accumulate bytes and split on newlines to get complete NDJSON objects.
+        buf = b""
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
                 async with client.stream("POST", f"{target}{path}", json=body) as resp:
                     async for chunk in resp.aiter_bytes():
-                        # Each newline-delimited JSON object = one token/chunk
-                        if b"\n" in chunk:
-                            _activity_inc(target)
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            if line.strip():
+                                _activity_inc(target)
+                                _activity_append_token(target, line, path)
                         yield chunk
         finally:
             _activity_clear(target)

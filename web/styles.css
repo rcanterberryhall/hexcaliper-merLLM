@@ -213,6 +213,24 @@ main { padding: 20px; }
 .instance-active-ep    { font-size: 11px; }
 .instance-elapsed      { font-size: 11px; margin-left: auto; }
 .instance-chunks       { font-size: 11px; color: var(--accent); }
+.instance-text-preview {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg);
+  max-height: 80px;
+  overflow: hidden;
+  word-break: break-word;
+  white-space: pre-wrap;
+  /* Show only the tail — overflow is hidden at top, text grows from bottom */
+  display: flex;
+  align-items: flex-end;
+}
 
 /* Tables */
 table {
