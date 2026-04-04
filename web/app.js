@@ -29,14 +29,75 @@ async function post(path, body) {
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 
-let _pollTimer     = null;
-let _activityTimer = null;
+let _pollTimer        = null;
+let _activityTimer    = null;
+let _activityEventSrc = null;
 
 function startPolling() {
   refresh();
   _pollTimer = setInterval(refresh, 10000);
+  // Seed instance cards immediately via one-shot poll, then switch to SSE push
   refreshActivity();
-  _activityTimer = setInterval(refreshActivity, 2000);
+  _startActivityStream();
+}
+
+function _startActivityStream() {
+  if (_activityEventSrc) return; // already open
+  _activityEventSrc = new EventSource("/api/merllm/activity/stream");
+
+  _activityEventSrc.onmessage = (e) => {
+    try {
+      const a = JSON.parse(e.data);
+      // SSE payload is the raw _activity_snapshot + per-gpu loaded models are
+      // not included (those come from the poll).  Merge with last known loaded state.
+      if (a.gpu0 !== undefined) _mergeAndRenderInstance("ollama-gpu0", "GPU 0", a.gpu0);
+      if (a.gpu1 !== undefined) _mergeAndRenderInstance("ollama-gpu1", "GPU 1", a.gpu1);
+    } catch (_) {}
+  };
+
+  _activityEventSrc.onerror = () => {
+    // On error, close and fall back to polling; retry SSE after 10 seconds
+    _activityEventSrc.close();
+    _activityEventSrc = null;
+    if (!_activityTimer) {
+      _activityTimer = setInterval(refreshActivity, 2000);
+    }
+    setTimeout(() => {
+      if (_activityTimer) { clearInterval(_activityTimer); _activityTimer = null; }
+      _startActivityStream();
+    }, 10000);
+  };
+}
+
+// Per-GPU cache so SSE updates (which carry only active state) can still
+// show loaded models and the instance URL from the last full poll.
+const _instCache = {
+  gpu0: { url: "", loaded: null },
+  gpu1: { url: "", loaded: null },
+};
+
+function _mergeAndRenderInstance(elId, label, activeSnapshot) {
+  // activeSnapshot is the raw _activity entry (or null) with elapsed_sec added.
+  // Build an inst object matching what renderInstanceCard expects.
+  const gpuKey = elId === "ollama-gpu0" ? "gpu0" : "gpu1";
+  const cached = _instCache[gpuKey];
+  renderInstanceCard(elId, label, {
+    url:    cached.url,
+    loaded: cached.loaded,
+    active: activeSnapshot,
+  });
+}
+
+async function refreshActivity() {
+  // Full poll: fetches loaded models + active state. Updates cache.
+  if (!document.getElementById("tab-overview").classList.contains("active")) return;
+  try {
+    const a = await api("/api/merllm/activity");
+    _instCache.gpu0 = { url: a.gpu0.url, loaded: a.gpu0.loaded };
+    _instCache.gpu1 = { url: a.gpu1.url, loaded: a.gpu1.loaded };
+    renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
+    renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
+  } catch (_) {}
 }
 
 async function refresh() {
@@ -59,15 +120,17 @@ async function refresh() {
   if (document.getElementById("tab-fans").classList.contains("active")) {
     loadFans().catch(() => {});
   }
-}
 
-async function refreshActivity() {
-  // Only poll when Overview tab is visible
-  if (!document.getElementById("tab-overview").classList.contains("active")) return;
+  // Refresh loaded models periodically (SSE only carries active state)
   try {
     const a = await api("/api/merllm/activity");
-    renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
-    renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
+    _instCache.gpu0 = { url: a.gpu0.url, loaded: a.gpu0.loaded };
+    _instCache.gpu1 = { url: a.gpu1.url, loaded: a.gpu1.loaded };
+    // Only re-render if SSE is not driving updates (avoid fighting the stream)
+    if (!_activityEventSrc) {
+      renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
+      renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
+    }
   } catch (_) {}
 }
 

@@ -42,9 +42,37 @@ import queue_manager
 
 # ── Per-instance activity tracking ───────────────────────────────────────────
 # Keyed by "gpu0" / "gpu1". Each entry is either None (idle) or a dict with:
-#   model, endpoint, started_at (epoch float), chunks (NDJSON lines received).
+#   model, endpoint, started_at (epoch float), chunks (NDJSON lines received),
+#   text (rolling token buffer, last _TEXT_TAIL chars).
 # Single-threaded asyncio — no lock needed.
 _activity: dict[str, dict | None] = {"gpu0": None, "gpu1": None}
+
+# ── SSE push for real-time activity updates ────────────────────────────────
+# One asyncio.Queue per connected SSE client. Updated on every token.
+_activity_sse_queues: list[asyncio.Queue] = []
+_last_sse_push: float = 0.0
+_SSE_PUSH_MIN_INTERVAL = 0.1  # max 10 pushes/sec during active generation
+
+
+def _push_activity_sse(force: bool = False) -> None:
+    """Push current activity snapshot to all connected SSE clients.
+
+    Rate-limited to _SSE_PUSH_MIN_INTERVAL seconds between pushes unless
+    force=True (used on request start/end so those transitions are always seen).
+    """
+    global _last_sse_push
+    if not _activity_sse_queues:
+        return
+    now = time.time()
+    if not force and now - _last_sse_push < _SSE_PUSH_MIN_INTERVAL:
+        return
+    _last_sse_push = now
+    data = json.dumps(_activity_snapshot())
+    for q in list(_activity_sse_queues):
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            pass
 
 
 def _gpu_label(url: str) -> str:
@@ -58,16 +86,19 @@ def _activity_set(url: str, model: str, endpoint: str) -> None:
         "started_at": time.time(),
         "chunks":     0,
     }
+    _push_activity_sse(force=True)
 
 
 def _activity_inc(url: str) -> None:
     entry = _activity.get(_gpu_label(url))
     if entry is not None:
         entry["chunks"] += 1
+    _push_activity_sse()
 
 
 def _activity_clear(url: str) -> None:
     _activity[_gpu_label(url)] = None
+    _push_activity_sse(force=True)
 
 
 _TEXT_TAIL = 600   # characters kept in the rolling text buffer
@@ -390,6 +421,41 @@ async def merllm_activity():
             "active": snapshot.get("gpu1"),
         },
     }
+
+
+@app.get("/api/merllm/activity/stream")
+async def activity_stream():
+    """
+    Server-sent events stream of per-instance activity.
+
+    Pushes a snapshot whenever a token arrives (rate-limited to 10/sec)
+    and immediately on request start/end. Keepalive comment sent every 5s
+    when idle. The frontend subscribes to this instead of polling.
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=50)
+    _activity_sse_queues.append(q)
+
+    async def generate():
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=5.0)
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                _activity_sse_queues.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/merllm/mode")
