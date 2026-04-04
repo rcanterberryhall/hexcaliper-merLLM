@@ -496,10 +496,11 @@ async function saveSettings() {
 const FAN_SETTINGS_FIELDS = [
   { key: "FAN_SPEED",                 label: "Min fan speed %",        min: 0,  max: 100 },
   { key: "FAN_SPEED_MAX",             label: "Max fan speed %",        min: 0,  max: 100 },
-  { key: "FAN_RAMP_STEP",             label: "Ramp step % per cycle",  min: 1,  max: 20  },
+  { key: "FAN_RAMP_STEP",             label: "Ramp step % per cycle",  min: 1,  max: 50  },
   { key: "TEMP_RAMP_RANGE",           label: "Ramp range (°C)",        min: 1,  max: 40  },
   { key: "CPU_TEMPERATURE_THRESHOLD", label: "CPU threshold (°C)",     min: 30, max: 100 },
   { key: "GPU_TEMPERATURE_THRESHOLD", label: "GPU threshold (°C)",     min: 40, max: 100 },
+  { key: "CHECK_INTERVAL",            label: "Check interval (sec)",   min: 1,  max: 60  },
 ];
 
 async function loadFans() {
@@ -585,12 +586,13 @@ function renderFansControl(status, settings) {
 
   // Show active override values; fall back to values reported by the controller
   const current = {
-    FAN_SPEED:                 settings.FAN_SPEED                 ?? th.fan_speed_min_pct ?? "",
-    FAN_SPEED_MAX:             settings.FAN_SPEED_MAX             ?? th.fan_speed_max_pct ?? "",
-    FAN_RAMP_STEP:             settings.FAN_RAMP_STEP             ?? th.fan_ramp_step_pct ?? "",
-    TEMP_RAMP_RANGE:           settings.TEMP_RAMP_RANGE           ?? th.ramp_range_c      ?? "",
-    CPU_TEMPERATURE_THRESHOLD: settings.CPU_TEMPERATURE_THRESHOLD ?? th.cpu               ?? "",
-    GPU_TEMPERATURE_THRESHOLD: settings.GPU_TEMPERATURE_THRESHOLD ?? th.gpu               ?? "",
+    FAN_SPEED:                 settings.FAN_SPEED                 ?? th.fan_speed_min_pct  ?? "",
+    FAN_SPEED_MAX:             settings.FAN_SPEED_MAX             ?? th.fan_speed_max_pct  ?? "",
+    FAN_RAMP_STEP:             settings.FAN_RAMP_STEP             ?? th.fan_ramp_step_pct  ?? "",
+    TEMP_RAMP_RANGE:           settings.TEMP_RAMP_RANGE           ?? th.ramp_range_c       ?? "",
+    CPU_TEMPERATURE_THRESHOLD: settings.CPU_TEMPERATURE_THRESHOLD ?? th.cpu                ?? "",
+    GPU_TEMPERATURE_THRESHOLD: settings.GPU_TEMPERATURE_THRESHOLD ?? th.gpu                ?? "",
+    CHECK_INTERVAL:            settings.CHECK_INTERVAL            ?? th.check_interval_sec ?? "",
   };
 
   const hasOverrides = Object.keys(settings).length > 0;
