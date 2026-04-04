@@ -51,6 +51,11 @@ async function refresh() {
     const metrics = await api("/api/merllm/metrics/current");
     renderMetrics(metrics);
   } catch (_) {}
+
+  // Refresh fans tab if it is active (avoid background polling when not viewed)
+  if (document.getElementById("tab-fans").classList.contains("active")) {
+    loadFans().catch(() => {});
+  }
 }
 
 // ── Overview ──────────────────────────────────────────────────────────────────
@@ -234,19 +239,26 @@ async function viewResult(id) {
 function renderMetrics(m) {
   if (!m || !Object.keys(m).length) return;
 
-  // CPU
-  const cpuKeys = Object.keys(m).filter(k => k.startsWith("cpu.core"));
+  // CPU — sort numerically so core10 doesn't come before core2
+  const cpuKeys = Object.keys(m)
+    .filter(k => k.startsWith("cpu.core"))
+    .sort((a, b) => parseInt(a.replace("cpu.core", "")) - parseInt(b.replace("cpu.core", "")));
   const cpuEl = document.getElementById("cpu-metrics");
   if (cpuKeys.length) {
     const avg = cpuKeys.reduce((s, k) => s + (m[k]?.value ?? 0), 0) / cpuKeys.length;
+    const cells = cpuKeys.map((k, i) => {
+      const pct = m[k]?.value ?? 0;
+      const col = pct > 90 ? "var(--red)" : pct > 70 ? "var(--yellow)" : pct > 30 ? "var(--accent)" : "var(--green)";
+      return `<div class="cpu-cell" title="core${i}: ${pct.toFixed(1)}%" style="background:${col};opacity:${0.2 + pct / 125}"></div>`;
+    }).join("");
     cpuEl.innerHTML = `
-      <div class="stat-row"><span class="stat-label">Avg utilization</span>
+      <div class="stat-row" style="margin-bottom:8px"><span class="stat-label">Avg utilization</span>
         <span class="bar-wrap">${bar(avg)}<span style="width:36px;font-size:11px;text-align:right">${avg.toFixed(1)}%</span></span>
-      </div>` +
-      cpuKeys.slice(0, 8).map(k =>
-        `<div class="stat-row"><span class="stat-label muted">${esc(k)}</span>
-           <span class="bar-wrap">${bar(m[k]?.value ?? 0)}</span></div>`
-      ).join("");
+      </div>
+      <div class="stat-row" style="margin-bottom:8px"><span class="stat-label">${cpuKeys.length} cores</span>
+        <span class="muted" style="font-size:11px">&#9632; &lt;30% &nbsp; &#9632; 30–70% &nbsp; &#9632; 70–90% &nbsp; &#9632; &gt;90%</span>
+      </div>
+      <div class="cpu-grid">${cells}</div>`;
   }
 
   // Memory
@@ -388,25 +400,30 @@ function disconnectSSH() {
 let _vncWs = null;
 let _vncSocket = null;
 
-function connectVNC() {
+async function connectVNC() {
   const container = document.getElementById("vnc-container");
-  container.innerHTML = '<canvas id="vnc-canvas"></canvas>';
+  container.innerHTML = '<span class="muted">Loading noVNC…</span>';
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}/ws/vnc`;
 
-  if (typeof RFB !== "undefined") {
-    try {
-      const rfb = new RFB(container, url);
-      rfb.scaleViewport = true;
-      rfb.addEventListener("disconnect", () => {
-        container.innerHTML = '<span class="muted">VNC disconnected.</span>';
-      });
-    } catch (err) {
-      container.innerHTML = `<span class="muted">VNC error: ${esc(err.message)}</span>`;
-    }
-  } else {
-    container.innerHTML =
-      '<span class="muted">noVNC library not loaded. Add noVNC\'s core/rfb.js to your setup.</span>';
+  let RFB;
+  try {
+    const mod = await import('/novnc/core/rfb.js');
+    RFB = mod.default;
+  } catch (err) {
+    container.innerHTML = `<span class="muted">noVNC load error: ${esc(String(err))}</span>`;
+    return;
+  }
+
+  container.innerHTML = '<canvas id="vnc-canvas"></canvas>';
+  try {
+    const rfb = new RFB(container, url);
+    rfb.scaleViewport = true;
+    rfb.addEventListener("disconnect", () => {
+      container.innerHTML = '<span class="muted">VNC disconnected.</span>';
+    });
+  } catch (err) {
+    container.innerHTML = `<span class="muted">VNC error: ${esc(err.message)}</span>`;
   }
 }
 
@@ -474,6 +491,166 @@ async function saveSettings() {
   }
 }
 
+// ── Fan Controller ────────────────────────────────────────────────────────────
+
+const FAN_SETTINGS_FIELDS = [
+  { key: "FAN_SPEED",                 label: "Min fan speed %",        min: 0,  max: 100 },
+  { key: "FAN_SPEED_MAX",             label: "Max fan speed %",        min: 0,  max: 100 },
+  { key: "FAN_RAMP_STEP",             label: "Ramp step % per cycle",  min: 1,  max: 20  },
+  { key: "TEMP_RAMP_RANGE",           label: "Ramp range (°C)",        min: 1,  max: 40  },
+  { key: "CPU_TEMPERATURE_THRESHOLD", label: "CPU threshold (°C)",     min: 30, max: 100 },
+  { key: "GPU_TEMPERATURE_THRESHOLD", label: "GPU threshold (°C)",     min: 40, max: 100 },
+];
+
+async function loadFans() {
+  const [fanStatus, fanSettings] = await Promise.all([
+    api("/api/merllm/fans/status").catch(() => null),
+    api("/api/merllm/fans/settings").catch(() => ({})),
+  ]);
+  renderFansStatus(fanStatus);
+  renderFansControl(fanStatus, fanSettings);
+}
+
+function renderFansStatus(s) {
+  const el = document.getElementById("fans-status-content");
+  if (!s || s.error) {
+    el.innerHTML = `<span class="muted">Fan controller unavailable${s && s.error ? ": " + esc(s.error) : ""}</span>`;
+    return;
+  }
+
+  const t   = s.temperatures || {};
+  const f   = s.fan          || {};
+  const th  = s.thresholds   || {};
+  const cpuTh  = th.cpu  || 50;
+  const gpuTh  = th.gpu  || 80;
+  const rampC  = th.ramp_range_c || 15;
+
+  function tempRow(label, tempC, threshold) {
+    const pct = Math.min(100, tempC / threshold * 100);
+    return `<div class="stat-row">
+      <span class="stat-label">${label}</span>
+      <span class="bar-wrap">${bar(pct)}<span style="width:40px;font-size:11px;text-align:right">${tempC}°C</span></span>
+    </div>`;
+  }
+
+  const cpuRows = (t.cpu || []).map((c, i) => tempRow(`CPU ${i + 1}`, c, cpuTh)).join("");
+  const gpuRows = (t.gpu || []).map((g, i) => tempRow(`GPU ${i + 1}`, g, gpuTh)).join("");
+
+  const fanPct    = f.current_speed_pct ?? 0;
+  const targetPct = f.target_speed_pct  ?? 0;
+  const safetyBadge = f.safety_override
+    ? `<span style="color:var(--red);font-weight:600">&#9888; SAFETY — Dell default</span>`
+    : `<span style="color:var(--green)">Manual ramp</span>`;
+
+  el.innerHTML = `
+    <div style="margin-bottom:14px">
+      <div class="stat-row">
+        <span class="stat-label">Inlet</span>
+        <span class="stat-value">${t.inlet != null ? t.inlet + "°C" : "—"}</span>
+      </div>
+      ${cpuRows}
+      ${gpuRows}
+      <div class="stat-row">
+        <span class="stat-label">Exhaust</span>
+        <span class="stat-value">${t.exhaust != null ? t.exhaust + "°C" : "—"}</span>
+      </div>
+    </div>
+    <hr style="border-color:var(--border);margin:12px 0">
+    <div class="stat-row">
+      <span class="stat-label">Fan speed</span>
+      <span class="bar-wrap">${bar(fanPct)}<span style="width:36px;font-size:11px;text-align:right">${fanPct}%</span></span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Target</span>
+      <span class="stat-value">${targetPct}%</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Profile</span>
+      <span class="muted" style="font-size:11px">${esc(f.profile || "—")}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Control</span>
+      ${safetyBadge}
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:10px">
+      Ramp: ${th.fan_speed_min_pct ?? "?"}% → ${th.fan_speed_max_pct ?? "?"}%
+      over ${rampC}°C below CPU ${cpuTh}°C / GPU ${gpuTh}°C threshold
+    </div>
+    <div class="muted" style="font-size:10px;margin-top:4px">${esc(s.timestamp || "")}</div>`;
+}
+
+function renderFansControl(status, settings) {
+  const el = document.getElementById("fans-control-content");
+  const th = (status || {}).thresholds || {};
+
+  // Show active override values; fall back to values reported by the controller
+  const current = {
+    FAN_SPEED:                 settings.FAN_SPEED                 ?? th.fan_speed_min_pct ?? "",
+    FAN_SPEED_MAX:             settings.FAN_SPEED_MAX             ?? th.fan_speed_max_pct ?? "",
+    FAN_RAMP_STEP:             settings.FAN_RAMP_STEP             ?? th.fan_ramp_step_pct ?? "",
+    TEMP_RAMP_RANGE:           settings.TEMP_RAMP_RANGE           ?? th.ramp_range_c      ?? "",
+    CPU_TEMPERATURE_THRESHOLD: settings.CPU_TEMPERATURE_THRESHOLD ?? th.cpu               ?? "",
+    GPU_TEMPERATURE_THRESHOLD: settings.GPU_TEMPERATURE_THRESHOLD ?? th.gpu               ?? "",
+  };
+
+  const hasOverrides = Object.keys(settings).length > 0;
+  const overrideBanner = hasOverrides
+    ? `<div style="margin-bottom:10px;padding:6px 10px;background:rgba(251,191,36,0.1);border:1px solid var(--yellow);border-radius:6px;font-size:11px;color:var(--yellow)">
+         Overrides active — values differ from container defaults.
+       </div>`
+    : "";
+
+  const fields = FAN_SETTINGS_FIELDS.map(f => `
+    <div class="form-group">
+      <label>${esc(f.label)}</label>
+      <input id="fan-${f.key}" type="number" min="${f.min}" max="${f.max}" value="${esc(String(current[f.key]))}" />
+    </div>`).join("");
+
+  el.innerHTML = `
+    ${overrideBanner}
+    ${fields}
+    <div class="settings-actions" style="margin-top:12px">
+      <button class="btn primary" onclick="saveFanSettings()">Save</button>
+      <button class="btn" onclick="resetFanSettings()">Reset to Defaults</button>
+      <span id="fan-settings-msg" class="muted" style="font-size:12px;align-self:center"></span>
+    </div>
+    <div style="margin-top:16px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--muted);line-height:1.8">
+      <strong style="color:var(--text)">How the ramp works</strong><br>
+      Below (threshold &minus; range): fans hold at min %<br>
+      Within range of threshold: linear ramp → max %<br>
+      At or above threshold: Dell default control (safety)
+    </div>`;
+}
+
+async function saveFanSettings() {
+  const body = {};
+  FAN_SETTINGS_FIELDS.forEach(f => {
+    const el = document.getElementById("fan-" + f.key);
+    if (el && el.value !== "") body[f.key] = Number(el.value);
+  });
+  const msg = document.getElementById("fan-settings-msg");
+  try {
+    await post("/api/merllm/fans/settings", body);
+    msg.textContent = "Saved.";
+    setTimeout(() => { msg.textContent = ""; }, 3000);
+    loadFans().catch(() => {});
+  } catch (err) {
+    msg.textContent = "Error: " + err.message;
+  }
+}
+
+async function resetFanSettings() {
+  const msg = document.getElementById("fan-settings-msg");
+  try {
+    await api("/api/merllm/fans/settings", { method: "DELETE" });
+    msg.textContent = "Reset to defaults.";
+    setTimeout(() => { msg.textContent = ""; }, 3000);
+    loadFans().catch(() => {});
+  } catch (err) {
+    msg.textContent = "Error: " + err.message;
+  }
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 function esc(s) {
@@ -519,4 +696,5 @@ function fmtBytes(bytes) {
 
 loadSettings();
 loadBatchJobs();
+loadFans().catch(() => {});
 startPolling();

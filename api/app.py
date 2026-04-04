@@ -463,19 +463,46 @@ def _docker_status() -> list[dict]:
         return []
 
 
+# Services backed by Docker containers
+_LOG_DOCKER = {
+    "lancellmot-api":   "hexcaliper-lancellmot-api-1",
+    "lancellmot-nginx": "hexcaliper-lancellmot-nginx-1",
+    "parsival-api":     "hexcaliper-squire-parsival-api-1",
+    "parsival-nginx":   "hexcaliper-squire-parsival-nginx-1",
+    "merllm-api":       "merllm-api",
+}
+
+# Services backed by host systemd units
+_LOG_SYSTEMD = {"ollama-gpu0", "ollama-gpu1", "ollama-night"}
+
+_ALL_LOG_SERVICES = set(_LOG_DOCKER) | _LOG_SYSTEMD
+
+
 @app.get("/api/merllm/logs/{service}")
 async def service_logs(service: str, lines: int = 100):
-    """Tail recent log lines from a systemd service."""
-    allowed = {"ollama-gpu0", "ollama-gpu1", "ollama-night",
-               "hexcaliper-api", "hexcaliper-squire-page-api"}
-    if service not in allowed:
-        raise HTTPException(status_code=422, detail="Unknown service")
+    """Tail recent log lines — Docker containers via SDK, systemd units via journalctl."""
+    if service not in _ALL_LOG_SERVICES:
+        raise HTTPException(status_code=422,
+                            detail=f"Unknown service. Valid: {sorted(_ALL_LOG_SERVICES)}")
+
+    if service in _LOG_SYSTEMD:
+        try:
+            result = subprocess.run(
+                ["journalctl", "--directory", "/var/log/journal",
+                 "-u", f"{service}.service", "--no-pager", "-n", str(lines)],
+                capture_output=True, text=True, timeout=10
+            )
+            return {"service": service, "lines": result.stdout.splitlines()}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    container_name = _LOG_DOCKER[service]
     try:
-        result = subprocess.run(
-            ["journalctl", "-u", service, "--no-pager", "-n", str(lines)],
-            capture_output=True, text=True, timeout=10
-        )
-        return {"service": service, "lines": result.stdout.splitlines()}
+        import docker
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        raw = container.logs(tail=lines, timestamps=False).decode("utf-8", errors="replace")
+        return {"service": service, "container": container_name, "lines": raw.splitlines()}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -498,6 +525,58 @@ async def geoip_info(request: Request):
         "geoip_db_present": os.path.exists(config.GEOIP_DB_PATH),
         "manual_override":  config.GEOIP_OFFSET_OVERRIDE or None,
     }
+
+
+# ── Fan controller proxy ──────────────────────────────────────────────────────
+
+
+@app.get("/api/merllm/fans/status")
+async def fans_status():
+    """Current temperatures, fan speed, and active thresholds from the iDRAC fan controller."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{config.FAN_CONTROLLER_URL}/status")
+            return Response(content=r.content, media_type="application/json",
+                            status_code=r.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "available": False}, status_code=503)
+
+
+@app.get("/api/merllm/fans/settings")
+async def fans_get_settings():
+    """Active fan controller override values (empty object if none set)."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{config.FAN_CONTROLLER_URL}/settings")
+            return Response(content=r.content, media_type="application/json",
+                            status_code=r.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "available": False}, status_code=503)
+
+
+@app.post("/api/merllm/fans/settings")
+async def fans_save_settings(request: Request):
+    """Push threshold/speed overrides to the fan controller (merges with existing)."""
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.post(f"{config.FAN_CONTROLLER_URL}/settings", json=body)
+            return Response(content=r.content, media_type="application/json",
+                            status_code=r.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+
+
+@app.delete("/api/merllm/fans/settings")
+async def fans_reset_settings():
+    """Remove all fan controller overrides, reverting to env-var defaults."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.delete(f"{config.FAN_CONTROLLER_URL}/settings")
+            return Response(content=r.content, media_type="application/json",
+                            status_code=r.status_code)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
 
 
 # ── WebSocket: SSH terminal ───────────────────────────────────────────────────
@@ -538,11 +617,14 @@ async def ws_ssh(websocket: WebSocket):
                         pass
 
                 async def proc_to_ws():
-                    async for data in proc.stdout:
-                        try:
+                    try:
+                        while True:
+                            data = await proc.stdout.read(4096)
+                            if not data:
+                                break
                             await websocket.send_text(data)
-                        except WebSocketDisconnect:
-                            break
+                    except WebSocketDisconnect:
+                        pass
 
                 await asyncio.gather(ws_to_proc(), proc_to_ws())
 

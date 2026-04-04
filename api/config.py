@@ -74,6 +74,11 @@ SSH_KEY_PATH = _get("SSH_KEY_PATH", "/data/ssh_key")
 VNC_HOST = _get("VNC_HOST", "host.docker.internal")
 VNC_PORT = int(_get("VNC_PORT", "5900"))
 
+# ── Fan controller ────────────────────────────────────────────────────────────
+
+# URL of the iDRAC fan controller REST API (api_server.py on port 8080).
+FAN_CONTROLLER_URL = _get("FAN_CONTROLLER_URL", "http://host.docker.internal:8080")
+
 
 def apply_overrides(d: dict) -> None:
     """Hot-reload settings from the database into module-level variables."""

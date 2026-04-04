@@ -23,6 +23,7 @@
   <button data-tab="logs">Logs</button>
   <button data-tab="terminal">SSH</button>
   <button data-tab="vnc">VNC</button>
+  <button data-tab="fans">Fans</button>
   <button data-tab="settings">Settings</button>
   <button data-tab="help">Help</button>
 </nav>
@@ -171,8 +172,11 @@
           <option value="ollama-gpu0">ollama-gpu0</option>
           <option value="ollama-gpu1">ollama-gpu1</option>
           <option value="ollama-night">ollama-night</option>
-          <option value="hexcaliper-api">hexcaliper-api</option>
-          <option value="hexcaliper-squire-page-api">hexcaliper-squire-page-api</option>
+          <option value="lancellmot-api">lancellmot-api</option>
+          <option value="lancellmot-nginx">lancellmot-nginx</option>
+          <option value="parsival-api">parsival-api</option>
+          <option value="parsival-nginx">parsival-nginx</option>
+          <option value="merllm-api">merllm-api</option>
         </select>
         <input id="log-lines" type="number" value="100" min="10" max="500" style="width:80px;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" />
         <button class="btn primary" onclick="fetchLogs()">Fetch</button>
@@ -211,6 +215,25 @@
       <div id="vnc-container">
         <span class="muted">VNC not connected</span>
       </div>
+    </div>
+  </div>
+
+  <!-- ── Fans ── -->
+  <div id="tab-fans" class="tab">
+    <div class="grid-2">
+
+      <div class="card">
+        <h2>Fan Status
+          <button class="btn" style="float:right;padding:2px 10px;font-size:11px" onclick="loadFans()">Refresh</button>
+        </h2>
+        <div id="fans-status-content"><span class="muted">Loading&hellip;</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Fan Control</h2>
+        <div id="fans-control-content"><span class="muted">Loading&hellip;</span></div>
+      </div>
+
     </div>
   </div>
 
@@ -381,6 +404,12 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
 <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
+<!-- noVNC git source (ES modules) bundled into nginx image at build time -->
+<script type="module">
+  import RFB from '/novnc/core/rfb.js';
+  window.RFB = RFB;
+</script>
 
 <script src="app.js"></script>
 </body>

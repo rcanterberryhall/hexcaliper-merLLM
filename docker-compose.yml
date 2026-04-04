@@ -33,6 +33,9 @@ services:
       NIGHT_SERVICE:  "ollama-night"
       DRAIN_TIMEOUT_SEC: "300"
 
+      # ── GPU metrics ──────────────────────────────────────────────────────
+      LD_LIBRARY_PATH: "/usr/local/lib"
+
       # ── Storage ───────────────────────────────────────────────────────────
       DB_PATH:              "/data/merllm.db"
       METRICS_RETAIN_DAYS:  "7"
@@ -41,15 +44,27 @@ services:
       # ── SSH proxy (optional) ──────────────────────────────────────────────
       SSH_HOST:     "host.docker.internal"
       SSH_PORT:     "22"
-      SSH_USER:     ""        # set to your username to enable SSH terminal
+      SSH_USER:     "lobulus"
       SSH_KEY_PATH: "/data/ssh_key"
 
       # ── VNC proxy (optional) ──────────────────────────────────────────────
       VNC_HOST: "host.docker.internal"
-      VNC_PORT: "5900"
+      VNC_PORT: "5901"
+
+      # ── Fan controller ────────────────────────────────────────────────────
+      # REST API exposed by the iDRAC fan controller container (api_server.py)
+      FAN_CONTROLLER_URL: "http://host.docker.internal:8080"
 
     volumes:
       - merllm-data:/data
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/local/lib/libnvidia-ml.so.1:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+
+    devices:
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidia1:/dev/nvidia1
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -61,7 +76,7 @@ services:
       - "11400"
 
   merllm-nginx:
-    image: nginx:1.27-alpine
+    build: ./nginx
     container_name: merllm-nginx
     restart: unless-stopped
     ports:
