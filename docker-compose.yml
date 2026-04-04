@@ -53,7 +53,7 @@ services:
 
       # ── Fan controller ────────────────────────────────────────────────────
       # REST API exposed by the iDRAC fan controller container (api_server.py)
-      FAN_CONTROLLER_URL: "http://host.docker.internal:8080"
+      FAN_CONTROLLER_URL: "http://host.docker.internal:8083"
 
     volumes:
       - merllm-data:/data
