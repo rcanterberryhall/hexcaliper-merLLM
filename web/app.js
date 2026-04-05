@@ -121,6 +121,9 @@ async function refresh() {
     loadFans().catch(() => {});
   }
 
+  // Fault history is always refreshed — it lives on Overview
+  loadFaultHistory().catch(() => {});
+
   // Refresh loaded models periodically (SSE only carries active state)
   try {
     const a = await api("/api/merllm/activity");
@@ -652,7 +655,6 @@ async function loadFans() {
   ]);
   renderFansStatus(fanStatus);
   renderFansControl(fanStatus, fanSettings);
-  loadFaultHistory().catch(() => {});
 }
 
 async function loadFaultHistory() {
