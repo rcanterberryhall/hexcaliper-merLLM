@@ -22,11 +22,14 @@ Additional endpoints:
 """
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
+
+_req_log = logging.getLogger("merllm.requests")
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
@@ -169,6 +172,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="merLLM", version="1.0.0", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    """Log every HTTP request with method, path, status, duration, and user."""
+    start = time.monotonic()
+    response = await call_next(request)
+    ms = int((time.monotonic() - start) * 1000)
+    user = request.headers.get("CF-Access-Authenticated-User-Email", "anonymous")
+    status = response.status_code
+    msg = "%s %s %d %dms [%s]", request.method, request.url.path, status, ms, user
+    if status >= 500:
+        _req_log.error(*msg)
+    elif status >= 400:
+        _req_log.warning(*msg)
+    else:
+        _req_log.info(*msg)
+    return response
+
+
 # Static web UI
 _web_dir = os.path.join(os.path.dirname(__file__), "..", "web")
 if os.path.isdir(_web_dir):
@@ -191,8 +213,14 @@ def _priority(request: Request) -> int:
     return queue_manager.PRIORITY_BATCH if h == "batch" else queue_manager.PRIORITY_INTERACTIVE
 
 
-async def _stream_proxy(target: str, path: str, body: dict) -> StreamingResponse:
-    """Stream an Ollama response, tracking activity per instance."""
+async def _stream_proxy(target: str, path: str, body: dict,
+                        on_done=None) -> StreamingResponse:
+    """Stream an Ollama response, tracking activity per instance.
+
+    on_done: optional zero-argument callable invoked in the generator's finally
+    block, after the stream ends. Use this to release GPU slots or other
+    resources that must be held for the full duration of streaming.
+    """
     model = body.get("model", "")
     _activity_set(target, model, path)
 
@@ -213,6 +241,8 @@ async def _stream_proxy(target: str, path: str, body: dict) -> StreamingResponse
                         yield chunk
         finally:
             _activity_clear(target)
+            if on_done:
+                on_done()
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -264,10 +294,27 @@ async def proxy_generate(request: Request):
     target = mode_manager.get_target_url(model)
     stream = body.get("stream", True)
 
+    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    if not acquired:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "GPU busy — all slots occupied",
+                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
+            },
+            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
+        )
+
     async with mode_manager.InFlightGuard():
         if stream:
-            return await _stream_proxy(target, "/api/generate", body)
-        return await _proxy(target, "/api/generate", body)
+            return await _stream_proxy(
+                target, "/api/generate", body,
+                on_done=lambda: queue_manager.release_gpu_slot(target),
+            )
+        try:
+            return await _proxy(target, "/api/generate", body)
+        finally:
+            queue_manager.release_gpu_slot(target)
 
 
 @app.post("/api/chat")
@@ -286,10 +333,27 @@ async def proxy_chat(request: Request):
     target = mode_manager.get_target_url(model)
     stream = body.get("stream", True)
 
+    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    if not acquired:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "GPU busy — all slots occupied",
+                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
+            },
+            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
+        )
+
     async with mode_manager.InFlightGuard():
         if stream:
-            return await _stream_proxy(target, "/api/chat", body)
-        return await _proxy(target, "/api/chat", body)
+            return await _stream_proxy(
+                target, "/api/chat", body,
+                on_done=lambda: queue_manager.release_gpu_slot(target),
+            )
+        try:
+            return await _proxy(target, "/api/chat", body)
+        finally:
+            queue_manager.release_gpu_slot(target)
 
 
 @app.post("/api/embeddings")

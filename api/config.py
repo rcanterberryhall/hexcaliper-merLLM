@@ -57,6 +57,14 @@ DB_PATH             = _get("DB_PATH",             "/data/merllm.db")
 METRICS_RETAIN_DAYS = int(_get("METRICS_RETAIN_DAYS", "7"))
 METRICS_INTERVAL_SEC = int(_get("METRICS_INTERVAL_SEC", "10"))
 
+# ── Queue / GPU slot management ──────────────────────────────────────────────
+
+# Seconds an interactive request will wait for a GPU slot before returning 503.
+INTERACTIVE_QUEUE_TIMEOUT = int(_get("INTERACTIVE_QUEUE_TIMEOUT", "30"))
+
+# Max concurrent generation requests per GPU instance. 1 = fully serialised.
+GPU_MAX_CONCURRENT = int(_get("GPU_MAX_CONCURRENT", "1"))
+
 # ── API server ────────────────────────────────────────────────────────────────
 
 PORT     = int(_get("PORT",     "11400"))

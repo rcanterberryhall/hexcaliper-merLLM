@@ -29,6 +29,48 @@ PRIORITY_BATCH       = 1
 _queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
 _batch_event: asyncio.Event   = asyncio.Event()   # signalled when night mode starts
 
+# ── Per-GPU slot management ───────────────────────────────────────────────────
+# One asyncio.Semaphore per Ollama target URL, capped at GPU_MAX_CONCURRENT.
+# Interactive requests wait up to INTERACTIVE_QUEUE_TIMEOUT seconds then give up.
+# Batch requests wait indefinitely. Semaphore waiters are FIFO within priority.
+
+_gpu_semaphores: dict[str, asyncio.Semaphore] = {}
+_gpu_in_flight:  dict[str, int]               = {}
+
+
+def _gpu_sem(target: str) -> asyncio.Semaphore:
+    if target not in _gpu_semaphores:
+        _gpu_semaphores[target] = asyncio.Semaphore(config.GPU_MAX_CONCURRENT)
+        _gpu_in_flight[target]  = 0
+    return _gpu_semaphores[target]
+
+
+async def acquire_gpu_slot(target: str, priority: int) -> bool:
+    """
+    Acquire a generation slot for `target`.
+
+    Interactive priority: waits up to INTERACTIVE_QUEUE_TIMEOUT seconds.
+    Returns False (→ caller should 503) if the slot is not available in time.
+
+    Batch priority: waits indefinitely; always returns True.
+    """
+    sem = _gpu_sem(target)
+    if priority == PRIORITY_INTERACTIVE:
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+    else:
+        await sem.acquire()
+    _gpu_in_flight[target] = _gpu_in_flight.get(target, 0) + 1
+    return True
+
+
+def release_gpu_slot(target: str) -> None:
+    """Release a slot acquired by acquire_gpu_slot."""
+    _gpu_semaphores[target].release()
+    _gpu_in_flight[target] = max(0, _gpu_in_flight.get(target, 0) - 1)
+
 
 @dataclass(order=True)
 class QueuedRequest:
@@ -90,7 +132,10 @@ async def _forward(target: str, body: dict) -> tuple[int, bytes, dict]:
 
 
 def queue_depth() -> dict:
-    return {"total": _queue.qsize()}
+    result: dict = {"total": _queue.qsize(), "gpus": {}}
+    for target, in_flight in _gpu_in_flight.items():
+        result["gpus"][target] = {"in_flight": in_flight}
+    return result
 
 
 # ── Batch job submission ──────────────────────────────────────────────────────
