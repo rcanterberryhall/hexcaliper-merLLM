@@ -728,13 +728,13 @@ def _docker_status() -> list[dict]:
         return []
 
 
-# Services backed by Docker containers
+# Services backed by Docker containers — names read from config (env-var overridable)
 _LOG_DOCKER = {
-    "lancellmot-api":   "hexcaliper-lancellmot-api-1",
-    "lancellmot-nginx": "hexcaliper-lancellmot-nginx-1",
-    "parsival-api":     "hexcaliper-squire-parsival-api-1",
-    "parsival-nginx":   "hexcaliper-squire-parsival-nginx-1",
-    "merllm-api":       "merllm-api",
+    "lancellmot-api":   config.LOG_CONTAINER_LANCELLMOT_API,
+    "lancellmot-nginx": config.LOG_CONTAINER_LANCELLMOT_NGINX,
+    "parsival-api":     config.LOG_CONTAINER_PARSIVAL_API,
+    "parsival-nginx":   config.LOG_CONTAINER_PARSIVAL_NGINX,
+    "merllm-api":       config.LOG_CONTAINER_MERLLM_API,
 }
 
 # Services backed by host systemd units

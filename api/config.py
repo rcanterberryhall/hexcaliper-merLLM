@@ -79,6 +79,15 @@ VNC_PORT = int(_get("VNC_PORT", "5900"))
 # URL of the iDRAC fan controller REST API (api_server.py on port 8080).
 FAN_CONTROLLER_URL = _get("FAN_CONTROLLER_URL", "http://host.docker.internal:8080")
 
+# ── Log container name mapping ────────────────────────────────────────────────
+# Maps logical service names to Docker container names for the /api/merllm/logs
+# endpoint. Override if your compose project name or container names differ.
+LOG_CONTAINER_LANCELLMOT_API   = _get("LOG_CONTAINER_LANCELLMOT_API",   "hexcaliper-lancellmot-api-1")
+LOG_CONTAINER_LANCELLMOT_NGINX = _get("LOG_CONTAINER_LANCELLMOT_NGINX", "hexcaliper-lancellmot-nginx-1")
+LOG_CONTAINER_PARSIVAL_API     = _get("LOG_CONTAINER_PARSIVAL_API",     "hexcaliper-squire-parsival-api-1")
+LOG_CONTAINER_PARSIVAL_NGINX   = _get("LOG_CONTAINER_PARSIVAL_NGINX",   "hexcaliper-squire-parsival-nginx-1")
+LOG_CONTAINER_MERLLM_API       = _get("LOG_CONTAINER_MERLLM_API",       "merllm-api")
+
 
 def apply_overrides(d: dict) -> None:
     """Hot-reload settings from the database into module-level variables."""
