@@ -443,8 +443,6 @@ async def activity_stream():
                     yield f"data: {data}\n\n"
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
-        except asyncio.CancelledError:
-            pass
         finally:
             try:
                 _activity_sse_queues.remove(q)
