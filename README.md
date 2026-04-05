@@ -97,6 +97,21 @@ merLLM is a drop-in replacement for `OLLAMA_BASE_URL`. All standard endpoints ar
 
 Set `X-Priority: batch` on a request to place it in the low-priority queue without submitting a batch job.
 
+## Activity SSE stream
+
+The overview dashboard subscribes to `GET /api/merllm/activity/stream` (Server-Sent Events) for real-time per-GPU activity. Each event carries a JSON snapshot:
+
+```json
+{
+  "gpu0": {"model": "qwen3:32b", "endpoint": "/api/chat", "chunks": 47, "text": "...recent tokens..."},
+  "gpu1": null
+}
+```
+
+`null` means the GPU is idle. Events are pushed immediately on request start/end and rate-limited to 10/sec during streaming. A keepalive comment (`: keepalive`) is sent every 5 s when idle to keep the connection alive through proxies.
+
+LanceLLMot and Parsival dashboards consume this stream to show live token output without polling.
+
 ## GeoIP setup
 
 Download the free MaxMind GeoLite2-City database:
@@ -117,7 +132,7 @@ The `ollama-night` service should be a systemd unit that starts Ollama with `CUD
 
 | Tab | Contents |
 |---|---|
-| Overview | Mode status, Ollama health, GPU stats, batch counts, recent transitions |
+| Overview | Mode status, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), batch counts, recent transitions |
 | Batch Jobs | Submit jobs, view queue, cancel/requeue |
 | Metrics | CPU, RAM, disk, GPU utilization and VRAM, network throughput |
 | Logs | Live log tail from any systemd service |
@@ -161,5 +176,6 @@ tests/
   test_config.py
   test_db.py
   test_queue_manager.py
+  test_activity_sse.py   — SSE push rate limiting, queue fan-out, activity helpers
 docker-compose.yml
 ```
