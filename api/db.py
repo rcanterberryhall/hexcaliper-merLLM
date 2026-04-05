@@ -67,6 +67,15 @@ def _create_tables(c: sqlite3.Connection) -> None:
             success    INTEGER NOT NULL DEFAULT 1,
             error      TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS fan_faults (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts               REAL NOT NULL,
+            event_type       TEXT NOT NULL,
+            message          TEXT NOT NULL,
+            fan_speed_applied INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_fan_faults_ts ON fan_faults(ts);
     """)
 
 
@@ -218,5 +227,26 @@ def list_transitions(limit: int = 20) -> list[dict]:
     with lock:
         rows = conn().execute(
             "SELECT * FROM transitions ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Fan faults ────────────────────────────────────────────────────────────────
+
+def insert_fan_fault(event_type: str, message: str,
+                     fan_speed_applied: Optional[int] = None) -> int:
+    with lock:
+        cur = conn().execute(
+            "INSERT INTO fan_faults (ts, event_type, message, fan_speed_applied) "
+            "VALUES (?, ?, ?, ?)",
+            (time.time(), event_type, message, fan_speed_applied)
+        )
+    return cur.lastrowid
+
+
+def list_fan_faults(limit: int = 100) -> list[dict]:
+    with lock:
+        rows = conn().execute(
+            "SELECT * FROM fan_faults ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]

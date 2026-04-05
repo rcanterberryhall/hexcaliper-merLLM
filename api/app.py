@@ -568,6 +568,45 @@ async def batch_requeue(job_id: str):
     return {"ok": True}
 
 
+# ── Fan controller fault log ──────────────────────────────────────────────────
+
+@app.post("/api/fan/fault")
+async def fan_fault(request: Request):
+    """
+    Receive a fault event from the iDRAC fan controller and store it.
+
+    Expected body:
+      {
+        "type":              "gpu_fault_onset" | "gpu_fault_cleared" | ...,
+        "message":           "human-readable description",
+        "timestamp":         "ISO-8601 string (informational; DB uses server time)",
+        "fan_speed_applied": 80   (optional integer)
+      }
+    """
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    event_type = body.get("type", "unknown")
+    message    = body.get("message", "")
+    fan_speed  = body.get("fan_speed_applied")
+    if fan_speed is not None:
+        try:
+            fan_speed = int(fan_speed)
+        except (ValueError, TypeError):
+            fan_speed = None
+
+    row_id = db.insert_fan_fault(event_type, message, fan_speed)
+    return {"ok": True, "id": row_id}
+
+
+@app.get("/api/fan/faults")
+async def fan_faults(limit: int = 100):
+    """Return the most recent fan controller fault events, newest first."""
+    return db.list_fan_faults(limit=min(limit, 500))
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
 

@@ -166,3 +166,31 @@ def test_insert_and_list_transitions(tmp_db):
     transitions = db.list_transitions(limit=10)
     assert len(transitions) == 2
     assert transitions[0]["direction"] == "to_day"   # most recent first
+
+
+# ── Fan faults ─────────────────────────────────────────────────────────────────
+
+
+def test_insert_and_list_fan_faults(tmp_db):
+    db = tmp_db
+    db.insert_fan_fault("gpu_fault_onset", "NVML failure detected", fan_speed_applied=80)
+    db.insert_fan_fault("gpu_fault_cleared", "NVML recovered")
+    faults = db.list_fan_faults(limit=10)
+    assert len(faults) == 2
+    assert faults[0]["event_type"] == "gpu_fault_cleared"   # most recent first
+    assert faults[1]["event_type"] == "gpu_fault_onset"
+    assert faults[1]["fan_speed_applied"] == 80
+    assert faults[0]["fan_speed_applied"] is None
+
+
+def test_fan_fault_list_is_empty_initially(tmp_db):
+    db = tmp_db
+    assert db.list_fan_faults() == []
+
+
+def test_fan_fault_limit_is_respected(tmp_db):
+    db = tmp_db
+    for i in range(10):
+        db.insert_fan_fault("gpu_fault_onset", f"fault {i}", fan_speed_applied=80)
+    faults = db.list_fan_faults(limit=5)
+    assert len(faults) == 5
