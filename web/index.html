@@ -117,8 +117,12 @@
       </div>
       <div class="card">
         <h2>Job Queue</h2>
-        <div style="margin-bottom:8px;display:flex;gap:8px">
+        <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn" onclick="loadBatchJobs()">Refresh</button>
+          <button class="btn" onclick="batchRunNow()">Run Now</button>
+          <button class="btn" onclick="batchRetryFailed()">Retry Failed</button>
+          <button class="btn" style="color:var(--warning,#f0a030)" onclick="batchDrain()">Drain Queue</button>
+          <button class="btn" onclick="batchClearCompleted()">Clear Completed</button>
         </div>
         <div id="batch-table-wrap">
           <table>

@@ -27,6 +27,10 @@ async function post(path, body) {
   });
 }
 
+async function del(path) {
+  return api(path, { method: "DELETE" });
+}
+
 // ── Polling ───────────────────────────────────────────────────────────────────
 
 let _pollTimer        = null;
@@ -377,6 +381,39 @@ async function viewResult(id) {
     const r = await api(`/api/batch/results/${id}`);
     alert(r.result);
   } catch (err) { alert("Error: " + err.message); }
+}
+
+async function batchRunNow() {
+  try {
+    await post("/api/batch/run-now", {});
+    loadBatchJobs();
+  } catch (err) { alert("Run Now failed: " + err.message); }
+}
+
+async function batchRetryFailed() {
+  try {
+    const r = await post("/api/batch/retry-failed", {});
+    loadBatchJobs();
+    if (r.requeued === 0) alert("No failed jobs to retry.");
+  } catch (err) { alert("Retry failed: " + err.message); }
+}
+
+async function batchDrain() {
+  if (!confirm("Cancel all queued jobs?")) return;
+  try {
+    const r = await post("/api/batch/drain", {});
+    loadBatchJobs();
+    alert(`Drained ${r.cancelled} queued job(s).`);
+  } catch (err) { alert("Drain failed: " + err.message); }
+}
+
+async function batchClearCompleted() {
+  if (!confirm("Delete all completed and cancelled jobs?")) return;
+  try {
+    const r = await del("/api/batch/completed");
+    loadBatchJobs();
+    alert(`Deleted ${r.deleted} job(s).`);
+  } catch (err) { alert("Clear failed: " + err.message); }
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────

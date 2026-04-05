@@ -124,6 +124,47 @@ def update_batch_job(job_id: str, **fields) -> None:
         )
 
 
+def drain_queued_jobs() -> int:
+    """Cancel all jobs currently in 'queued' status. Returns count cancelled."""
+    with lock:
+        cur = conn().execute(
+            "UPDATE batch_jobs SET status = 'cancelled' WHERE status = 'queued'"
+        )
+    return cur.rowcount
+
+
+def requeue_all_failed_jobs() -> int:
+    """Requeue all failed jobs. Returns count requeued."""
+    with lock:
+        cur = conn().execute(
+            "UPDATE batch_jobs SET status = 'queued', error = NULL, "
+            "started_at = NULL, completed_at = NULL, result = NULL "
+            "WHERE status = 'failed'"
+        )
+    return cur.rowcount
+
+
+def delete_terminal_jobs(older_than_days: Optional[int] = None) -> int:
+    """
+    Delete completed and cancelled jobs.
+    If older_than_days is set, only delete jobs completed/cancelled more than
+    that many days ago. Returns count deleted.
+    """
+    with lock:
+        if older_than_days is not None:
+            cutoff = time.time() - older_than_days * 86400
+            cur = conn().execute(
+                "DELETE FROM batch_jobs WHERE status IN ('completed', 'cancelled') "
+                "AND submitted_at < ?",
+                (cutoff,)
+            )
+        else:
+            cur = conn().execute(
+                "DELETE FROM batch_jobs WHERE status IN ('completed', 'cancelled')"
+            )
+    return cur.rowcount
+
+
 def requeue_orphaned_jobs() -> int:
     """
     Reset any jobs left in 'running' status back to 'queued'.

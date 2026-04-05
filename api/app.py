@@ -573,6 +573,35 @@ async def batch_requeue(job_id: str):
     return {"ok": True}
 
 
+@app.post("/api/batch/drain")
+async def batch_drain():
+    """Cancel all queued jobs."""
+    n = db.drain_queued_jobs()
+    return {"ok": True, "cancelled": n}
+
+
+@app.post("/api/batch/retry-failed")
+async def batch_retry_failed():
+    """Requeue all failed jobs."""
+    n = db.requeue_all_failed_jobs()
+    queue_manager.signal_night_mode()
+    return {"ok": True, "requeued": n}
+
+
+@app.post("/api/batch/run-now")
+async def batch_run_now():
+    """Trigger the batch runner immediately without waiting for night mode."""
+    queue_manager.signal_night_mode()
+    return {"ok": True}
+
+
+@app.delete("/api/batch/completed")
+async def batch_delete_completed(older_than_days: Optional[int] = None):
+    """Delete completed and cancelled jobs, optionally filtered by age."""
+    n = db.delete_terminal_jobs(older_than_days)
+    return {"ok": True, "deleted": n}
+
+
 # ── Fan controller fault log ──────────────────────────────────────────────────
 
 @app.post("/api/fan/fault")

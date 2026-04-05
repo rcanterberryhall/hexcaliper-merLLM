@@ -221,3 +221,76 @@ def test_fan_fault_limit_is_respected(tmp_db):
         db.insert_fan_fault("gpu_fault_onset", f"fault {i}", fan_speed_applied=80)
     faults = db.list_fan_faults(limit=5)
     assert len(faults) == 5
+
+
+# ── Batch queue management helpers ────────────────────────────────────────────
+
+
+def test_drain_queued_jobs(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.insert_batch_job("j3", "app", "model", "prompt", {})
+    db.update_batch_job("j3", status="running", started_at=time.time())
+
+    count = db.drain_queued_jobs()
+    assert count == 2
+    assert db.get_batch_job("j1")["status"] == "cancelled"
+    assert db.get_batch_job("j2")["status"] == "cancelled"
+    assert db.get_batch_job("j3")["status"] == "running"  # not touched
+
+
+def test_drain_queued_jobs_none_queued(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="running", started_at=time.time())
+    assert db.drain_queued_jobs() == 0
+
+
+def test_requeue_all_failed_jobs(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="failed", error="timeout")
+    db.update_batch_job("j2", status="failed", error="oom")
+
+    count = db.requeue_all_failed_jobs()
+    assert count == 2
+    j1 = db.get_batch_job("j1")
+    assert j1["status"] == "queued"
+    assert j1["error"] is None
+
+
+def test_requeue_all_failed_jobs_none_failed(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    assert db.requeue_all_failed_jobs() == 0
+
+
+def test_delete_terminal_jobs_all(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.insert_batch_job("j3", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="completed", completed_at=time.time())
+    db.update_batch_job("j2", status="cancelled")
+    # j3 stays queued
+
+    count = db.delete_terminal_jobs()
+    assert count == 2
+    assert db.get_batch_job("j1") is None
+    assert db.get_batch_job("j2") is None
+    assert db.get_batch_job("j3") is not None
+
+
+def test_delete_terminal_jobs_age_filter(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="completed", completed_at=time.time())
+    db.update_batch_job("j2", status="completed", completed_at=time.time())
+
+    # Filter by age=1 day — both jobs were just submitted, none old enough
+    count = db.delete_terminal_jobs(older_than_days=1)
+    assert count == 0
+    assert db.get_batch_job("j1") is not None
