@@ -124,6 +124,22 @@ def update_batch_job(job_id: str, **fields) -> None:
         )
 
 
+def requeue_orphaned_jobs() -> int:
+    """
+    Reset any jobs left in 'running' status back to 'queued'.
+
+    Called at startup to recover jobs that were mid-flight when the
+    process was killed or the container was restarted.  Returns the
+    number of jobs recovered.
+    """
+    with lock:
+        cur = conn().execute(
+            "UPDATE batch_jobs SET status = 'queued', started_at = NULL, error = 'Recovered after restart' "
+            "WHERE status = 'running'"
+        )
+    return cur.rowcount
+
+
 def cancel_batch_job(job_id: str) -> bool:
     with lock:
         cur = conn().execute(

@@ -151,6 +151,11 @@ async def lifespan(app: FastAPI):
         if m == mode_manager.Mode.NIGHT else None
     )
 
+    # Recover any jobs that were running when the process was last killed
+    recovered = db.requeue_orphaned_jobs()
+    if recovered:
+        print(f"[merllm] recovered {recovered} orphaned job(s) → queued")
+
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
     asyncio.create_task(mode_manager.scheduler_loop())

@@ -171,6 +171,33 @@ def test_insert_and_list_transitions(tmp_db):
 # ── Fan faults ─────────────────────────────────────────────────────────────────
 
 
+def test_requeue_orphaned_jobs(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.insert_batch_job("j3", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="running", started_at=time.time())
+    db.update_batch_job("j2", status="running", started_at=time.time())
+    db.update_batch_job("j3", status="completed", completed_at=time.time())
+
+    recovered = db.requeue_orphaned_jobs()
+    assert recovered == 2
+
+    j1 = db.get_batch_job("j1")
+    j2 = db.get_batch_job("j2")
+    j3 = db.get_batch_job("j3")
+    assert j1["status"] == "queued"
+    assert j1["started_at"] is None
+    assert j2["status"] == "queued"
+    assert j3["status"] == "completed"   # untouched
+
+
+def test_requeue_orphaned_jobs_none_running(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    assert db.requeue_orphaned_jobs() == 0
+
+
 def test_insert_and_list_fan_faults(tmp_db):
     db = tmp_db
     db.insert_fan_fault("gpu_fault_onset", "NVML failure detected", fan_speed_applied=80)
