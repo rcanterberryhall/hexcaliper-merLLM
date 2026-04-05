@@ -810,6 +810,12 @@ async def fans_reset_settings():
         return JSONResponse({"error": str(exc)}, status_code=503)
 
 
+@app.get("/api/merllm/fans/faults")
+async def fans_faults(limit: int = 100):
+    """Fault history stored in merLLM DB (does not proxy to fan controller)."""
+    return db.list_fan_faults(limit=min(limit, 500))
+
+
 # ── WebSocket: SSH terminal ───────────────────────────────────────────────────
 
 

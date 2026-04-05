@@ -652,6 +652,55 @@ async function loadFans() {
   ]);
   renderFansStatus(fanStatus);
   renderFansControl(fanStatus, fanSettings);
+  loadFaultHistory().catch(() => {});
+}
+
+async function loadFaultHistory() {
+  const el = document.getElementById("fans-fault-content");
+  try {
+    const faults = await api("/api/merllm/fans/faults?limit=50");
+    renderFaultHistory(el, faults);
+  } catch (err) {
+    el.innerHTML = `<span class="muted">Could not load fault history: ${esc(err.message)}</span>`;
+  }
+}
+
+function renderFaultHistory(el, faults) {
+  if (!faults || faults.length === 0) {
+    el.innerHTML = `<span class="muted">No fault events recorded.</span>`;
+    return;
+  }
+
+  const TYPE_STYLE = {
+    gpu_fault_onset:   { color: "var(--red)",    icon: "&#9888;" },
+    gpu_fault_cleared: { color: "var(--green)",  icon: "&#10003;" },
+    idrac_read_fault:  { color: "var(--red)",    icon: "&#9888;" },
+    default:           { color: "var(--yellow)", icon: "&#9432;" },
+  };
+
+  const rows = faults.map(f => {
+    const style = TYPE_STYLE[f.event_type] || TYPE_STYLE.default;
+    const ts    = f.ts ? new Date(f.ts * 1000).toLocaleString() : "—";
+    const speed = f.fan_speed_applied != null
+      ? `<span class="muted" style="font-size:11px">&nbsp;(fallback ${f.fan_speed_applied}%)</span>`
+      : "";
+    return `<tr>
+      <td style="white-space:nowrap;color:var(--muted);font-size:11px">${esc(ts)}</td>
+      <td style="color:${style.color};font-size:12px">${style.icon}&nbsp;${esc(f.event_type)}</td>
+      <td style="font-size:12px">${esc(f.message)}${speed}</td>
+    </tr>`;
+  }).join("");
+
+  el.innerHTML = `
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Type</th><th>Message</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:8px">Showing last ${faults.length} event${faults.length !== 1 ? "s" : ""}. Stored in merLLM DB.</div>`;
 }
 
 function renderFansStatus(s) {
