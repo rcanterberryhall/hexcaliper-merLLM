@@ -106,6 +106,14 @@ FAN_CONTROLLER_URL = _get("FAN_CONTROLLER_URL", "http://host.docker.internal:808
 # Gotify, and any HTTP endpoint that accepts JSON POST.
 NOTIFICATION_WEBHOOK_URL = _get("NOTIFICATION_WEBHOOK_URL", "")
 
+# ── Companion service URLs (for My Day panel) ────────────────────────────────
+
+# URL of the Parsival (hexcaliper-squire) nginx, reachable from merLLM container.
+PARSIVAL_URL = _get("PARSIVAL_URL", "http://host.docker.internal:8082")
+
+# URL of the LanceLLMot (hexcaliper) nginx, reachable from merLLM container.
+LANCELLMOT_URL = _get("LANCELLMOT_URL", "http://host.docker.internal:8080")
+
 # ── Log container name mapping ────────────────────────────────────────────────
 # Maps logical service names to Docker container names for the /api/merllm/logs
 # endpoint. Override if your compose project name or container names differ.
@@ -131,6 +139,8 @@ def apply_overrides(d: dict) -> None:
         "ssh_user":                  "SSH_USER",
         "ssh_key_path":              "SSH_KEY_PATH",
         "notification_webhook_url":  "NOTIFICATION_WEBHOOK_URL",
+        "parsival_url":              "PARSIVAL_URL",
+        "lancellmot_url":            "LANCELLMOT_URL",
     }
     int_fields = {
         "night_num_ctx":           "NIGHT_NUM_CTX",

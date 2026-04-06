@@ -55,6 +55,9 @@ function startPolling() {
   refreshActivity();
   _startActivityStream();
   _startNotifStream();
+  // My Day panel: load once on startup, refresh every 60s
+  refreshMyDay();
+  setInterval(refreshMyDay, 60000);
 }
 
 function _startNotifStream() {
@@ -895,6 +898,106 @@ async function saveSettings() {
   } catch (err) {
     document.getElementById("settings-msg").textContent = "Save failed: " + err.message;
   }
+}
+
+// ── My Day Panel ──────────────────────────────────────────────────────────────
+
+async function refreshMyDay() {
+  try {
+    const data = await api("/api/merllm/myday");
+    renderMyDay(data);
+  } catch (err) {
+    document.getElementById("myday-cards").innerHTML =
+      `<div class="myday-card myday-err">Failed to load My Day summary: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderMyDay(data) {
+  const cards = [];
+
+  // Parsival card
+  if (!data.parsival.ok) {
+    cards.push(`<div class="myday-card myday-offline">
+      <div class="myday-app">Parsival</div>
+      <div class="myday-offline-msg">offline</div>
+    </div>`);
+  } else {
+    const p = data.parsival;
+    const hasSituations = p.active_situations > 0;
+    const hasOverdue    = p.overdue_followups > 0;
+    const cls = (hasSituations || hasOverdue) ? "myday-card myday-attention" : "myday-card myday-ok";
+    cards.push(`<a class="myday-link" href="/page/index.html" target="_blank" rel="noopener">
+      <div class="${cls}">
+        <div class="myday-app">Parsival</div>
+        <div class="myday-rows">
+          <div class="myday-row">
+            <span class="myday-label">Active situations</span>
+            <span class="myday-val${hasSituations ? ' myday-highlight' : ''}">${p.active_situations}</span>
+          </div>
+          <div class="myday-row">
+            <span class="myday-label">New / investigating</span>
+            <span class="myday-val">${p.new_investigating}</span>
+          </div>
+          <div class="myday-row">
+            <span class="myday-label">Overdue follow-ups</span>
+            <span class="myday-val${hasOverdue ? ' myday-highlight' : ''}">${p.overdue_followups}</span>
+          </div>
+          ${p.cold_start ? '<div class="myday-hint">Learning attention patterns…</div>' : ''}
+        </div>
+      </div>
+    </a>`);
+  }
+
+  // LanceLLMot card
+  if (!data.lancellmot.ok) {
+    cards.push(`<div class="myday-card myday-offline">
+      <div class="myday-app">LanceLLMot</div>
+      <div class="myday-offline-msg">offline</div>
+    </div>`);
+  } else {
+    const l = data.lancellmot;
+    const hasPending = l.total_pending > 0;
+    const cls = hasPending ? "myday-card myday-attention" : "myday-card myday-ok";
+    cards.push(`<a class="myday-link" href="/web/index.html" target="_blank" rel="noopener">
+      <div class="${cls}">
+        <div class="myday-app">LanceLLMot</div>
+        <div class="myday-rows">
+          <div class="myday-row">
+            <span class="myday-label">Acquisition pending</span>
+            <span class="myday-val${l.acquisition_pending > 0 ? ' myday-highlight' : ''}">${l.acquisition_pending}</span>
+          </div>
+          <div class="myday-row">
+            <span class="myday-label">Escalation pending</span>
+            <span class="myday-val${l.escalation_pending > 0 ? ' myday-highlight' : ''}">${l.escalation_pending}</span>
+          </div>
+        </div>
+      </div>
+    </a>`);
+  }
+
+  // merLLM card
+  const m = data.merllm;
+  const hasJobs = m.queued_jobs > 0 || m.failed_jobs > 0;
+  const mCls = hasJobs ? "myday-card myday-attention" : "myday-card myday-ok";
+  cards.push(`<div class="${mCls}">
+    <div class="myday-app">merLLM</div>
+    <div class="myday-rows">
+      <div class="myday-row">
+        <span class="myday-label">Queued batch jobs</span>
+        <span class="myday-val${m.queued_jobs > 0 ? ' myday-highlight' : ''}">${m.queued_jobs}</span>
+      </div>
+      <div class="myday-row">
+        <span class="myday-label">Completed (unreviewed)</span>
+        <span class="myday-val">${m.completed_jobs}</span>
+      </div>
+      <div class="myday-row">
+        <span class="myday-label">Failed jobs</span>
+        <span class="myday-val${m.failed_jobs > 0 ? ' myday-highlight' : ''}">${m.failed_jobs}</span>
+      </div>
+    </div>
+  </div>`);
+
+  document.getElementById("myday-cards").innerHTML = cards.join("");
 }
 
 // ── Fan Controller ────────────────────────────────────────────────────────────

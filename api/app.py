@@ -819,6 +819,67 @@ async def metrics_thresholds(request: Request):
 # ── Database backup ───────────────────────────────────────────────────────────
 
 
+@app.get("/api/merllm/myday")
+async def merllm_myday():
+    """
+    Aggregate 'My Day' attention summary from all Hexcaliper services.
+
+    Fetches from Parsival (/page/api/attention/summary) and LanceLLMot
+    (/api/status/pending) concurrently.  If a service is unreachable,
+    its section is omitted and an error flag is set.
+
+    Also returns merLLM's own batch job queue counts.
+
+    :return: Dict with ``parsival``, ``lancellmot``, and ``merllm`` sections.
+    :rtype: dict
+    """
+    _myday_log = logging.getLogger("merllm.myday")
+
+    async def _fetch(url: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.json()
+        except Exception as exc:
+            _myday_log.warning("myday fetch failed for %s: %s", url, exc)
+            return None
+
+    parsival_url    = f"{config.PARSIVAL_URL}/page/api/attention/summary"
+    lancellmot_url  = f"{config.LANCELLMOT_URL}/api/status/pending"
+
+    parsival_data, lancellmot_data = await asyncio.gather(
+        _fetch(parsival_url),
+        _fetch(lancellmot_url),
+    )
+
+    queued_jobs    = db.list_batch_jobs(status="queued")
+    completed_jobs = db.list_batch_jobs(status="completed")
+    failed_jobs    = db.list_batch_jobs(status="failed")
+
+    return {
+        "parsival": {
+            "ok":               parsival_data is not None,
+            "active_situations": parsival_data.get("active_situations", 0) if parsival_data else 0,
+            "new_investigating": parsival_data.get("new_investigating", 0) if parsival_data else 0,
+            "overdue_followups": parsival_data.get("overdue_followups", 0) if parsival_data else 0,
+            "cold_start":        parsival_data.get("cold_start", True) if parsival_data else True,
+        },
+        "lancellmot": {
+            "ok":                   lancellmot_data is not None,
+            "acquisition_pending":  lancellmot_data.get("acquisition_pending", 0) if lancellmot_data else 0,
+            "escalation_pending":   lancellmot_data.get("escalation_pending", 0) if lancellmot_data else 0,
+            "total_pending":        lancellmot_data.get("total_pending", 0) if lancellmot_data else 0,
+        },
+        "merllm": {
+            "ok":              True,
+            "queued_jobs":     len(queued_jobs),
+            "completed_jobs":  len(completed_jobs),
+            "failed_jobs":     len(failed_jobs),
+        },
+    }
+
+
 @app.get("/api/merllm/events")
 async def merllm_events(request: Request):
     """

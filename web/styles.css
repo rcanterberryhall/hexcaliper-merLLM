@@ -395,6 +395,68 @@ tr:hover td { background: #1c2330; }
 .range-btn:hover  { color: var(--text); background: var(--border); }
 .range-btn.active { color: var(--text); background: var(--bg); border-color: var(--accent); }
 
+/* My Day panel */
+.myday-panel {
+  margin-bottom: 16px;
+  padding: 16px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.myday-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.myday-cards {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.myday-link {
+  text-decoration: none;
+  color: inherit;
+  flex: 1 1 200px;
+}
+.myday-card {
+  flex: 1 1 200px;
+  padding: 12px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  min-width: 180px;
+}
+.myday-link .myday-card { cursor: pointer; transition: border-color .15s; }
+.myday-link:hover .myday-card { border-color: var(--accent); }
+.myday-card.myday-attention { border-left: 3px solid var(--yellow); }
+.myday-card.myday-ok        { border-left: 3px solid var(--green); }
+.myday-card.myday-offline   { border-left: 3px solid var(--red); opacity: .7; }
+.myday-card.myday-loading   { color: var(--muted); }
+.myday-card.myday-err       { color: var(--red); }
+.myday-app {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.myday-offline-msg { color: var(--red); font-size: 13px; }
+.myday-rows { display: flex; flex-direction: column; gap: 4px; }
+.myday-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+}
+.myday-label { color: var(--muted); }
+.myday-val   { font-weight: 600; }
+.myday-val.myday-highlight { color: var(--yellow); }
+.myday-hint  { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
 /* Job completion toast notifications */
 .job-toast {
   position: fixed;
