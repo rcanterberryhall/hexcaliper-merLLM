@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 _req_log = logging.getLogger("merllm.requests")
+log = logging.getLogger("merllm")
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
@@ -157,10 +158,30 @@ async def lifespan(app: FastAPI):
         if m == mode_manager.Mode.NIGHT else None
     )
 
+    # Startup diagnostics: database integrity
+    try:
+        integrity = db.conn().execute("PRAGMA integrity_check").fetchone()
+        if integrity and integrity[0] != "ok":
+            log.error("database integrity check failed: %s", integrity[0])
+        else:
+            log.info("database integrity check passed")
+    except Exception as exc:
+        log.error("database integrity check error: %s", exc)
+
+    # Startup diagnostics: check Ollama instances
+    for name, url in [("gpu0", config.OLLAMA_0_URL), ("gpu1", config.OLLAMA_1_URL)]:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+                r = await client.get(f"{url}/api/tags")
+                models = len(r.json().get("models", []))
+                log.info("Ollama %s reachable (%d models)", name, models)
+        except Exception as exc:
+            log.warning("Ollama %s unreachable at startup: %s", name, exc)
+
     # Recover any jobs that were running when the process was last killed
     recovered = db.requeue_orphaned_jobs()
     if recovered:
-        print(f"[merllm] recovered {recovered} orphaned job(s) → queued")
+        log.info("recovered %d orphaned job(s) → queued", recovered)
 
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
@@ -168,9 +189,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(queue_manager.worker_loop())
     asyncio.create_task(queue_manager.batch_runner_loop())
 
-    print(f"[merllm] started — mode={mode_manager.current_mode().value}")
+    log.info("started — mode=%s", mode_manager.current_mode().value)
     yield
-    print("[merllm] shutting down")
+    log.info("shutting down")
 
 
 app = FastAPI(title="merLLM", version="1.0.0", lifespan=lifespan)

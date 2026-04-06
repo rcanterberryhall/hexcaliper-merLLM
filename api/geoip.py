@@ -7,10 +7,13 @@ The resolved offset is cached; updates when the detected offset changes.
 Download GeoLite2-City.mmdb from MaxMind (free account required) and place
 it at the path specified by GEOIP_DB_PATH.
 """
+import logging
 import os
 from typing import Optional
 
 import config
+
+log = logging.getLogger(__name__)
 
 _reader = None
 _cached_ip: Optional[str] = None
@@ -27,7 +30,8 @@ def _get_reader():
         import geoip2.database
         _reader = geoip2.database.Reader(config.GEOIP_DB_PATH)
         return _reader
-    except Exception:
+    except Exception as exc:
+        log.warning("GeoIP database init failed: %s", exc)
         return None
 
 
@@ -60,7 +64,8 @@ def get_utc_offset(ip: str) -> float:
         response = reader.city(ip)
         offset = float(response.location.time_zone and
                        _tz_to_offset(response.location.time_zone) or 0.0)
-    except Exception:
+    except Exception as exc:
+        log.warning("GeoIP lookup failed for %s: %s", ip, exc)
         offset = 0.0
 
     _cached_ip = ip
@@ -75,7 +80,8 @@ def _tz_to_offset(tz_name: str) -> float:
         import zoneinfo
         now = datetime.now(zoneinfo.ZoneInfo(tz_name))
         return now.utcoffset().total_seconds() / 3600
-    except Exception:
+    except Exception as exc:
+        log.warning("timezone offset lookup failed for %s: %s", tz_name, exc)
         return 0.0
 
 

@@ -131,6 +131,7 @@ async def worker_loop() -> None:
                 result = await _forward(item.target, item.body)
             item.future.set_result(result)
         except Exception as exc:
+            log.error("request to %s failed: %s", item.target, exc)
             if not item.future.done():
                 item.future.set_exception(exc)
         finally:

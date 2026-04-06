@@ -8,6 +8,7 @@ GPU metrics use pynvml via the NVML library mounted in the container.
 Gracefully degrades if pynvml is unavailable or NVML initialisation fails.
 """
 import asyncio
+import logging
 import time
 from typing import Optional
 
@@ -15,6 +16,8 @@ import psutil
 
 import config
 import db
+
+log = logging.getLogger(__name__)
 
 _nvml_ok = False
 _gpu_count = 0
@@ -27,7 +30,8 @@ def _init_nvml() -> None:
         pynvml.nvmlInit()
         _gpu_count = pynvml.nvmlDeviceGetCount()
         _nvml_ok = True
-    except Exception:
+    except Exception as exc:
+        log.warning("NVML init failed (GPU metrics disabled): %s", exc)
         _nvml_ok = False
 
 
@@ -44,14 +48,14 @@ def _collect_gpu_points() -> list[tuple[str, float]]:
             temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
             pwr  = pynvml.nvmlDeviceGetPowerUsage(h) / 1000  # mW → W
             points += [
-                (f"gpu{i}.util",      float(util.gpu)),
-                (f"gpu{i}.mem_used",  float(mem.used)),
-                (f"gpu{i}.mem_total", float(mem.total)),
-                (f"gpu{i}.temp",      float(temp)),
-                (f"gpu{i}.power_w",   float(pwr)),
+                (f"gpu{i}.util_pct",    float(util.gpu)),
+                (f"gpu{i}.mem_used_mb", float(mem.used)  / 1024 ** 2),
+                (f"gpu{i}.mem_total_mb",float(mem.total) / 1024 ** 2),
+                (f"gpu{i}.temp_c",      float(temp)),
+                (f"gpu{i}.power_w",     float(pwr)),
             ]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("GPU metric collection failed: %s", exc)
     return points
 
 
@@ -73,7 +77,8 @@ def collect() -> list[tuple[str, float]]:
 
     # CPU
     per_cpu = psutil.cpu_percent(percpu=True)
-    points.append(("cpu.total", float(psutil.cpu_percent())))
+    total = sum(per_cpu) / len(per_cpu) if per_cpu else 0.0
+    points.append(("cpu.total", total))
     for i, pct in enumerate(per_cpu):
         points.append((f"cpu.core{i}", float(pct)))
 
@@ -99,9 +104,10 @@ def collect() -> list[tuple[str, float]]:
         points += [
             ("disk.root.used",  float(du.used)),
             ("disk.root.total", float(du.total)),
+            ("disk.root.pct",   float(du.percent)),
         ]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("disk usage collection failed: %s", exc)
 
     # Disk I/O
     try:
@@ -111,8 +117,8 @@ def collect() -> list[tuple[str, float]]:
                 ("disk.read_bytes",  float(dio.read_bytes)),
                 ("disk.write_bytes", float(dio.write_bytes)),
             ]
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("disk I/O collection failed: %s", exc)
 
     # Network throughput
     sent, recv = _net_bytes()
@@ -148,16 +154,16 @@ def gpu_snapshot() -> list[dict]:
             temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
             pwr  = pynvml.nvmlDeviceGetPowerUsage(h) / 1000
             result.append({
-                "index":     i,
-                "name":      name,
-                "gpu_util":  util.gpu,
-                "mem_used":  mem.used,
-                "mem_total": mem.total,
-                "temp":      temp,
-                "power_w":   pwr,
+                "index":          i,
+                "name":           name,
+                "utilization_pct": util.gpu,
+                "mem_used_mb":    round(mem.used  / 1024 ** 2, 1),
+                "mem_total_mb":   round(mem.total / 1024 ** 2, 1),
+                "temp_c":         temp,
+                "power_w":        pwr,
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("GPU snapshot failed: %s", exc)
     return result
 
 
@@ -170,5 +176,5 @@ async def collection_loop() -> None:
             db.insert_metrics(points)
             db.prune_old_metrics(config.METRICS_RETAIN_DAYS)
         except Exception as exc:
-            print(f"[metrics] collection error: {exc}")
+            log.error("collection error: %s", exc)
         await asyncio.sleep(config.METRICS_INTERVAL_SEC)
