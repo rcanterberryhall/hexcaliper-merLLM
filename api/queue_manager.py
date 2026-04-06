@@ -9,15 +9,22 @@ Batch jobs queued via POST /api/batch/submit are held in SQLite and executed
 when night mode activates (or immediately if night mode is already active).
 The night-mode batch runner processes jobs sequentially against the dual-GPU
 Ollama instance with extended context.
+
+Failed jobs are automatically retried up to BATCH_MAX_RETRIES times with
+exponential backoff (30s, 120s, …). The accumulated error history is
+preserved in the job's error field.
 """
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 import config
 import db
@@ -172,6 +179,8 @@ def get_job_status(job_id: str) -> Optional[dict]:
         "started_at":   job.get("started_at"),
         "completed_at": job.get("completed_at"),
         "error":        job.get("error"),
+        "retries":      job.get("retries", 0),
+        "retry_after":  job.get("retry_after"),
     }
 
 
@@ -197,9 +206,13 @@ async def batch_runner_loop() -> None:
     """
     Execute queued batch jobs during night mode.
 
-    Waits for the night-mode signal, then processes all queued jobs
-    sequentially with extended context. Returns to waiting when the
-    queue is empty or day mode resumes.
+    Waits for the night-mode signal, then loops until either:
+    - All jobs (including deferred retries) are processed, or
+    - Night mode ends.
+
+    Deferred retries (jobs with a future retry_after timestamp) are
+    waited for in-place — the runner sleeps until the earliest one is
+    ready rather than exiting and losing the night-mode window.
     """
     while True:
         await _batch_event.wait()
@@ -208,24 +221,41 @@ async def batch_runner_loop() -> None:
         if mode_manager.current_mode() != mode_manager.Mode.NIGHT:
             continue
 
-        queued = db.list_batch_jobs(status="queued")
-        if not queued:
-            continue
+        log.info("batch runner activated")
 
-        print(f"[batch] night mode active — processing {len(queued)} job(s)")
-
-        for job in queued:
-            if mode_manager.current_mode() != mode_manager.Mode.NIGHT:
-                print("[batch] mode changed — pausing batch processing")
-                break
-            await _run_batch_job(job)
+        while mode_manager.current_mode() == mode_manager.Mode.NIGHT:
+            ready = db.list_batch_jobs(status="queued", ready_only=True)
+            if ready:
+                log.info("batch: processing %d ready job(s)", len(ready))
+                for job in ready:
+                    if mode_manager.current_mode() != mode_manager.Mode.NIGHT:
+                        log.info("batch: mode changed — pausing")
+                        break
+                    await _run_batch_job(job)
+            else:
+                next_ts = db.get_earliest_retry_after()
+                if next_ts is None:
+                    log.info("batch: queue empty, going idle")
+                    break
+                wait_sec = max(1.0, next_ts - time.time())
+                log.info("batch: %.0fs until next retry", wait_sec)
+                await asyncio.sleep(min(wait_sec, 60.0))
 
 
 async def _run_batch_job(job: dict) -> None:
-    job_id = job["id"]
+    """
+    Execute one batch job against Ollama.
+
+    On failure, automatically retries up to BATCH_MAX_RETRIES times with
+    exponential backoff (30s × 4^attempt). Each retry increments the
+    job's retry counter and sets retry_after. On final failure the job
+    is marked 'failed' with accumulated error history.
+    """
+    job_id  = job["id"]
+    retries = job.get("retries", 0)
     db.update_batch_job(job_id, status="running", started_at=time.time())
 
-    options = {}
+    options: dict = {}
     try:
         options = json.loads(job.get("options", "{}"))
     except (json.JSONDecodeError, TypeError):
@@ -249,8 +279,28 @@ async def _run_batch_job(job: dict) -> None:
             result_text = resp.json().get("response", "")
         db.update_batch_job(job_id, status="completed",
                             completed_at=time.time(), result=result_text)
-        print(f"[batch] job {job_id[:8]} completed")
+        log.info("batch job %s completed", job_id[:8])
     except Exception as exc:
-        db.update_batch_job(job_id, status="failed",
-                            completed_at=time.time(), error=str(exc))
-        print(f"[batch] job {job_id[:8]} failed: {exc}")
+        prev_error = (job.get("error") or "").strip()
+        if retries < config.BATCH_MAX_RETRIES:
+            backoff    = 30 * (4 ** retries)          # 30s, 120s, 480s …
+            retry_after = time.time() + backoff
+            new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
+            db.update_batch_job(
+                job_id,
+                status="queued",
+                retries=retries + 1,
+                retry_after=retry_after,
+                started_at=None,
+                error=new_error,
+            )
+            log.warning(
+                "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
+                job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
+            )
+        else:
+            final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
+            db.update_batch_job(job_id, status="failed",
+                                completed_at=time.time(), error=final_error)
+            log.error("batch job %s permanently failed after %d attempt(s): %s",
+                      job_id[:8], retries + 1, exc)

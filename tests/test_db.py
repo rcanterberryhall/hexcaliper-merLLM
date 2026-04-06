@@ -294,3 +294,61 @@ def test_delete_terminal_jobs_age_filter(tmp_db):
     count = db.delete_terminal_jobs(older_than_days=1)
     assert count == 0
     assert db.get_batch_job("j1") is not None
+
+
+# ── Retry columns ─────────────────────────────────────────────────────────────
+
+
+def test_new_job_has_zero_retries(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    j = db.get_batch_job("j1")
+    assert j["retries"] == 0
+    assert j["retry_after"] is None
+
+
+def test_list_batch_jobs_ready_only_excludes_deferred(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt 1", {})  # ready (no retry_after)
+    db.insert_batch_job("j2", "app", "model", "prompt 2", {})  # deferred
+    db.update_batch_job("j2", retry_after=time.time() + 3600)  # 1h in the future
+
+    ready = db.list_batch_jobs(status="queued", ready_only=True)
+    ids = [j["id"] for j in ready]
+    assert "j1" in ids
+    assert "j2" not in ids
+
+
+def test_list_batch_jobs_ready_only_includes_past_retry_after(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.update_batch_job("j1", retry_after=time.time() - 10)  # in the past
+
+    ready = db.list_batch_jobs(status="queued", ready_only=True)
+    assert any(j["id"] == "j1" for j in ready)
+
+
+def test_get_earliest_retry_after_none_when_empty(tmp_db):
+    db = tmp_db
+    assert db.get_earliest_retry_after() is None
+
+
+def test_get_earliest_retry_after_ignores_ready_jobs(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    # j1 has no retry_after — should not appear
+    assert db.get_earliest_retry_after() is None
+
+
+def test_get_earliest_retry_after_returns_minimum(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    future1 = time.time() + 60
+    future2 = time.time() + 120
+    db.update_batch_job("j1", retry_after=future1)
+    db.update_batch_job("j2", retry_after=future2)
+
+    result = db.get_earliest_retry_after()
+    assert result is not None
+    assert abs(result - future1) < 1.0  # closest future timestamp

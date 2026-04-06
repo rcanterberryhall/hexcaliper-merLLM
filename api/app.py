@@ -597,6 +597,12 @@ async def batch_submit(request: Request):
     prompt = body.get("prompt", "").strip()
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt is required")
+    if len(prompt) > config.BATCH_MAX_PROMPT_LEN:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Prompt exceeds maximum length of {config.BATCH_MAX_PROMPT_LEN} characters "
+                   f"({len(prompt)} submitted). Set BATCH_MAX_PROMPT_LEN to override.",
+        )
 
     job_id = queue_manager.submit_batch_job(
         source_app=body.get("source_app", "unknown"),

@@ -201,3 +201,155 @@ async def test_queue_depth_reports_in_flight(qm):
     assert qm.queue_depth()["gpus"][target]["in_flight"] == 1
     qm.release_gpu_slot(target)
     assert qm.queue_depth()["gpus"][target]["in_flight"] == 0
+
+
+# ── Batch retry tests ─────────────────────────────────────────────────────────
+
+
+def _fresh_qm(tmp_path, monkeypatch, extra_env=None):
+    """Re-import queue_manager with an isolated DB and optional env overrides."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for k, v in (extra_env or {}).items():
+        monkeypatch.setenv(k, v)
+    for mod in list(sys.modules.keys()):
+        if mod in ("queue_manager", "db", "config", "mode_manager", "geoip"):
+            sys.modules.pop(mod, None)
+    import queue_manager
+    return queue_manager
+
+
+class _MockResp:
+    status_code = 200
+    def raise_for_status(self): pass
+    def json(self): return {"response": "ok"}
+
+
+class _MockFailResp:
+    def raise_for_status(self):
+        raise RuntimeError("Ollama OOM")
+
+
+def _mock_client_factory(responses):
+    """Return a mock httpx.AsyncClient class that yields responses in order."""
+    call_iter = iter(responses)
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def post(self, *args, **kwargs):
+            return next(call_iter)
+
+    return lambda **kwargs: _Client()
+
+
+@pytest.mark.asyncio
+async def test_run_batch_job_retries_on_transient_failure(tmp_path, monkeypatch):
+    """A failing job is requeued with retry_after set; second attempt completes it."""
+    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
+    import db
+
+    job_id = qm.submit_batch_job("test", "model", "hello")
+    job = db.get_batch_job(job_id)
+
+    # First run: Ollama fails
+    monkeypatch.setattr(qm.httpx, "AsyncClient",
+                        _mock_client_factory([_MockFailResp()]))
+    await qm._run_batch_job(job)
+
+    after_fail = db.get_batch_job(job_id)
+    assert after_fail["status"] == "queued"
+    assert after_fail["retries"] == 1
+    assert after_fail["retry_after"] is not None
+    assert after_fail["retry_after"] > time.time()
+    assert "attempt 1 failed" in after_fail["error"]
+
+    # Second run: Ollama succeeds
+    monkeypatch.setattr(qm.httpx, "AsyncClient",
+                        _mock_client_factory([_MockResp()]))
+    await qm._run_batch_job(after_fail)
+
+    final = db.get_batch_job(job_id)
+    assert final["status"] == "completed"
+    assert final["result"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_job_fails_permanently_after_max_retries(tmp_path, monkeypatch):
+    """After BATCH_MAX_RETRIES failures the job is marked 'failed'."""
+    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
+    import db
+
+    job_id = qm.submit_batch_job("test", "model", "hello")
+
+    # Run 3 times, all failing (max_retries=2 → 3 total attempts)
+    for _ in range(3):
+        job = db.get_batch_job(job_id)
+        monkeypatch.setattr(qm.httpx, "AsyncClient",
+                            _mock_client_factory([_MockFailResp()]))
+        await qm._run_batch_job(job)
+
+    final = db.get_batch_job(job_id)
+    assert final["status"] == "failed"
+    assert final["retries"] == 2
+    assert "final failure" in final["error"]
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_increases_exponentially(tmp_path, monkeypatch):
+    """Each retry sets a strictly larger retry_after than the previous."""
+    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
+    import db
+
+    job_id = qm.submit_batch_job("test", "model", "hello")
+
+    retry_afters = []
+    for _ in range(2):
+        job = db.get_batch_job(job_id)
+        monkeypatch.setattr(qm.httpx, "AsyncClient",
+                            _mock_client_factory([_MockFailResp()]))
+        await qm._run_batch_job(job)
+        retry_afters.append(db.get_batch_job(job_id)["retry_after"])
+
+    assert retry_afters[1] > retry_afters[0]
+
+
+def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
+    """POST /api/batch/submit returns 422 when prompt exceeds BATCH_MAX_PROMPT_LEN."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("BATCH_MAX_PROMPT_LEN", "50")
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
+                   "metrics", "geoip"):
+            sys.modules.pop(mod, None)
+
+    import app as app_mod
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app_mod.app, raise_server_exceptions=True)
+    resp = client.post("/api/batch/submit", json={
+        "source_app": "test",
+        "prompt": "x" * 51,
+    })
+    assert resp.status_code == 422
+    assert "maximum length" in resp.json()["detail"]
+
+
+def test_batch_submit_accepts_prompt_within_limit(tmp_path, monkeypatch):
+    """POST /api/batch/submit accepts a prompt that fits within BATCH_MAX_PROMPT_LEN."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("BATCH_MAX_PROMPT_LEN", "50")
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
+                   "metrics", "geoip"):
+            sys.modules.pop(mod, None)
+
+    import app as app_mod
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app_mod.app, raise_server_exceptions=True)
+    resp = client.post("/api/batch/submit", json={
+        "source_app": "test",
+        "prompt": "x" * 50,
+    })
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True

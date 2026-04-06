@@ -42,7 +42,9 @@ def _create_tables(c: sqlite3.Connection) -> None:
             started_at   REAL,
             completed_at REAL,
             result       TEXT,
-            error        TEXT
+            error        TEXT,
+            retries      INTEGER NOT NULL DEFAULT 0,
+            retry_after  REAL
         );
 
         CREATE TABLE IF NOT EXISTS metrics (
@@ -77,6 +79,12 @@ def _create_tables(c: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_fan_faults_ts ON fan_faults(ts);
     """)
+    # Schema migration: add columns that may be absent in older databases.
+    existing = {row[1] for row in c.execute("PRAGMA table_info(batch_jobs)").fetchall()}
+    if "retries" not in existing:
+        c.execute("ALTER TABLE batch_jobs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0")
+    if "retry_after" not in existing:
+        c.execute("ALTER TABLE batch_jobs ADD COLUMN retry_after REAL")
 
 
 # ── Batch jobs ────────────────────────────────────────────────────────────────
@@ -99,9 +107,23 @@ def get_batch_job(job_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def list_batch_jobs(status: Optional[str] = None) -> list[dict]:
+def list_batch_jobs(status: Optional[str] = None, ready_only: bool = False) -> list[dict]:
+    """
+    List batch jobs, optionally filtered by status.
+
+    ready_only=True (only meaningful with status="queued"): exclude jobs whose
+    retry_after timestamp is in the future, i.e. return only jobs that are
+    ready to run right now.
+    """
     with lock:
-        if status:
+        if ready_only and status == "queued":
+            rows = conn().execute(
+                "SELECT * FROM batch_jobs WHERE status = 'queued' "
+                "AND (retry_after IS NULL OR retry_after <= ?) "
+                "ORDER BY submitted_at",
+                (time.time(),)
+            ).fetchall()
+        elif status:
             rows = conn().execute(
                 "SELECT * FROM batch_jobs WHERE status = ? ORDER BY submitted_at DESC",
                 (status,)
@@ -111,6 +133,21 @@ def list_batch_jobs(status: Optional[str] = None) -> list[dict]:
                 "SELECT * FROM batch_jobs ORDER BY submitted_at DESC LIMIT 200"
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_earliest_retry_after() -> Optional[float]:
+    """
+    Return the smallest retry_after timestamp among deferred queued jobs
+    (those whose retry_after is in the future), or None if there are none.
+    """
+    with lock:
+        row = conn().execute(
+            "SELECT MIN(retry_after) AS min_ts FROM batch_jobs "
+            "WHERE status = 'queued' AND retry_after IS NOT NULL AND retry_after > ?",
+            (time.time(),)
+        ).fetchone()
+    val = row["min_ts"] if row else None
+    return float(val) if val is not None else None
 
 
 def update_batch_job(job_id: str, **fields) -> None:

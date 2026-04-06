@@ -57,6 +57,14 @@ DB_PATH             = _get("DB_PATH",             "/data/merllm.db")
 METRICS_RETAIN_DAYS = int(_get("METRICS_RETAIN_DAYS", "7"))
 METRICS_INTERVAL_SEC = int(_get("METRICS_INTERVAL_SEC", "10"))
 
+# ── Batch job execution ───────────────────────────────────────────────────────
+
+# Max number of automatic retries for a failed batch job (default 2 → 3 total attempts).
+BATCH_MAX_RETRIES = int(_get("BATCH_MAX_RETRIES", "2"))
+
+# Maximum prompt length in characters accepted by POST /api/batch/submit.
+BATCH_MAX_PROMPT_LEN = int(_get("BATCH_MAX_PROMPT_LEN", "100000"))
+
 # ── Queue / GPU slot management ──────────────────────────────────────────────
 
 # Seconds an interactive request will wait for a GPU slot before returning 503.
