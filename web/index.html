@@ -304,7 +304,24 @@
           context (<code>NIGHT_NUM_CTX</code>).<br><br>
           Any interactive request during night mode triggers an immediate return to day mode.<br><br>
           <strong style="color:var(--text)">Manual override</strong> — use the Day / Night / Auto buttons on the
-          Overview tab. Auto clears the override and returns to schedule-driven behaviour.
+          Overview tab. Auto clears the override and returns to schedule-driven behaviour.<br><br>
+          <strong style="color:var(--text)">Honest failures</strong> — if a systemctl call fails during a transition,
+          the mode is not changed and the failure is recorded in the transition history. The UI shows the error.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Priority Queue</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          All <code>/api/generate</code> and <code>/api/chat</code> requests pass through a GPU slot queue.
+          Interactive requests proceed immediately if a GPU is available. When both GPUs are busy, the request
+          waits up to <code>INTERACTIVE_QUEUE_TIMEOUT</code> seconds (default 30) before returning 503.<br><br>
+          Batch-priority requests (<code>X-Priority: batch</code>) yield to queued interactive requests.
+          The queue tracks in-flight count per GPU for informed routing.<br><br>
+          <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
+          <code>queue_status</code> event is emitted before generation starts, showing queue position,
+          reason (e.g. "transitioning to day mode"), and estimated wait time. LanceLLMot and Parsival
+          display this as a waiting indicator.
         </p>
       </div>
 
@@ -313,6 +330,13 @@
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
           Batch jobs are generation requests that run during night mode with a larger context window.
           They're useful for deep-analysis tasks that would block interactive use during the day.<br><br>
+          <strong style="color:var(--text)">Automatic retry</strong> — failed jobs are retried up to
+          <code>BATCH_MAX_RETRIES</code> times (default 2, giving 3 total attempts) with exponential
+          backoff (30s, 120s). On final failure, the error messages are stored on the job record.<br><br>
+          <strong style="color:var(--text)">Notifications</strong> — when a batch job completes, merLLM
+          sends a webhook POST to <code>NOTIFICATION_WEBHOOK_URL</code> (if configured) with job ID,
+          source app, status, timestamps, and prompt preview. Works with Slack webhooks, ntfy.sh, Gotify,
+          or any JSON POST endpoint. The dashboard SSE stream also receives completion events in real time.<br><br>
           Submit a job from the <strong style="color:var(--text)">Batch Jobs</strong> tab or via the API:
         </p>
         <pre style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;margin-top:8px;overflow-x:auto">POST /api/batch/submit
@@ -327,8 +351,26 @@ GET  /api/batch/results/&lt;id&gt;
 POST /api/batch/&lt;id&gt;/cancel
 POST /api/batch/&lt;id&gt;/requeue</pre>
         <p style="color:var(--muted);font-size:13px;margin-top:8px">
+          Prompts exceeding <code>BATCH_MAX_PROMPT_LEN</code> (default 100,000 chars) are rejected with 422.
           Jobs stay in <code>queued</code> status until night mode activates, then run sequentially.
           Failed jobs can be requeued; cancelled jobs can only be resubmitted.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>My Day Panel</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          The Overview tab includes a "My Day" panel that aggregates attention items from across the ecosystem:<br><br>
+          <strong style="color:var(--text)">From Parsival</strong> — new/investigating situations, overdue
+          follow-ups, unread high-attention items.<br>
+          <strong style="color:var(--text)">From LanceLLMot</strong> — pending deep analysis results,
+          escalation results awaiting review.<br>
+          <strong style="color:var(--text)">From merLLM</strong> — completed batch jobs not yet retrieved,
+          active warnings (GPU temp, Ollama down, transition failures).<br><br>
+          Each card links to the relevant item in the relevant app. If an app is unreachable, that card
+          shows "offline" instead of failing the whole panel.<br><br>
+          Configure companion service URLs via <code>PARSIVAL_URL</code> and <code>LANCELLMOT_URL</code>
+          in Settings.
         </p>
       </div>
 
@@ -415,20 +457,33 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
       </div>
 
       <div class="card">
+        <h2>Metrics Charts</h2>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7">
+          The Metrics tab renders time-series line charts (via Chart.js) for CPU utilization, RAM usage,
+          GPU utilization (per card), GPU VRAM (per card), GPU temperature (per card), disk I/O, and
+          network throughput.<br><br>
+          Data is polled from <code>/api/merllm/metrics/history</code> on tab activation and on range change.
+          Default view: last 1 hour. Range selector buttons: 1h / 6h / 24h / 7d.
+        </p>
+      </div>
+
+      <div class="card">
         <h2>API Reference</h2>
         <table style="font-size:12px">
           <tr><th>Endpoint</th><th>Description</th></tr>
-          <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">Mode, GPUs, queue, health</td></tr>
-          <tr><td><code>POST /api/merllm/mode</code></td><td class="muted">Set day/night/auto</td></tr>
+          <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">Mode, GPUs, queue depth, health</td></tr>
+          <tr><td><code>POST /api/merllm/mode</code></td><td class="muted">Set day/night/auto; returns failure status</td></tr>
           <tr><td><code>GET  /api/merllm/settings</code></td><td class="muted">View current config</td></tr>
           <tr><td><code>POST /api/merllm/settings</code></td><td class="muted">Update config live</td></tr>
           <tr><td><code>GET  /api/merllm/metrics/current</code></td><td class="muted">Latest system snapshot</td></tr>
-          <tr><td><code>GET  /api/merllm/metrics/history</code></td><td class="muted">Time-series data</td></tr>
+          <tr><td><code>GET  /api/merllm/metrics/history</code></td><td class="muted">Time-series data for charts</td></tr>
           <tr><td><code>GET  /api/merllm/diagnostics</code></td><td class="muted">Connectivity + container health</td></tr>
-          <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines</td></tr>
+          <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines (configurable containers)</td></tr>
           <tr><td><code>GET  /api/merllm/transitions</code></td><td class="muted">Mode transition history</td></tr>
           <tr><td><code>GET  /api/merllm/geoip</code></td><td class="muted">GeoIP schedule info</td></tr>
-          <tr><td><code>GET  /health</code></td><td class="muted">Liveness check</td></tr>
+          <tr><td><code>GET  /api/merllm/myday</code></td><td class="muted">My Day cross-app attention summary</td></tr>
+          <tr><td><code>POST /api/merllm/backup</code></td><td class="muted">Trigger SQLite online backup</td></tr>
+          <tr><td><code>GET  /health</code></td><td class="muted">Docker health check / liveness</td></tr>
         </table>
       </div>
 
