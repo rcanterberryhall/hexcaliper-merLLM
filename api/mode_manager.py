@@ -16,6 +16,7 @@ when OLLAMA_MANAGE_VIA = "systemctl". Set OLLAMA_MANAGE_VIA = "none" to
 operate in proxy-only mode (Ollama services managed externally).
 """
 import asyncio
+import logging
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -25,6 +26,8 @@ from typing import Callable, Optional
 import config
 import db
 import geoip
+
+log = logging.getLogger(__name__)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -123,7 +126,10 @@ class InFlightGuard:
 
 def _systemctl(action: str, service: str) -> bool:
     if config.OLLAMA_MANAGE_VIA != "systemctl":
-        print(f"[mode] (proxy-only) would run: systemctl {action} {service}")
+        # Proxy-only mode: Ollama lifecycle is managed externally.
+        # Log at INFO so operators can see the skipped step; always return True
+        # because the routing change itself is the intended action.
+        log.info("(proxy-only) skipping service management: systemctl %s %s", action, service)
         return True
     try:
         result = subprocess.run(
@@ -131,10 +137,10 @@ def _systemctl(action: str, service: str) -> bool:
             capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
-            print(f"[mode] systemctl {action} {service}: {result.stderr.strip()}")
+            log.error("systemctl %s %s failed: %s", action, service, result.stderr.strip())
         return result.returncode == 0
     except Exception as exc:
-        print(f"[mode] systemctl {action} {service} failed: {exc}")
+        log.error("systemctl %s %s raised: %s", action, service, exc)
         return False
 
 
@@ -146,7 +152,7 @@ async def _drain(timeout_sec: int) -> None:
             if _in_flight == 0:
                 return
         await asyncio.sleep(1)
-    print(f"[mode] drain timed out with {_in_flight} requests still in flight")
+    log.warning("drain timed out with %d requests still in flight", _in_flight)
 
 
 # ── Transitions ───────────────────────────────────────────────────────────────
@@ -166,10 +172,11 @@ async def transition_to_night(trigger: str = "auto") -> bool:
     async with _transition_lock:
         if _mode == Mode.NIGHT:
             return True
+        prev_mode = _mode
         start = time.time()
         _mode = Mode.TRANSITIONING
         _notify_mode_change()
-        print(f"[mode] transitioning to night (trigger={trigger})")
+        log.info("transitioning to night (trigger=%s)", trigger)
 
         await _drain(config.DRAIN_TIMEOUT_SEC)
 
@@ -180,10 +187,14 @@ async def transition_to_night(trigger: str = "auto") -> bool:
             ok &= _systemctl("start", config.NIGHT_SERVICE)
 
         duration = time.time() - start
-        _mode = Mode.NIGHT
+        if ok:
+            _mode = Mode.NIGHT
+            log.info("night mode active (%.1fs)", duration)
+        else:
+            _mode = prev_mode
+            log.error("transition to night failed after %.1fs — rolled back to %s", duration, prev_mode.value)
         _notify_mode_change()
         db.insert_transition("day→night", trigger, duration, ok)
-        print(f"[mode] night mode active ({duration:.1f}s)")
         return ok
 
 
@@ -200,10 +211,11 @@ async def transition_to_day(trigger: str = "interactive") -> bool:
     async with _transition_lock:
         if _mode == Mode.DAY:
             return True
+        prev_mode = _mode
         start = time.time()
         _mode = Mode.TRANSITIONING
         _notify_mode_change()
-        print(f"[mode] transitioning to day (trigger={trigger})")
+        log.info("transitioning to day (trigger=%s)", trigger)
 
         await _drain(config.DRAIN_TIMEOUT_SEC)
 
@@ -214,10 +226,14 @@ async def transition_to_day(trigger: str = "interactive") -> bool:
             ok &= _systemctl("start", config.GPU1_SERVICE)
 
         duration = time.time() - start
-        _mode = Mode.DAY
+        if ok:
+            _mode = Mode.DAY
+            log.info("day mode active (%.1fs)", duration)
+        else:
+            _mode = prev_mode
+            log.error("transition to day failed after %.1fs — rolled back to %s", duration, prev_mode.value)
         _notify_mode_change()
         db.insert_transition("night→day", trigger, duration, ok)
-        print(f"[mode] day mode active ({duration:.1f}s)")
         return ok
 
 
@@ -232,18 +248,27 @@ def _notify_mode_change() -> None:
 # ── Override ──────────────────────────────────────────────────────────────────
 
 
-async def set_override(mode: Optional[str]) -> None:
-    """Set or clear manual mode override."""
+async def set_override(mode: Optional[str]) -> bool:
+    """
+    Set or clear manual mode override.
+
+    Returns True if the target mode was reached (or was already active),
+    False if the transition failed. On failure the mode is rolled back by
+    the transition function; the override is still recorded so the caller
+    can inspect it.
+    """
     global _override
     if mode is None:
         _override = None
-        return
+        return True
     target = Mode(mode)
     _override = target
+    ok = True
     if target == Mode.DAY and _mode != Mode.DAY:
-        await transition_to_day("manual_override")
+        ok = await transition_to_day("manual_override")
     elif target == Mode.NIGHT and _mode != Mode.NIGHT:
-        await transition_to_night("manual_override")
+        ok = await transition_to_night("manual_override")
+    return ok
 
 
 # ── Background scheduler ──────────────────────────────────────────────────────

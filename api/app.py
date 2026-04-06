@@ -537,8 +537,18 @@ async def set_mode(request: Request):
     mode = body.get("mode")
     if mode not in ("day", "night", "auto", None):
         raise HTTPException(status_code=422, detail="mode must be 'day', 'night', or 'auto'")
-    await mode_manager.set_override(None if mode == "auto" else mode)
-    return {"ok": True, "mode": mode_manager.current_mode().value}
+    ok = await mode_manager.set_override(None if mode == "auto" else mode)
+    current = mode_manager.current_mode().value
+    if not ok:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "mode": current,
+                "error": f"Transition to {mode!r} failed — mode rolled back to {current!r}.",
+            },
+        )
+    return {"ok": True, "mode": current}
 
 
 @app.get("/api/merllm/settings")
