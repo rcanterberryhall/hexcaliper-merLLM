@@ -8,6 +8,16 @@ document.querySelectorAll("nav button").forEach(btn => {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "metrics") loadMetricsCharts().catch(() => {});
+  });
+});
+
+document.querySelectorAll(".range-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    _metricsRange = btn.dataset.range;
+    loadMetricsCharts().catch(() => {});
   });
 });
 
@@ -519,6 +529,160 @@ function renderMetrics(m) {
       <span class="stat-value">${rxKey ? fmtBytes(m[rxKey]?.value) + "/s" : "—"}</span></div>
     <div class="stat-row"><span class="stat-label">TX</span>
       <span class="stat-value">${txKey ? fmtBytes(m[txKey]?.value) + "/s" : "—"}</span></div>`;
+}
+
+// ── Metrics Charts ────────────────────────────────────────────────────────────
+
+const _charts = {};
+let _metricsRange = "1h";
+
+function _chartScaleDefaults() {
+  return {
+    x: {
+      ticks: { color: "#8b949e", font: { size: 10 }, maxTicksLimit: 8, maxRotation: 0 },
+      grid: { color: "#21262d" },
+    },
+    y: {
+      ticks: { color: "#8b949e", font: { size: 10 } },
+      grid: { color: "#21262d" },
+    },
+  };
+}
+
+function _chartOptions(extraScales) {
+  return {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: "index", intersect: false },
+    plugins: {
+      legend: {
+        labels: { color: "#8b949e", font: { size: 11 }, boxWidth: 10, padding: 8 },
+      },
+      tooltip: {
+        backgroundColor: "#161b22",
+        borderColor: "#30363d",
+        borderWidth: 1,
+        titleColor: "#e6edf3",
+        bodyColor: "#8b949e",
+      },
+    },
+    scales: { ..._chartScaleDefaults(), ...(extraScales || {}) },
+  };
+}
+
+function _mkDs(label, data, color, yAxisID) {
+  const ds = {
+    label,
+    data,
+    borderColor: color,
+    backgroundColor: color + "18",
+    borderWidth: 1.5,
+    pointRadius: 0,
+    tension: 0.3,
+    fill: false,
+  };
+  if (yAxisID) ds.yAxisID = yAxisID;
+  return ds;
+}
+
+function _fmtTs(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function _setChart(id, labels, datasets, extraScales) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (_charts[id]) {
+    _charts[id].data.labels = labels;
+    _charts[id].data.datasets = datasets;
+    _charts[id].update("none");
+  } else {
+    _charts[id] = new Chart(canvas, {
+      type: "line",
+      data: { labels, datasets },
+      options: _chartOptions(extraScales),
+    });
+  }
+}
+
+async function _hist(metric) {
+  try {
+    return await api(`/api/merllm/metrics/history?metric=${encodeURIComponent(metric)}&range=${_metricsRange}`);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function loadMetricsCharts() {
+  const [cpu, ramUsed, diskPct, g0util, g0mem, g0temp, g1util, g1mem, g1temp, tx, rx] =
+    await Promise.all([
+      _hist("cpu.total"),
+      _hist("ram.used"),
+      _hist("disk.root.pct"),
+      _hist("gpu0.util_pct"),
+      _hist("gpu0.mem_used_mb"),
+      _hist("gpu0.temp_c"),
+      _hist("gpu1.util_pct"),
+      _hist("gpu1.mem_used_mb"),
+      _hist("gpu1.temp_c"),
+      _hist("net.tx_bps"),
+      _hist("net.rx_bps"),
+    ]);
+
+  if (cpu.length) {
+    _setChart("chart-cpu",
+      cpu.map(p => _fmtTs(p.ts)),
+      [_mkDs("CPU %", cpu.map(p => p.value.toFixed(1)), "#58a6ff")]
+    );
+  }
+
+  if (ramUsed.length) {
+    _setChart("chart-mem",
+      ramUsed.map(p => _fmtTs(p.ts)),
+      [_mkDs("RAM GB", ramUsed.map(p => (p.value / 1073741824).toFixed(2)), "#3fb950")]
+    );
+  }
+
+  if (diskPct.length) {
+    _setChart("chart-disk",
+      diskPct.map(p => _fmtTs(p.ts)),
+      [_mkDs("Disk %", diskPct.map(p => p.value.toFixed(1)), "#d29922")]
+    );
+  }
+
+  // GPU charts: util+temp on left y, VRAM MB on right y
+  for (const [idx, util, mem, temp] of [
+    [0, g0util, g0mem, g0temp],
+    [1, g1util, g1mem, g1temp],
+  ]) {
+    const base = util.length ? util : mem.length ? mem : temp;
+    if (!base.length) continue;
+    _setChart(`chart-gpu${idx}`,
+      base.map(p => _fmtTs(p.ts)),
+      [
+        _mkDs("Util %",  util.map(p => p.value.toFixed(1)), "#58a6ff", "y"),
+        _mkDs("Temp °C", temp.map(p => p.value.toFixed(1)), "#f85149", "y"),
+        _mkDs("VRAM MB", mem.map(p  => Math.round(p.value)), "#a78bfa", "yMem"),
+      ],
+      {
+        y:    { type: "linear", position: "left",  ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
+        yMem: { type: "linear", position: "right", ticks: { color: "#a78bfa", font: { size: 10 } }, grid: { drawOnChartArea: false } },
+      }
+    );
+  }
+
+  const netBase = tx.length ? tx : rx;
+  if (netBase.length) {
+    _setChart("chart-net",
+      netBase.map(p => _fmtTs(p.ts)),
+      [
+        _mkDs("TX MB/s", tx.map(p => (p.value / 1048576).toFixed(3)), "#58a6ff"),
+        _mkDs("RX MB/s", rx.map(p => (p.value / 1048576).toFixed(3)), "#3fb950"),
+      ]
+    );
+  }
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────────────

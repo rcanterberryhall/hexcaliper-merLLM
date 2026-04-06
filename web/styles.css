@@ -374,3 +374,30 @@ tr:hover td { background: #1c2330; }
 .mt { margin-top: 16px; }
 .muted { color: var(--muted); }
 .mono { font-family: monospace; }
+
+/* Metrics — range selector */
+.metrics-range-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.range-btn {
+  padding: 3px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.range-btn:hover  { color: var(--text); background: var(--border); }
+.range-btn.active { color: var(--text); background: var(--bg); border-color: var(--accent); }
+
+/* Metrics — chart canvas wrapper */
+.chart-wrap {
+  position: relative;
+  height: 120px;
+  margin-top: 12px;
+}

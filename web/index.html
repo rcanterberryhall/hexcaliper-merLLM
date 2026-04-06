@@ -140,36 +140,49 @@
 
   <!-- ── Metrics ── -->
   <div id="tab-metrics" class="tab">
+    <div class="metrics-range-bar">
+      <span class="muted" style="font-size:12px">Range:</span>
+      <button class="range-btn active" data-range="1h">1h</button>
+      <button class="range-btn" data-range="6h">6h</button>
+      <button class="range-btn" data-range="24h">24h</button>
+      <button class="range-btn" data-range="7d">7d</button>
+    </div>
     <div class="grid-3">
 
       <div class="card">
         <h2>CPU</h2>
         <div id="cpu-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-cpu"></canvas></div>
       </div>
 
       <div class="card">
         <h2>Memory</h2>
         <div id="mem-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-mem"></canvas></div>
       </div>
 
       <div class="card">
         <h2>Disk</h2>
         <div id="disk-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-disk"></canvas></div>
       </div>
 
       <div class="card span-2">
         <h2>GPU 0</h2>
         <div id="gpu0-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-gpu0"></canvas></div>
       </div>
 
       <div class="card">
         <h2>GPU 1</h2>
         <div id="gpu1-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-gpu1"></canvas></div>
       </div>
 
       <div class="card span-2">
         <h2>Network</h2>
         <div id="net-metrics"></div>
+        <div class="chart-wrap"><canvas id="chart-net"></canvas></div>
       </div>
 
     </div>
@@ -411,6 +424,9 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
 
     </div>
   </div>
+
+<!-- Chart.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
 <!-- xterm.js from CDN -->
 <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
