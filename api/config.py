@@ -99,6 +99,13 @@ VNC_PORT = int(_get("VNC_PORT", "5900"))
 # URL of the iDRAC fan controller REST API (api_server.py on port 8080).
 FAN_CONTROLLER_URL = _get("FAN_CONTROLLER_URL", "http://host.docker.internal:8080")
 
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+# Webhook URL to POST batch job completion payloads to.  Leave empty to disable.
+# Supports Slack incoming webhooks, ntfy.sh topics (e.g. https://ntfy.sh/my-topic),
+# Gotify, and any HTTP endpoint that accepts JSON POST.
+NOTIFICATION_WEBHOOK_URL = _get("NOTIFICATION_WEBHOOK_URL", "")
+
 # ── Log container name mapping ────────────────────────────────────────────────
 # Maps logical service names to Docker container names for the /api/merllm/logs
 # endpoint. Override if your compose project name or container names differ.
@@ -113,16 +120,17 @@ def apply_overrides(d: dict) -> None:
     """Hot-reload settings from the database into module-level variables."""
     mod = sys.modules[__name__]
     str_fields = {
-        "ollama_0_url":            "OLLAMA_0_URL",
-        "ollama_1_url":            "OLLAMA_1_URL",
-        "day_model_gpu0":          "DAY_MODEL_GPU0",
-        "day_model_gpu1":          "DAY_MODEL_GPU1",
-        "night_model":             "NIGHT_MODEL",
-        "base_day_end_local":      "BASE_DAY_END_LOCAL",
-        "geoip_offset_override":   "GEOIP_OFFSET_OVERRIDE",
-        "ollama_manage_via":       "OLLAMA_MANAGE_VIA",
-        "ssh_user":                "SSH_USER",
-        "ssh_key_path":            "SSH_KEY_PATH",
+        "ollama_0_url":              "OLLAMA_0_URL",
+        "ollama_1_url":              "OLLAMA_1_URL",
+        "day_model_gpu0":            "DAY_MODEL_GPU0",
+        "day_model_gpu1":            "DAY_MODEL_GPU1",
+        "night_model":               "NIGHT_MODEL",
+        "base_day_end_local":        "BASE_DAY_END_LOCAL",
+        "geoip_offset_override":     "GEOIP_OFFSET_OVERRIDE",
+        "ollama_manage_via":         "OLLAMA_MANAGE_VIA",
+        "ssh_user":                  "SSH_USER",
+        "ssh_key_path":              "SSH_KEY_PATH",
+        "notification_webhook_url":  "NOTIFICATION_WEBHOOK_URL",
     }
     int_fields = {
         "night_num_ctx":           "NIGHT_NUM_CTX",

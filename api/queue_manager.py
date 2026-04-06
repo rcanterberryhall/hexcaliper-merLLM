@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 import config
 import db
 import mode_manager
+import notifications
 
 PRIORITY_INTERACTIVE = 0
 PRIORITY_BATCH       = 1
@@ -298,6 +299,12 @@ async def _run_batch_job(job: dict) -> None:
         db.update_batch_job(job_id, status="completed",
                             completed_at=time.time(), result=result_text)
         log.info("batch job %s completed", job_id[:8])
+        completed_job = db.get_batch_job(job_id)
+        if completed_job:
+            asyncio.ensure_future(notifications.dispatch(
+                completed_job,
+                webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+            ))
     except Exception as exc:
         prev_error = (job.get("error") or "").strip()
         if retries < config.BATCH_MAX_RETRIES:
@@ -322,3 +329,9 @@ async def _run_batch_job(job: dict) -> None:
                                 completed_at=time.time(), error=final_error)
             log.error("batch job %s permanently failed after %d attempt(s): %s",
                       job_id[:8], retries + 1, exc)
+            failed_job = db.get_batch_job(job_id)
+            if failed_job:
+                asyncio.ensure_future(notifications.dispatch(
+                    failed_job,
+                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+                ))

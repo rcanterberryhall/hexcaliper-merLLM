@@ -43,6 +43,7 @@ import db
 import geoip
 import metrics
 import mode_manager
+import notifications
 import queue_manager
 
 # ── Per-instance activity tracking ───────────────────────────────────────────
@@ -618,18 +619,19 @@ async def set_mode(request: Request):
 async def get_settings():
     saved = db.get_settings()
     return {
-        "ollama_0_url":           config.OLLAMA_0_URL,
-        "ollama_1_url":           config.OLLAMA_1_URL,
-        "day_model_gpu0":         config.DAY_MODEL_GPU0,
-        "day_model_gpu1":         config.DAY_MODEL_GPU1,
-        "night_model":            config.NIGHT_MODEL,
-        "night_num_ctx":          config.NIGHT_NUM_CTX,
-        "inactivity_timeout_min": config.INACTIVITY_TIMEOUT_MIN,
-        "base_day_end_local":     config.BASE_DAY_END_LOCAL,
-        "geoip_offset_override":  config.GEOIP_OFFSET_OVERRIDE,
-        "ollama_manage_via":      config.OLLAMA_MANAGE_VIA,
-        "drain_timeout_sec":      config.DRAIN_TIMEOUT_SEC,
-        "metrics_interval_sec":   config.METRICS_INTERVAL_SEC,
+        "ollama_0_url":              config.OLLAMA_0_URL,
+        "ollama_1_url":              config.OLLAMA_1_URL,
+        "day_model_gpu0":            config.DAY_MODEL_GPU0,
+        "day_model_gpu1":            config.DAY_MODEL_GPU1,
+        "night_model":               config.NIGHT_MODEL,
+        "night_num_ctx":             config.NIGHT_NUM_CTX,
+        "inactivity_timeout_min":    config.INACTIVITY_TIMEOUT_MIN,
+        "base_day_end_local":        config.BASE_DAY_END_LOCAL,
+        "geoip_offset_override":     config.GEOIP_OFFSET_OVERRIDE,
+        "ollama_manage_via":         config.OLLAMA_MANAGE_VIA,
+        "drain_timeout_sec":         config.DRAIN_TIMEOUT_SEC,
+        "metrics_interval_sec":      config.METRICS_INTERVAL_SEC,
+        "notification_webhook_url":  config.NOTIFICATION_WEBHOOK_URL,
     }
 
 
@@ -815,6 +817,34 @@ async def metrics_thresholds(request: Request):
 
 
 # ── Database backup ───────────────────────────────────────────────────────────
+
+
+@app.get("/api/merllm/events")
+async def merllm_events(request: Request):
+    """
+    Server-Sent Events stream for real-time browser notifications.
+
+    Emits job_complete or job_failed events when batch jobs finish.
+    Clients connect once and keep the connection open.
+    """
+    async def event_generator():
+        q = notifications.add_sse_listener()
+        try:
+            yield "data: {\"type\": \"connected\"}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=30)
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # SSE comment keeps connection alive
+        finally:
+            notifications.remove_sse_listener(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/merllm/backup")

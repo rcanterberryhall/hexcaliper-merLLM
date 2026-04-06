@@ -43,9 +43,10 @@ async function del(path) {
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 
-let _pollTimer        = null;
-let _activityTimer    = null;
-let _activityEventSrc = null;
+let _pollTimer         = null;
+let _activityTimer     = null;
+let _activityEventSrc  = null;
+let _notifEventSrc     = null;
 
 function startPolling() {
   refresh();
@@ -53,6 +54,61 @@ function startPolling() {
   // Seed instance cards immediately via one-shot poll, then switch to SSE push
   refreshActivity();
   _startActivityStream();
+  _startNotifStream();
+}
+
+function _startNotifStream() {
+  if (_notifEventSrc) return;
+  _notifEventSrc = new EventSource("/api/merllm/events");
+  _notifEventSrc.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.type === "job_complete" || ev.type === "job_failed") {
+        const title = ev.status === "completed"
+          ? `✓ Batch job complete — ${ev.source_app || "merLLM"}`
+          : `✗ Batch job failed — ${ev.source_app || "merLLM"}`;
+        const body = ev.prompt_preview
+          ? `"${ev.prompt_preview}…"` : "";
+        // In-page toast
+        _showJobToast(title, body, ev.status === "completed");
+        // Browser notification if permitted
+        if (Notification.permission === "granted") {
+          new Notification(title, {body});
+        }
+      }
+    } catch (_) {}
+  };
+  _notifEventSrc.onerror = () => {
+    _notifEventSrc.close();
+    _notifEventSrc = null;
+    setTimeout(_startNotifStream, 15000);
+  };
+}
+
+function _showJobToast(title, body, success) {
+  const toast = document.createElement("div");
+  toast.className = "job-toast " + (success ? "toast-ok" : "toast-err");
+  toast.innerHTML = `<strong>${esc(title)}</strong>${body ? "<br><span>" + esc(body) + "</span>" : ""}`;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.classList.add("toast-visible"), 50);
+  setTimeout(() => { toast.classList.remove("toast-visible"); setTimeout(() => toast.remove(), 400); }, 6000);
+}
+
+async function requestNotifPermission() {
+  if (!("Notification" in window)) {
+    alert("This browser does not support desktop notifications.");
+    return;
+  }
+  const result = await Notification.requestPermission();
+  const btn = document.getElementById("notif-permission-btn");
+  if (btn) {
+    if (result === "granted") {
+      btn.textContent = "Browser notifications enabled";
+      btn.disabled = true;
+    } else {
+      btn.textContent = "Permission denied — try browser settings";
+    }
+  }
 }
 
 function _startActivityStream() {
@@ -792,8 +848,10 @@ const SETTINGS_FIELDS = [
   { key: "geoip_offset_override",  label: "UTC offset override",      type: "text" },
   { key: "ollama_manage_via",      label: "Manage Ollama via",        type: "select",
     options: ["none", "systemctl"] },
-  { key: "drain_timeout_sec",      label: "Drain timeout (sec)",      type: "number" },
-  { key: "metrics_interval_sec",   label: "Metrics interval (sec)",   type: "number" },
+  { key: "drain_timeout_sec",         label: "Drain timeout (sec)",      type: "number" },
+  { key: "metrics_interval_sec",      label: "Metrics interval (sec)",   type: "number" },
+  { key: "notification_webhook_url",  label: "Notification webhook URL",  type: "text",
+    hint: "POST to this URL on job completion. Supports Slack, ntfy.sh, Gotify, etc." },
 ];
 
 async function loadSettings() {
@@ -811,9 +869,11 @@ async function loadSettings() {
           <select id="sf-${f.key}">${opts}</select>
         </div>`;
       }
+      const hint = f.hint ? `<div class="form-hint">${esc(f.hint)}</div>` : '';
       return `<div class="form-group">
         <label>${esc(f.label)}</label>
         <input id="sf-${f.key}" type="${f.type}" value="${esc(String(val))}" />
+        ${hint}
       </div>`;
     }).join("");
   } catch (err) {
