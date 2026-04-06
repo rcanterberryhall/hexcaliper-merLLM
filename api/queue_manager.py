@@ -79,6 +79,11 @@ def release_gpu_slot(target: str) -> None:
     _gpu_in_flight[target] = max(0, _gpu_in_flight.get(target, 0) - 1)
 
 
+def gpu_slot_busy(target: str) -> bool:
+    """Return True if all GPU_MAX_CONCURRENT slots for target are occupied."""
+    return _gpu_sem(target)._value == 0
+
+
 @dataclass(order=True)
 class QueuedRequest:
     priority: int
@@ -161,16 +166,25 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
     return job_id
 
 
+def get_queue_position(job_id: str) -> Optional[int]:
+    """
+    Return the zero-based queue position of a queued job (number of jobs ahead).
+
+    Returns None if the job is not in queued status.
+    """
+    jobs = db.list_batch_jobs(status="queued")
+    queued_ids = [j["id"] for j in sorted(jobs, key=lambda j: j.get("submitted_at", ""))]
+    try:
+        return queued_ids.index(job_id)
+    except ValueError:
+        return None
+
+
 def get_job_status(job_id: str) -> Optional[dict]:
     job = db.get_batch_job(job_id)
     if not job:
         return None
-    options = {}
-    try:
-        options = json.loads(job.get("options", "{}"))
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return {
+    result: dict = {
         "id":           job["id"],
         "source_app":   job["source_app"],
         "model":        job["model"],
@@ -182,6 +196,10 @@ def get_job_status(job_id: str) -> Optional[dict]:
         "retries":      job.get("retries", 0),
         "retry_after":  job.get("retry_after"),
     }
+    if job["status"] == "queued":
+        result["queue_position"] = get_queue_position(job_id)
+        result["estimated_start"] = None   # no per-job duration data available
+    return result
 
 
 def get_job_result(job_id: str) -> Optional[dict]:

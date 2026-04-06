@@ -215,6 +215,45 @@ def _priority(request: Request) -> int:
     return queue_manager.PRIORITY_BATCH if h == "batch" else queue_manager.PRIORITY_INTERACTIVE
 
 
+async def _generate_stream(target: str, path: str, body: dict, on_done=None):
+    """
+    Async generator that streams NDJSON from Ollama, line by line.
+
+    Injects ``context_tokens`` (= prompt_eval_count) into the final done line
+    so callers can display context-window utilisation.
+
+    on_done: optional zero-argument callable called in the finally block.
+    """
+    buf = b""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+            async with client.stream("POST", f"{target}{path}", json=body) as resp:
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line.strip():
+                            _activity_inc(target)
+                            _activity_append_token(target, line, path)
+                            # Inject context_tokens into the done line.
+                            try:
+                                obj = json.loads(line)
+                                if obj.get("done"):
+                                    pec = obj.get("prompt_eval_count")
+                                    if pec is not None:
+                                        obj["context_tokens"] = pec
+                                    line = json.dumps(obj).encode()
+                            except Exception:
+                                pass
+                            yield line + b"\n"
+                        else:
+                            yield b"\n"
+    finally:
+        _activity_clear(target)
+        if on_done:
+            on_done()
+
+
 async def _stream_proxy(target: str, path: str, body: dict,
                         on_done=None) -> StreamingResponse:
     """Stream an Ollama response, tracking activity per instance.
@@ -225,26 +264,53 @@ async def _stream_proxy(target: str, path: str, body: dict,
     """
     model = body.get("model", "")
     _activity_set(target, model, path)
+    return StreamingResponse(_generate_stream(target, path, body, on_done),
+                             media_type="application/x-ndjson")
+
+
+def _queue_reason(target: str) -> str:
+    """Human-readable reason a request is waiting for a GPU slot."""
+    if mode_manager.current_mode() == mode_manager.Mode.NIGHT:
+        return "transitioning to day mode"
+    in_flight = queue_manager.queue_depth()["gpus"].get(target, {}).get("in_flight", 0)
+    if in_flight:
+        return "GPU slot occupied by another request"
+    return "GPU busy"
+
+
+async def _queued_stream(target: str, path: str, body: dict,
+                         priority: int) -> StreamingResponse:
+    """
+    Streaming proxy that emits a ``queue_status`` NDJSON line if the GPU slot
+    is not immediately available, giving the caller transparent visibility into
+    queue state before generation begins.
+    """
+    model = body.get("model", "")
+    _activity_set(target, model, path)
 
     async def generate():
-        # Line buffer: raw byte chunks from Ollama don't align with JSON lines.
-        # We accumulate bytes and split on newlines to get complete NDJSON objects.
-        buf = b""
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
-                async with client.stream("POST", f"{target}{path}", json=body) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        buf += chunk
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            if line.strip():
-                                _activity_inc(target)
-                                _activity_append_token(target, line, path)
-                        yield chunk
-        finally:
+        # If the slot is busy, tell the caller before we start waiting.
+        if queue_manager.gpu_slot_busy(target):
+            reason = _queue_reason(target)
+            est    = config.INTERACTIVE_QUEUE_TIMEOUT
+            yield json.dumps({
+                "type":                    "queue_status",
+                "reason":                  reason,
+                "estimated_wait_seconds":  est,
+            }).encode() + b"\n"
+
+        acquired = await queue_manager.acquire_gpu_slot(target, priority)
+        if not acquired:
+            yield json.dumps({
+                "error": "GPU busy — timed out waiting for slot",
+                "done":  True,
+            }).encode() + b"\n"
             _activity_clear(target)
-            if on_done:
-                on_done()
+            return
+
+        on_done = lambda: queue_manager.release_gpu_slot(target)
+        async for chunk in _generate_stream(target, path, body, on_done):
+            yield chunk
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -296,6 +362,10 @@ async def proxy_generate(request: Request):
     target = mode_manager.get_target_url(model)
     stream = body.get("stream", True)
 
+    if stream:
+        # Return immediately; queue_status NDJSON emitted inside if waiting.
+        return await _queued_stream(target, "/api/generate", body, priority)
+
     acquired = await queue_manager.acquire_gpu_slot(target, priority)
     if not acquired:
         return JSONResponse(
@@ -306,13 +376,7 @@ async def proxy_generate(request: Request):
             },
             headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
         )
-
     async with mode_manager.InFlightGuard():
-        if stream:
-            return await _stream_proxy(
-                target, "/api/generate", body,
-                on_done=lambda: queue_manager.release_gpu_slot(target),
-            )
         try:
             return await _proxy(target, "/api/generate", body)
         finally:
@@ -335,6 +399,9 @@ async def proxy_chat(request: Request):
     target = mode_manager.get_target_url(model)
     stream = body.get("stream", True)
 
+    if stream:
+        return await _queued_stream(target, "/api/chat", body, priority)
+
     acquired = await queue_manager.acquire_gpu_slot(target, priority)
     if not acquired:
         return JSONResponse(
@@ -345,13 +412,7 @@ async def proxy_chat(request: Request):
             },
             headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
         )
-
     async with mode_manager.InFlightGuard():
-        if stream:
-            return await _stream_proxy(
-                target, "/api/chat", body,
-                on_done=lambda: queue_manager.release_gpu_slot(target),
-            )
         try:
             return await _proxy(target, "/api/chat", body)
         finally:
