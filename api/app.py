@@ -24,9 +24,11 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 _req_log = logging.getLogger("merllm.requests")
@@ -749,6 +751,38 @@ async def metrics_thresholds(request: Request):
     body = await request.json()
     db.save_settings({"alert_thresholds": body})
     return {"ok": True}
+
+
+# ── Database backup ───────────────────────────────────────────────────────────
+
+
+@app.post("/api/merllm/backup")
+async def trigger_backup():
+    """Create an online SQLite backup and rotate old files."""
+    backup_dir = Path(config.BACKUP_DIR)
+    db_path    = Path(config.DB_PATH)
+    if not db_path.exists():
+        raise HTTPException(status_code=500, detail=f"Database not found: {db_path}")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    dest  = backup_dir / f"merllm-{stamp}.db"
+    try:
+        src = sqlite3.connect(str(db_path))
+        dst = sqlite3.connect(str(dest))
+        src.backup(dst)
+        dst.close()
+        src.close()
+        size = dest.stat().st_size
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}")
+    all_backups = sorted(backup_dir.glob("merllm-*.db"))
+    rotated: list[str] = []
+    if len(all_backups) > config.BACKUP_KEEP_DAYS:
+        for old in all_backups[:-config.BACKUP_KEEP_DAYS]:
+            old.unlink(missing_ok=True)
+            rotated.append(str(old))
+    return {"ok": True, "backup": str(dest), "size_bytes": size, "rotated": rotated}
 
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────

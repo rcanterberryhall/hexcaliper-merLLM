@@ -141,6 +141,33 @@ The `ollama-night` service should be a systemd unit that starts Ollama with `CUD
 | Settings | Live configuration editor |
 | Help | Quick reference for all features |
 
+## Database backup
+
+`POST /api/merllm/backup` triggers an online SQLite backup using Python's
+`sqlite3.backup()` API (safe while the database is in use).  
+Backup files are written to `BACKUP_DIR` (default `/data/backups`) as
+`merllm-YYYYMMDD-HHMMSS.db` and rotated to keep the newest `BACKUP_KEEP_DAYS`
+copies (default 7).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BACKUP_DIR` | `/data/backups` | Directory for backup files |
+| `BACKUP_KEEP_DAYS` | `7` | Number of backups to retain |
+
+**Scheduled backup via cron (run on the host):**
+
+```bash
+# Back up every night at 02:00
+0 2 * * * curl -s -X POST http://localhost:11400/api/merllm/backup \
+  >> /var/log/merllm-backup.log 2>&1
+```
+
+Or with the helper script (if present):
+
+```bash
+0 2 * * * /opt/hexcaliper/merllm/backup_db.sh >> /var/log/merllm-backup.log 2>&1
+```
+
 ## Development
 
 ```bash

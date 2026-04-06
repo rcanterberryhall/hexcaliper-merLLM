@@ -57,6 +57,10 @@ DB_PATH             = _get("DB_PATH",             "/data/merllm.db")
 METRICS_RETAIN_DAYS = int(_get("METRICS_RETAIN_DAYS", "7"))
 METRICS_INTERVAL_SEC = int(_get("METRICS_INTERVAL_SEC", "10"))
 
+# Directory where backup_db.sh and POST /api/merllm/backup write backup files.
+BACKUP_DIR       = _get("BACKUP_DIR",       "/data/backups")
+BACKUP_KEEP_DAYS = int(_get("BACKUP_KEEP_DAYS", "7"))
+
 # ── Batch job execution ───────────────────────────────────────────────────────
 
 # Max number of automatic retries for a failed batch job (default 2 → 3 total attempts).
