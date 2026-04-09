@@ -1,5 +1,4 @@
 """Tests for config.py — apply_overrides and defaults."""
-import importlib
 import os
 import sys
 
@@ -26,42 +25,39 @@ def test_defaults():
     cfg = _fresh_config()
     assert cfg.OLLAMA_0_URL == "http://host.docker.internal:11434"
     assert cfg.OLLAMA_1_URL == "http://host.docker.internal:11435"
-    assert cfg.DAY_MODEL_GPU0 == "qwen3:32b"
-    assert cfg.DAY_MODEL_GPU1 == "qwen3:30b-a3b"
-    assert cfg.NIGHT_MODEL == "qwen3:32b"
-    assert cfg.NIGHT_NUM_CTX == 32768
-    assert cfg.INACTIVITY_TIMEOUT_MIN == 90
-    assert cfg.BASE_DAY_END_LOCAL == "22:00"
-    assert cfg.OLLAMA_MANAGE_VIA == "none"
-    assert cfg.DRAIN_TIMEOUT_SEC == 300
+    assert cfg.DEFAULT_MODEL == "qwen3:32b"
+    assert cfg.RECLAIM_TIMEOUT == 300
+    assert cfg.HEALTH_BACKOFF_BASE == 10
+    assert cfg.HEALTH_BACKOFF_CAP == 300
+    assert cfg.HEALTH_FAULT_TIMEOUT == 1800
     assert cfg.METRICS_INTERVAL_SEC == 10
 
 
 def test_env_override():
     cfg = _fresh_config(
         OLLAMA_0_URL="http://localhost:9999",
-        DAY_MODEL_GPU0="qwen3:8b",
-        INACTIVITY_TIMEOUT_MIN="60",
-        NIGHT_NUM_CTX="16384",
+        DEFAULT_MODEL="qwen3:8b",
+        RECLAIM_TIMEOUT="120",
+        HEALTH_BACKOFF_BASE="5",
     )
     assert cfg.OLLAMA_0_URL == "http://localhost:9999"
-    assert cfg.DAY_MODEL_GPU0 == "qwen3:8b"
-    assert cfg.INACTIVITY_TIMEOUT_MIN == 60
-    assert cfg.NIGHT_NUM_CTX == 16384
+    assert cfg.DEFAULT_MODEL == "qwen3:8b"
+    assert cfg.RECLAIM_TIMEOUT == 120
+    assert cfg.HEALTH_BACKOFF_BASE == 5
 
 
 def test_apply_overrides_str():
     cfg = _fresh_config()
-    cfg.apply_overrides({"ollama_0_url": "http://new:1234", "day_model_gpu0": "llama3:8b"})
+    cfg.apply_overrides({"ollama_0_url": "http://new:1234", "default_model": "llama3:8b"})
     assert cfg.OLLAMA_0_URL == "http://new:1234"
-    assert cfg.DAY_MODEL_GPU0 == "llama3:8b"
+    assert cfg.DEFAULT_MODEL == "llama3:8b"
 
 
 def test_apply_overrides_int():
     cfg = _fresh_config()
-    cfg.apply_overrides({"night_num_ctx": 8192, "inactivity_timeout_min": 45})
-    assert cfg.NIGHT_NUM_CTX == 8192
-    assert cfg.INACTIVITY_TIMEOUT_MIN == 45
+    cfg.apply_overrides({"reclaim_timeout": 120, "health_backoff_base": 5})
+    assert cfg.RECLAIM_TIMEOUT == 120
+    assert cfg.HEALTH_BACKOFF_BASE == 5
 
 
 def test_apply_overrides_ignores_unknown():
@@ -73,9 +69,9 @@ def test_apply_overrides_ignores_unknown():
 
 def test_apply_overrides_invalid_int():
     cfg = _fresh_config()
-    original = cfg.NIGHT_NUM_CTX
-    cfg.apply_overrides({"night_num_ctx": "not-a-number"})
-    assert cfg.NIGHT_NUM_CTX == original
+    original = cfg.RECLAIM_TIMEOUT
+    cfg.apply_overrides({"reclaim_timeout": "not-a-number"})
+    assert cfg.RECLAIM_TIMEOUT == original
 
 
 def test_apply_overrides_none_value():

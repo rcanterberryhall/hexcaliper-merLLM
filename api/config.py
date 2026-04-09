@@ -20,39 +20,21 @@ OLLAMA_1_URL  = _get("OLLAMA_1_URL",  "http://host.docker.internal:11435")
 
 # ── Model assignment ──────────────────────────────────────────────────────────
 
-DAY_MODEL_GPU0 = _get("DAY_MODEL_GPU0", "qwen3:32b")
-DAY_MODEL_GPU1 = _get("DAY_MODEL_GPU1", "qwen3:30b-a3b")
-NIGHT_MODEL    = _get("NIGHT_MODEL",    "qwen3:32b")
-NIGHT_NUM_CTX  = int(_get("NIGHT_NUM_CTX", "32768"))
+DEFAULT_MODEL = _get("DEFAULT_MODEL", "qwen3:32b")
 
-# ── Mode scheduling ───────────────────────────────────────────────────────────
+# ── GPU health ────────────────────────────────────────────────────────────────
 
-# Minutes of no interactive requests before switching to night mode.
-INACTIVITY_TIMEOUT_MIN = int(_get("INACTIVITY_TIMEOUT_MIN", "90"))
+# Seconds a GPU must be idle with a non-default model before reclaiming.
+RECLAIM_TIMEOUT = int(_get("RECLAIM_TIMEOUT", "300"))
 
-# Base schedule hint: local time after which night mode may activate (HH:MM).
-BASE_DAY_END_LOCAL = _get("BASE_DAY_END_LOCAL", "22:00")
-
-# ── GeoIP ─────────────────────────────────────────────────────────────────────
-
-GEOIP_DB_PATH      = _get("GEOIP_DB_PATH", "/data/GeoLite2-City.mmdb")
-GEOIP_OFFSET_OVERRIDE = _get("GEOIP_OFFSET_OVERRIDE", "")   # e.g. "-5" for EST
-
-# ── Ollama lifecycle management ───────────────────────────────────────────────
-
-# "systemctl" — use systemctl on the host (requires appropriate permissions).
-# "none"      — proxy only; do not manage Ollama services.
-OLLAMA_MANAGE_VIA = _get("OLLAMA_MANAGE_VIA", "none")
-
-GPU0_SERVICE  = _get("GPU0_SERVICE",  "ollama-gpu0")
-GPU1_SERVICE  = _get("GPU1_SERVICE",  "ollama-gpu1")
-NIGHT_SERVICE = _get("NIGHT_SERVICE", "ollama-night")
-
-# Max seconds to wait for in-flight requests to drain before transitioning.
-DRAIN_TIMEOUT_SEC = int(_get("DRAIN_TIMEOUT_SEC", "300"))
+# Exponential backoff for health probes on degraded GPUs.
+HEALTH_BACKOFF_BASE = int(_get("HEALTH_BACKOFF_BASE", "10"))     # initial probe interval
+HEALTH_BACKOFF_CAP  = int(_get("HEALTH_BACKOFF_CAP",  "300"))    # max probe interval
+HEALTH_FAULT_TIMEOUT = int(_get("HEALTH_FAULT_TIMEOUT", "1800")) # seconds until faulted
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 
+EXTRA_DISK_PATHS    = _get("EXTRA_DISK_PATHS",    "")   # e.g. "archive=/mnt/archive,data=/mnt/data"
 DB_PATH             = _get("DB_PATH",             "/data/merllm.db")
 METRICS_RETAIN_DAYS = int(_get("METRICS_RETAIN_DAYS", "7"))
 METRICS_INTERVAL_SEC = int(_get("METRICS_INTERVAL_SEC", "10"))
@@ -130,12 +112,7 @@ def apply_overrides(d: dict) -> None:
     str_fields = {
         "ollama_0_url":              "OLLAMA_0_URL",
         "ollama_1_url":              "OLLAMA_1_URL",
-        "day_model_gpu0":            "DAY_MODEL_GPU0",
-        "day_model_gpu1":            "DAY_MODEL_GPU1",
-        "night_model":               "NIGHT_MODEL",
-        "base_day_end_local":        "BASE_DAY_END_LOCAL",
-        "geoip_offset_override":     "GEOIP_OFFSET_OVERRIDE",
-        "ollama_manage_via":         "OLLAMA_MANAGE_VIA",
+        "default_model":             "DEFAULT_MODEL",
         "ssh_user":                  "SSH_USER",
         "ssh_key_path":              "SSH_KEY_PATH",
         "notification_webhook_url":  "NOTIFICATION_WEBHOOK_URL",
@@ -143,9 +120,10 @@ def apply_overrides(d: dict) -> None:
         "lancellmot_url":            "LANCELLMOT_URL",
     }
     int_fields = {
-        "night_num_ctx":           "NIGHT_NUM_CTX",
-        "inactivity_timeout_min":  "INACTIVITY_TIMEOUT_MIN",
-        "drain_timeout_sec":       "DRAIN_TIMEOUT_SEC",
+        "reclaim_timeout":         "RECLAIM_TIMEOUT",
+        "health_backoff_base":     "HEALTH_BACKOFF_BASE",
+        "health_backoff_cap":      "HEALTH_BACKOFF_CAP",
+        "health_fault_timeout":    "HEALTH_FAULT_TIMEOUT",
         "metrics_interval_sec":    "METRICS_INTERVAL_SEC",
     }
     for key, attr in str_fields.items():

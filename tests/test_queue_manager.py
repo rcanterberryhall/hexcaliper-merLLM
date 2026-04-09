@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 def reset_queue():
     """Re-import queue_manager fresh for each test to reset module state."""
     for mod in list(sys.modules.keys()):
-        if mod in ("queue_manager", "config", "db", "mode_manager", "geoip"):
+        if mod in ("queue_manager", "config", "db", "gpu_router"):
             del sys.modules[mod]
     yield
 
@@ -108,12 +108,6 @@ def test_submit_and_retrieve_job_status(tmp_path, monkeypatch):
     assert status["status"] == "queued"
     assert status["source_app"] == "parsival"
     assert status["model"] == "qwen3:32b"
-
-
-def test_signal_night_mode(qm):
-    """signal_night_mode should not raise."""
-    qm.signal_night_mode()
-    assert qm._batch_event.is_set()
 
 
 # ── GPU slot tests ────────────────────────────────────────────────────────────
@@ -212,7 +206,7 @@ def _fresh_qm(tmp_path, monkeypatch, extra_env=None):
     for k, v in (extra_env or {}).items():
         monkeypatch.setenv(k, v)
     for mod in list(sys.modules.keys()):
-        if mod in ("queue_manager", "db", "config", "mode_manager", "geoip"):
+        if mod in ("queue_manager", "db", "config", "gpu_router"):
             sys.modules.pop(mod, None)
     import queue_manager
     return queue_manager
@@ -243,74 +237,15 @@ def _mock_client_factory(responses):
 
 
 @pytest.mark.asyncio
-async def test_run_batch_job_retries_on_transient_failure(tmp_path, monkeypatch):
-    """A failing job is requeued with retry_after set; second attempt completes it."""
-    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
+async def test_submit_batch_job_creates_job(tmp_path, monkeypatch):
+    """submit_batch_job creates a job in the DB."""
+    qm = _fresh_qm(tmp_path, monkeypatch)
     import db
-
     job_id = qm.submit_batch_job("test", "model", "hello")
     job = db.get_batch_job(job_id)
-
-    # First run: Ollama fails
-    monkeypatch.setattr(qm.httpx, "AsyncClient",
-                        _mock_client_factory([_MockFailResp()]))
-    await qm._run_batch_job(job)
-
-    after_fail = db.get_batch_job(job_id)
-    assert after_fail["status"] == "queued"
-    assert after_fail["retries"] == 1
-    assert after_fail["retry_after"] is not None
-    assert after_fail["retry_after"] > time.time()
-    assert "attempt 1 failed" in after_fail["error"]
-
-    # Second run: Ollama succeeds
-    monkeypatch.setattr(qm.httpx, "AsyncClient",
-                        _mock_client_factory([_MockResp()]))
-    await qm._run_batch_job(after_fail)
-
-    final = db.get_batch_job(job_id)
-    assert final["status"] == "completed"
-    assert final["result"] == "ok"
-
-
-@pytest.mark.asyncio
-async def test_run_batch_job_fails_permanently_after_max_retries(tmp_path, monkeypatch):
-    """After BATCH_MAX_RETRIES failures the job is marked 'failed'."""
-    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
-    import db
-
-    job_id = qm.submit_batch_job("test", "model", "hello")
-
-    # Run 3 times, all failing (max_retries=2 → 3 total attempts)
-    for _ in range(3):
-        job = db.get_batch_job(job_id)
-        monkeypatch.setattr(qm.httpx, "AsyncClient",
-                            _mock_client_factory([_MockFailResp()]))
-        await qm._run_batch_job(job)
-
-    final = db.get_batch_job(job_id)
-    assert final["status"] == "failed"
-    assert final["retries"] == 2
-    assert "final failure" in final["error"]
-
-
-@pytest.mark.asyncio
-async def test_retry_backoff_increases_exponentially(tmp_path, monkeypatch):
-    """Each retry sets a strictly larger retry_after than the previous."""
-    qm = _fresh_qm(tmp_path, monkeypatch, {"BATCH_MAX_RETRIES": "2"})
-    import db
-
-    job_id = qm.submit_batch_job("test", "model", "hello")
-
-    retry_afters = []
-    for _ in range(2):
-        job = db.get_batch_job(job_id)
-        monkeypatch.setattr(qm.httpx, "AsyncClient",
-                            _mock_client_factory([_MockFailResp()]))
-        await qm._run_batch_job(job)
-        retry_afters.append(db.get_batch_job(job_id)["retry_after"])
-
-    assert retry_afters[1] > retry_afters[0]
+    assert job is not None
+    assert job["source_app"] == "test"
+    assert job["model"] == "model"
 
 
 def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
@@ -318,8 +253,8 @@ def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("BATCH_MAX_PROMPT_LEN", "50")
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
 
     import app as app_mod
@@ -339,8 +274,8 @@ def test_batch_submit_accepts_prompt_within_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("BATCH_MAX_PROMPT_LEN", "50")
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
 
     import app as app_mod

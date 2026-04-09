@@ -18,7 +18,7 @@ def reset_activity():
     import importlib
     # Reload app module so module-level state is fresh
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "mode_manager", "queue_manager", "geoip", "metrics", "db", "config"):
+        if mod in ("app", "gpu_router", "queue_manager", "metrics", "db", "config"):
             sys.modules.pop(mod, None)
     yield
     # Clean up again after test

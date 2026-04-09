@@ -16,8 +16,8 @@ def _fresh_app(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKUP_DIR", str(bk_dir))
     monkeypatch.setenv("BACKUP_KEEP_DAYS", "3")
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
     # seed a minimal DB so the file exists
     conn = sqlite3.connect(str(db_file))
@@ -80,8 +80,8 @@ def test_backup_missing_db_returns_500(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH",    str(tmp_path / "nonexistent.db"))
     monkeypatch.setenv("BACKUP_DIR", str(tmp_path / "backups"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
     import app as app_mod
     from fastapi.testclient import TestClient

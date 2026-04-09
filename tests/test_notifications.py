@@ -276,7 +276,7 @@ def test_events_endpoint_is_registered(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     # Clear cached modules to get a fresh app
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "mode_manager", "queue_manager", "geoip", "metrics",
+        if mod in ("app", "gpu_router", "queue_manager", "metrics",
                    "db", "config", "notifications"):
             sys.modules.pop(mod, None)
 

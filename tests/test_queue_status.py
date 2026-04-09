@@ -35,8 +35,8 @@ def _ndjson_lines(content: bytes) -> list[dict]:
 def _fresh_app(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
     import app as app_mod
     from fastapi.testclient import TestClient
@@ -82,8 +82,8 @@ def test_context_tokens_injected_into_done_line(tmp_path, monkeypatch):
     """The done NDJSON line must carry context_tokens = prompt_eval_count."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
 
     import app as app_mod
@@ -121,8 +121,8 @@ def test_queue_status_emitted_when_slot_busy(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "5")
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
 
     import queue_manager as qm
@@ -160,8 +160,8 @@ def test_batch_queue_position_in_status(tmp_path, monkeypatch):
     """Queued batch jobs must report their queue_position in status."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
     import queue_manager as qm
     id1 = qm.submit_batch_job("test", "model", "first")
@@ -182,8 +182,8 @@ def test_completed_job_has_no_queue_position(tmp_path, monkeypatch):
     """Completed jobs must not include queue_position in their status."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
     import queue_manager as qm
     import db

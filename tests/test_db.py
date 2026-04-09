@@ -117,18 +117,18 @@ def test_count_batch_jobs_by_status(tmp_db):
 
 def test_settings_roundtrip(tmp_db):
     db = tmp_db
-    db.save_settings({"night_model": "qwen3:8b", "inactivity_timeout_min": 45})
+    db.save_settings({"default_model": "qwen3:8b", "reclaim_timeout": 120})
     s = db.get_settings()
-    assert s["night_model"] == "qwen3:8b"
-    assert s["inactivity_timeout_min"] == 45
+    assert s["default_model"] == "qwen3:8b"
+    assert s["reclaim_timeout"] == 120
 
 
 def test_settings_update(tmp_db):
     db = tmp_db
-    db.save_settings({"night_model": "a"})
-    db.save_settings({"night_model": "b"})
+    db.save_settings({"default_model": "a"})
+    db.save_settings({"default_model": "b"})
     s = db.get_settings()
-    assert s["night_model"] == "b"
+    assert s["default_model"] == "b"
 
 
 def test_get_settings_returns_none_when_empty(tmp_db):

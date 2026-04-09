@@ -9,29 +9,12 @@ services:
       OLLAMA_0_URL: "http://host.docker.internal:11434"
       OLLAMA_1_URL: "http://host.docker.internal:11435"
 
-      # ── Model assignment ──────────────────────────────────────────────────
-      DAY_MODEL_GPU0: "qwen3:32b"
-      DAY_MODEL_GPU1: "qwen3:30b-a3b"
-      NIGHT_MODEL:    "qwen3:32b"
-      NIGHT_NUM_CTX:  "32768"
-
-      # ── Scheduling ────────────────────────────────────────────────────────
-      INACTIVITY_TIMEOUT_MIN: "90"
-      BASE_DAY_END_LOCAL:     "22:00"
-
-      # ── GeoIP ─────────────────────────────────────────────────────────────
-      # Download GeoLite2-City.mmdb from MaxMind and place in ./data/
-      GEOIP_DB_PATH: "/data/GeoLite2-City.mmdb"
-      # GEOIP_OFFSET_OVERRIDE: "-5"   # uncomment to force a UTC offset
-
-      # ── Ollama lifecycle ──────────────────────────────────────────────────
-      # Set to "systemctl" to allow merLLM to start/stop ollama-gpu* services.
-      # Requires the Docker socket mounted and appropriate host permissions.
-      OLLAMA_MANAGE_VIA: "none"
-      GPU0_SERVICE:   "ollama-gpu0"
-      GPU1_SERVICE:   "ollama-gpu1"
-      NIGHT_SERVICE:  "ollama-night"
-      DRAIN_TIMEOUT_SEC: "300"
+      # ── Model & GPU health ─────────────────────────────────────────────────
+      DEFAULT_MODEL:        "qwen3:32b"
+      RECLAIM_TIMEOUT:      "300"       # seconds idle before reclaiming to default model
+      HEALTH_BACKOFF_BASE:  "10"        # initial health probe interval (seconds)
+      HEALTH_BACKOFF_CAP:   "300"       # max health probe interval (seconds)
+      HEALTH_FAULT_TIMEOUT: "1800"      # seconds until GPU declared faulted
 
       # ── GPU metrics ──────────────────────────────────────────────────────
       LD_LIBRARY_PATH: "/usr/local/lib"
@@ -55,11 +38,15 @@ services:
       # REST API exposed by the iDRAC fan controller container (api_server.py)
       FAN_CONTROLLER_URL: "http://host.docker.internal:8083"
 
+      # ── Extra disk monitoring ────────────────────────────────────────���────
+      # Comma-separated label=path pairs for additional disks to monitor
+      EXTRA_DISK_PATHS: "archive=/mnt/archive"
+
     volumes:
       - merllm-data:/data
       - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/local/lib/libnvidia-ml.so.1:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/log/journal:/var/log/journal:ro
+      - /media/lobulus/Archive:/mnt/archive:ro
 
     devices:
       - /dev/nvidiactl:/dev/nvidiactl

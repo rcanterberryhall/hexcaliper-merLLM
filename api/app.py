@@ -2,15 +2,16 @@
 app.py — merLLM: centralized LLM traffic control for the Hexcaliper ecosystem.
 
 Exposes a drop-in Ollama API proxy on :11400. Both LanceLLMot and Parsival
-point their OLLAMA_BASE_URL here. merLLM routes requests to the appropriate
-GPU-pinned Ollama instance and manages day/night mode transitions.
+point their OLLAMA_BASE_URL here. merLLM round-robins requests across both
+GPU-pinned Ollama instances with priority queuing and health tracking.
 
 Additional endpoints:
-  GET/POST  /api/merllm/status    — current mode, GPU layout, queue depth
-  POST      /api/merllm/mode      — manual override (day/night/auto)
+  GET/POST  /api/merllm/status    — GPU state, queue depth, health
   GET/POST  /api/merllm/settings  — view/update configuration
+  GET       /api/merllm/default-model — current default model
+  POST      /api/merllm/gpu/{gpu}/reset — manual GPU health reset
   GET       /api/merllm/activity  — live per-instance request state + loaded models
-  POST      /api/batch/submit     — queue a job for night-mode processing
+  POST      /api/batch/submit     — queue a batch job (runs at low priority)
   GET       /api/batch/status     — poll job status
   GET       /api/batch/results/{id} — retrieve completed output
   GET       /api/merllm/metrics/current  — latest system snapshot
@@ -25,7 +26,6 @@ import json
 import logging
 import os
 import sqlite3
-import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,9 +41,8 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 import db
-import geoip
+import gpu_router
 import metrics
-import mode_manager
 import notifications
 import queue_manager
 
@@ -152,12 +151,6 @@ async def lifespan(app: FastAPI):
     if saved:
         config.apply_overrides(saved)
 
-    # Register mode-change callback to signal batch runner
-    mode_manager.register_mode_change_callback(
-        lambda m: queue_manager.signal_night_mode()
-        if m == mode_manager.Mode.NIGHT else None
-    )
-
     # Startup diagnostics: database integrity
     try:
         integrity = db.conn().execute("PRAGMA integrity_check").fetchone()
@@ -185,11 +178,11 @@ async def lifespan(app: FastAPI):
 
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
-    asyncio.create_task(mode_manager.scheduler_loop())
     asyncio.create_task(queue_manager.worker_loop())
-    asyncio.create_task(queue_manager.batch_runner_loop())
+    asyncio.create_task(gpu_router.reclaim_loop())
 
-    log.info("started — mode=%s", mode_manager.current_mode().value)
+    log.info("started — routing=%s, default_model=%s",
+             "round_robin", config.DEFAULT_MODEL)
     yield
     log.info("shutting down")
 
@@ -292,8 +285,6 @@ async def _stream_proxy(target: str, path: str, body: dict,
 
 def _queue_reason(target: str) -> str:
     """Human-readable reason a request is waiting for a GPU slot."""
-    if mode_manager.current_mode() == mode_manager.Mode.NIGHT:
-        return "transitioning to day mode"
     in_flight = queue_manager.queue_depth()["gpus"].get(target, {}).get("in_flight", 0)
     if in_flight:
         return "GPU slot occupied by another request"
@@ -364,28 +355,15 @@ async def _proxy_get(target: str, path: str) -> Response:
 
 @app.post("/api/generate")
 async def proxy_generate(request: Request):
-    """
-    Proxy POST /api/generate to the appropriate Ollama instance.
-
-    Routes based on requested model name in day mode. Interactive requests
-    update the inactivity timer; if night mode is active and an interactive
-    request arrives, triggers transition back to day mode.
-    """
+    """Proxy POST /api/generate — round-robin routed across GPUs."""
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
-    ip = _client_ip(request)
 
-    if priority == queue_manager.PRIORITY_INTERACTIVE:
-        mode_manager.record_interactive(ip)
-        if mode_manager.current_mode() == mode_manager.Mode.NIGHT:
-            asyncio.create_task(mode_manager.transition_to_day("interactive_request"))
-
-    target = mode_manager.get_target_url(model)
+    target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
     if stream:
-        # Return immediately; queue_status NDJSON emitted inside if waiting.
         return await _queued_stream(target, "/api/generate", body, priority)
 
     acquired = await queue_manager.acquire_gpu_slot(target, priority)
@@ -398,27 +376,22 @@ async def proxy_generate(request: Request):
             },
             headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
         )
-    async with mode_manager.InFlightGuard():
-        try:
-            return await _proxy(target, "/api/generate", body)
-        finally:
-            queue_manager.release_gpu_slot(target)
+    try:
+        resp = await _proxy(target, "/api/generate", body)
+        gpu_router.record_activity(target)
+        return resp
+    finally:
+        queue_manager.release_gpu_slot(target)
 
 
 @app.post("/api/chat")
 async def proxy_chat(request: Request):
-    """Proxy POST /api/chat."""
+    """Proxy POST /api/chat — round-robin routed across GPUs."""
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
-    ip = _client_ip(request)
 
-    if priority == queue_manager.PRIORITY_INTERACTIVE:
-        mode_manager.record_interactive(ip)
-        if mode_manager.current_mode() == mode_manager.Mode.NIGHT:
-            asyncio.create_task(mode_manager.transition_to_day("interactive_request"))
-
-    target = mode_manager.get_target_url(model)
+    target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
     if stream:
@@ -434,19 +407,23 @@ async def proxy_chat(request: Request):
             },
             headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
         )
-    async with mode_manager.InFlightGuard():
-        try:
-            return await _proxy(target, "/api/chat", body)
-        finally:
-            queue_manager.release_gpu_slot(target)
+    try:
+        resp = await _proxy(target, "/api/chat", body)
+        gpu_router.record_activity(target)
+        return resp
+    finally:
+        queue_manager.release_gpu_slot(target)
 
 
 @app.post("/api/embeddings")
 async def proxy_embeddings(request: Request):
-    """Proxy POST /api/embeddings to GPU 0."""
+    """Proxy POST /api/embeddings — round-robin routed across GPUs."""
     body = await request.json()
-    async with mode_manager.InFlightGuard():
-        return await _proxy(config.OLLAMA_0_URL, "/api/embeddings", body)
+    model = body.get("model", "")
+    target = gpu_router.get_target_url(model)
+    resp = await _proxy(target, "/api/embeddings", body)
+    gpu_router.record_activity(target)
+    return resp
 
 
 @app.get("/api/tags")
@@ -466,10 +443,9 @@ async def proxy_pull(request: Request):
     """Proxy model pull to GPU 0 (shared model store)."""
     body = await request.json()
     stream = body.get("stream", True)
-    async with mode_manager.InFlightGuard():
-        if stream:
-            return await _stream_proxy(config.OLLAMA_0_URL, "/api/pull", body)
-        return await _proxy(config.OLLAMA_0_URL, "/api/pull", body)
+    if stream:
+        return await _stream_proxy(config.OLLAMA_0_URL, "/api/pull", body)
+    return await _proxy(config.OLLAMA_0_URL, "/api/pull", body)
 
 
 @app.get("/api/ps")
@@ -508,12 +484,11 @@ async def merllm_status():
     latest = db.get_latest_metrics()
 
     return {
-        **mode_manager.status(),
+        **gpu_router.status(),
         "queue":         queue_manager.queue_depth(),
         "ollama":        ollama_health,
-        "gpus":          metrics.gpu_snapshot(),
+        "gpu_metrics":   metrics.gpu_snapshot(),
         "batch_counts":  db.count_batch_jobs_by_status(),
-        "last_transition": db.list_transitions(limit=1),
         "warnings":      _build_warnings(ollama_health, latest),
     }
 
@@ -610,47 +585,35 @@ async def activity_stream():
     )
 
 
-@app.post("/api/merllm/mode")
-async def set_mode(request: Request):
-    """
-    Manual mode override.
+@app.get("/api/merllm/default-model")
+async def default_model():
+    """Return the current default model for client apps to query."""
+    return {"model": config.DEFAULT_MODEL}
 
-    Body: {"mode": "day" | "night" | "auto"}
-    "auto" clears the override and returns to schedule-driven behaviour.
-    """
-    body = await request.json()
-    mode = body.get("mode")
-    if mode not in ("day", "night", "auto", None):
-        raise HTTPException(status_code=422, detail="mode must be 'day', 'night', or 'auto'")
-    ok = await mode_manager.set_override(None if mode == "auto" else mode)
-    current = mode_manager.current_mode().value
+
+@app.post("/api/merllm/gpu/{gpu}/reset")
+async def reset_gpu(gpu: str):
+    """Manually reset a faulted GPU to healthy."""
+    url_map = {"gpu0": config.OLLAMA_0_URL, "gpu1": config.OLLAMA_1_URL}
+    url = url_map.get(gpu)
+    if not url:
+        raise HTTPException(status_code=422, detail="gpu must be 'gpu0' or 'gpu1'")
+    ok = gpu_router.reset_gpu(url)
     if not ok:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "ok": False,
-                "mode": current,
-                "error": f"Transition to {mode!r} failed — mode rolled back to {current!r}.",
-            },
-        )
-    return {"ok": True, "mode": current}
+        raise HTTPException(status_code=404, detail="GPU not found")
+    return {"ok": True, **gpu_router.status()}
 
 
 @app.get("/api/merllm/settings")
 async def get_settings():
-    saved = db.get_settings()
     return {
         "ollama_0_url":              config.OLLAMA_0_URL,
         "ollama_1_url":              config.OLLAMA_1_URL,
-        "day_model_gpu0":            config.DAY_MODEL_GPU0,
-        "day_model_gpu1":            config.DAY_MODEL_GPU1,
-        "night_model":               config.NIGHT_MODEL,
-        "night_num_ctx":             config.NIGHT_NUM_CTX,
-        "inactivity_timeout_min":    config.INACTIVITY_TIMEOUT_MIN,
-        "base_day_end_local":        config.BASE_DAY_END_LOCAL,
-        "geoip_offset_override":     config.GEOIP_OFFSET_OVERRIDE,
-        "ollama_manage_via":         config.OLLAMA_MANAGE_VIA,
-        "drain_timeout_sec":         config.DRAIN_TIMEOUT_SEC,
+        "default_model":             config.DEFAULT_MODEL,
+        "reclaim_timeout":           config.RECLAIM_TIMEOUT,
+        "health_backoff_base":       config.HEALTH_BACKOFF_BASE,
+        "health_backoff_cap":        config.HEALTH_BACKOFF_CAP,
+        "health_fault_timeout":      config.HEALTH_FAULT_TIMEOUT,
         "metrics_interval_sec":      config.METRICS_INTERVAL_SEC,
         "notification_webhook_url":  config.NOTIFICATION_WEBHOOK_URL,
     }
@@ -659,6 +622,21 @@ async def get_settings():
 @app.post("/api/merllm/settings")
 async def save_settings(request: Request):
     body = await request.json()
+
+    # DEFAULT_MODEL change requires explicit confirmation.
+    new_model = body.get("default_model")
+    if new_model and new_model != config.DEFAULT_MODEL:
+        if not body.get("confirm_model_change"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": "Changing default_model will reload both GPUs when idle. "
+                             "Resend with confirm_model_change: true to proceed.",
+                },
+            )
+        gpu_router.set_pending_default_model(new_model)
+
     db.save_settings(body)
     config.apply_overrides(body)
     return {"ok": True}
@@ -670,12 +648,12 @@ async def save_settings(request: Request):
 @app.post("/api/batch/submit")
 async def batch_submit(request: Request):
     """
-    Queue a generation request for night-mode extended-context processing.
+    Queue a generation request for batch processing (runs at low priority).
 
     Body: {
       "source_app": "parsival" | "lancellmot" | ...,
       "prompt": "...",
-      "model": "qwen3:32b",       # optional, defaults to NIGHT_MODEL
+      "model": "qwen3:32b",       # optional, defaults to DEFAULT_MODEL
       "options": {}               # optional Ollama options
     }
     """
@@ -692,7 +670,7 @@ async def batch_submit(request: Request):
 
     job_id = queue_manager.submit_batch_job(
         source_app=body.get("source_app", "unknown"),
-        model=body.get("model", config.NIGHT_MODEL),
+        model=body.get("model", config.DEFAULT_MODEL),
         prompt=prompt,
         options=body.get("options"),
     )
@@ -748,17 +726,12 @@ async def batch_drain():
 
 @app.post("/api/batch/retry-failed")
 async def batch_retry_failed():
-    """Requeue all failed jobs."""
+    """Requeue all failed jobs and re-enqueue them for processing."""
     n = db.requeue_all_failed_jobs()
-    queue_manager.signal_night_mode()
+    # Re-enqueue each requeued job for processing.
+    for job in db.list_batch_jobs(status="queued"):
+        asyncio.ensure_future(queue_manager._run_batch_job_async(job["id"]))
     return {"ok": True, "requeued": n}
-
-
-@app.post("/api/batch/run-now")
-async def batch_run_now():
-    """Trigger the batch runner immediately without waiting for night mode."""
-    queue_manager.signal_night_mode()
-    return {"ok": True}
 
 
 @app.delete("/api/batch/completed")
@@ -1024,29 +997,15 @@ _LOG_DOCKER = {
     "merllm-api":       config.LOG_CONTAINER_MERLLM_API,
 }
 
-# Services backed by host systemd units
-_LOG_SYSTEMD = {"ollama-gpu0", "ollama-gpu1", "ollama-night"}
-
-_ALL_LOG_SERVICES = set(_LOG_DOCKER) | _LOG_SYSTEMD
+_ALL_LOG_SERVICES = set(_LOG_DOCKER)
 
 
 @app.get("/api/merllm/logs/{service}")
 async def service_logs(service: str, lines: int = 100):
-    """Tail recent log lines — Docker containers via SDK, systemd units via journalctl."""
+    """Tail recent log lines from Docker containers."""
     if service not in _ALL_LOG_SERVICES:
         raise HTTPException(status_code=422,
                             detail=f"Unknown service. Valid: {sorted(_ALL_LOG_SERVICES)}")
-
-    if service in _LOG_SYSTEMD:
-        try:
-            result = subprocess.run(
-                ["journalctl", "--directory", "/var/log/journal",
-                 "-u", f"{service}.service", "--no-pager", "-n", str(lines)],
-                capture_output=True, text=True, timeout=10
-            )
-            return {"service": service, "lines": result.stdout.splitlines()}
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
 
     container_name = _LOG_DOCKER[service]
     try:
@@ -1059,24 +1018,6 @@ async def service_logs(service: str, lines: int = 100):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/merllm/transitions")
-async def transition_history():
-    return db.list_transitions(limit=50)
-
-
-@app.get("/api/merllm/geoip")
-async def geoip_info(request: Request):
-    ip = _client_ip(request)
-    offset = geoip.get_utc_offset(ip)
-    end_h, end_m = geoip.day_end_utc(config.BASE_DAY_END_LOCAL, offset)
-    return {
-        "client_ip":        ip,
-        "utc_offset":       offset,
-        "base_day_end":     config.BASE_DAY_END_LOCAL,
-        "adjusted_day_end_utc": f"{end_h:02d}:{end_m:02d}",
-        "geoip_db_present": os.path.exists(config.GEOIP_DB_PATH),
-        "manual_override":  config.GEOIP_OFFSET_OVERRIDE or None,
-    }
 
 
 # ── Fan controller proxy ──────────────────────────────────────────────────────
@@ -1249,4 +1190,4 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "mode": mode_manager.current_mode().value}
+    return {"ok": True, "routing": "round_robin"}

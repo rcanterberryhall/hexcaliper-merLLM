@@ -1,18 +1,14 @@
 """
-queue_manager.py — Priority queue and batch job execution.
+queue_manager.py — Priority queue and GPU slot management.
 
 Maintains an asyncio PriorityQueue with two levels:
   0 = interactive (high priority)
   1 = batch       (low priority)
 
-Batch jobs queued via POST /api/batch/submit are held in SQLite and executed
-when night mode activates (or immediately if night mode is already active).
-The night-mode batch runner processes jobs sequentially against the dual-GPU
-Ollama instance with extended context.
+Both levels run whenever a GPU slot is free. Interactive requests time out
+after INTERACTIVE_QUEUE_TIMEOUT seconds; batch requests wait indefinitely.
 
-Failed jobs are automatically retried up to BATCH_MAX_RETRIES times with
-exponential backoff (30s, 120s, …). The accumulated error history is
-preserved in the job's error field.
+Failed requests are retried on the other GPU when possible (failover).
 """
 import asyncio
 import json
@@ -28,14 +24,12 @@ log = logging.getLogger(__name__)
 
 import config
 import db
-import mode_manager
 import notifications
 
 PRIORITY_INTERACTIVE = 0
 PRIORITY_BATCH       = 1
 
 _queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-_batch_event: asyncio.Event   = asyncio.Event()   # signalled when night mode starts
 
 # ── Per-GPU slot management ───────────────────────────────────────────────────
 # One asyncio.Semaphore per Ollama target URL, capped at GPU_MAX_CONCURRENT.
@@ -120,22 +114,51 @@ async def enqueue(target: str, body: dict, priority: int = PRIORITY_INTERACTIVE)
 
 
 async def worker_loop() -> None:
-    """Process queued requests sequentially (one Ollama call at a time per GPU)."""
+    """Process queued requests (one Ollama call at a time per GPU)."""
+    import gpu_router
+
     while True:
         item: QueuedRequest = await _queue.get()
         if item.future.cancelled():
             _queue.task_done()
             continue
         try:
-            async with mode_manager.InFlightGuard():
-                result = await _forward(item.target, item.body)
+            result = await _forward(item.target, item.body)
+            gpu_router.record_activity(item.target)
             item.future.set_result(result)
         except Exception as exc:
             log.error("request to %s failed: %s", item.target, exc)
-            if not item.future.done():
-                item.future.set_exception(exc)
+            # Failover: try the other GPU if healthy.
+            other = _other_gpu(item.target)
+            if other:
+                try:
+                    log.info("failing over to %s", other)
+                    result = await _forward(other, item.body)
+                    gpu_router.record_activity(other)
+                    item.future.set_result(result)
+                except Exception as exc2:
+                    log.error("failover to %s also failed: %s", other, exc2)
+                    gpu_router.mark_failed(other)
+                    if not item.future.done():
+                        item.future.set_exception(exc2)
+            else:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            gpu_router.mark_failed(item.target)
         finally:
             _queue.task_done()
+
+
+def _other_gpu(target: str) -> Optional[str]:
+    """Return the other GPU URL if it's healthy, else None."""
+    import gpu_router
+    urls = [config.OLLAMA_0_URL, config.OLLAMA_1_URL]
+    for url in urls:
+        if url != target:
+            state = gpu_router._gpus.get(url)
+            if state and state.health == gpu_router.GpuHealth.HEALTHY:
+                return url
+    return None
 
 
 async def _forward(target: str, body: dict) -> tuple[int, bytes, dict]:
@@ -158,14 +181,98 @@ def queue_depth() -> dict:
 def submit_batch_job(source_app: str, model: str, prompt: str,
                      options: Optional[dict] = None) -> str:
     """
-    Persist a batch job for night-mode execution.
+    Persist a batch job and enqueue it for processing.
 
-    Returns the job ID. The job stays 'queued' until night mode activates.
+    Returns the job ID. The job runs at batch priority whenever a GPU is free.
     """
     job_id = str(uuid.uuid4())
-    db.insert_batch_job(job_id, source_app, model or config.NIGHT_MODEL,
+    db.insert_batch_job(job_id, source_app, model or config.DEFAULT_MODEL,
                         prompt, options or {})
+    # Schedule async execution.
+    asyncio.ensure_future(_run_batch_job_async(job_id))
     return job_id
+
+
+async def _run_batch_job_async(job_id: str) -> None:
+    """Execute a batch job through the normal priority queue."""
+    import gpu_router
+
+    job = db.get_batch_job(job_id)
+    if not job or job["status"] != "queued":
+        return
+
+    retries = job.get("retries", 0)
+    db.update_batch_job(job_id, status="running", started_at=time.time())
+
+    options: dict = {}
+    try:
+        options = json.loads(job.get("options", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    body = {
+        "model":   job["model"],
+        "prompt":  job["prompt"],
+        "stream":  False,
+        "options": options,
+    }
+
+    target = gpu_router.get_target_url(job["model"])
+
+    try:
+        acquired = await acquire_gpu_slot(target, PRIORITY_BATCH)
+        if not acquired:
+            # Should not happen for batch (waits indefinitely), but guard.
+            raise RuntimeError("failed to acquire GPU slot")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+                resp = await client.post(f"{target}/api/generate", json=body)
+                resp.raise_for_status()
+                result_text = resp.json().get("response", "")
+            gpu_router.record_activity(target)
+            db.update_batch_job(job_id, status="completed",
+                                completed_at=time.time(), result=result_text)
+            log.info("batch job %s completed", job_id[:8])
+            completed_job = db.get_batch_job(job_id)
+            if completed_job:
+                asyncio.ensure_future(notifications.dispatch(
+                    completed_job,
+                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+                ))
+        finally:
+            release_gpu_slot(target)
+    except Exception as exc:
+        prev_error = (job.get("error") or "").strip()
+        if retries < config.BATCH_MAX_RETRIES:
+            backoff    = 30 * (4 ** retries)          # 30s, 120s, 480s …
+            retry_after = time.time() + backoff
+            new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
+            db.update_batch_job(
+                job_id,
+                status="queued",
+                retries=retries + 1,
+                retry_after=retry_after,
+                started_at=None,
+                error=new_error,
+            )
+            log.warning(
+                "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
+                job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
+            )
+            await asyncio.sleep(backoff)
+            await _run_batch_job_async(job_id)
+        else:
+            final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
+            db.update_batch_job(job_id, status="failed",
+                                completed_at=time.time(), error=final_error)
+            log.error("batch job %s permanently failed after %d attempt(s): %s",
+                      job_id[:8], retries + 1, exc)
+            failed_job = db.get_batch_job(job_id)
+            if failed_job:
+                asyncio.ensure_future(notifications.dispatch(
+                    failed_job,
+                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+                ))
 
 
 def get_queue_position(job_id: str) -> Optional[int]:
@@ -200,7 +307,7 @@ def get_job_status(job_id: str) -> Optional[dict]:
     }
     if job["status"] == "queued":
         result["queue_position"] = get_queue_position(job_id)
-        result["estimated_start"] = None   # no per-job duration data available
+        result["estimated_start"] = None
     return result
 
 
@@ -212,127 +319,3 @@ def get_job_result(job_id: str) -> Optional[dict]:
         "id":     job["id"],
         "result": job.get("result", ""),
     }
-
-
-def signal_night_mode() -> None:
-    """Call when night mode activates to start draining the batch queue."""
-    _batch_event.set()
-
-
-# ── Night-mode batch runner ───────────────────────────────────────────────────
-
-
-async def batch_runner_loop() -> None:
-    """
-    Execute queued batch jobs during night mode.
-
-    Waits for the night-mode signal, then loops until either:
-    - All jobs (including deferred retries) are processed, or
-    - Night mode ends.
-
-    Deferred retries (jobs with a future retry_after timestamp) are
-    waited for in-place — the runner sleeps until the earliest one is
-    ready rather than exiting and losing the night-mode window.
-    """
-    while True:
-        await _batch_event.wait()
-        _batch_event.clear()
-
-        if mode_manager.current_mode() != mode_manager.Mode.NIGHT:
-            continue
-
-        log.info("batch runner activated")
-
-        while mode_manager.current_mode() == mode_manager.Mode.NIGHT:
-            ready = db.list_batch_jobs(status="queued", ready_only=True)
-            if ready:
-                log.info("batch: processing %d ready job(s)", len(ready))
-                for job in ready:
-                    if mode_manager.current_mode() != mode_manager.Mode.NIGHT:
-                        log.info("batch: mode changed — pausing")
-                        break
-                    await _run_batch_job(job)
-            else:
-                next_ts = db.get_earliest_retry_after()
-                if next_ts is None:
-                    log.info("batch: queue empty, going idle")
-                    break
-                wait_sec = max(1.0, next_ts - time.time())
-                log.info("batch: %.0fs until next retry", wait_sec)
-                await asyncio.sleep(min(wait_sec, 60.0))
-
-
-async def _run_batch_job(job: dict) -> None:
-    """
-    Execute one batch job against Ollama.
-
-    On failure, automatically retries up to BATCH_MAX_RETRIES times with
-    exponential backoff (30s × 4^attempt). Each retry increments the
-    job's retry counter and sets retry_after. On final failure the job
-    is marked 'failed' with accumulated error history.
-    """
-    job_id  = job["id"]
-    retries = job.get("retries", 0)
-    db.update_batch_job(job_id, status="running", started_at=time.time())
-
-    options: dict = {}
-    try:
-        options = json.loads(job.get("options", "{}"))
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    options.setdefault("num_ctx", config.NIGHT_NUM_CTX)
-
-    body = {
-        "model":   job["model"],
-        "prompt":  job["prompt"],
-        "stream":  False,
-        "options": options,
-    }
-
-    target = config.OLLAMA_0_URL   # night mode: single dual-GPU instance
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
-            resp = await client.post(f"{target}/api/generate", json=body)
-            resp.raise_for_status()
-            result_text = resp.json().get("response", "")
-        db.update_batch_job(job_id, status="completed",
-                            completed_at=time.time(), result=result_text)
-        log.info("batch job %s completed", job_id[:8])
-        completed_job = db.get_batch_job(job_id)
-        if completed_job:
-            asyncio.ensure_future(notifications.dispatch(
-                completed_job,
-                webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-            ))
-    except Exception as exc:
-        prev_error = (job.get("error") or "").strip()
-        if retries < config.BATCH_MAX_RETRIES:
-            backoff    = 30 * (4 ** retries)          # 30s, 120s, 480s …
-            retry_after = time.time() + backoff
-            new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
-            db.update_batch_job(
-                job_id,
-                status="queued",
-                retries=retries + 1,
-                retry_after=retry_after,
-                started_at=None,
-                error=new_error,
-            )
-            log.warning(
-                "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
-                job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
-            )
-        else:
-            final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
-            db.update_batch_job(job_id, status="failed",
-                                completed_at=time.time(), error=final_error)
-            log.error("batch job %s permanently failed after %d attempt(s): %s",
-                      job_id[:8], retries + 1, exc)
-            failed_job = db.get_batch_job(job_id)
-            if failed_job:
-                asyncio.ensure_future(notifications.dispatch(
-                    failed_job,
-                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-                ))

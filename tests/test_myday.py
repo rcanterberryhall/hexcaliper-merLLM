@@ -14,8 +14,8 @@ def client(tmp_path, monkeypatch):
     """Return a TestClient with an isolated DB."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip", "notifications"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics", "notifications"):
             sys.modules.pop(mod, None)
     from fastapi.testclient import TestClient
     import app as app_mod

@@ -12,12 +12,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 def client(tmp_path, monkeypatch):
     """Return a TestClient with an isolated DB and mocked queue_manager."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setenv("OLLAMA_DAY_URL", "http://localhost:11434")
-    monkeypatch.setenv("OLLAMA_NIGHT_URL", "http://localhost:11435")
-
     for mod in list(sys.modules.keys()):
-        if mod in ("app", "db", "config", "queue_manager", "mode_manager",
-                   "metrics", "geoip"):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
             sys.modules.pop(mod, None)
 
     from fastapi.testclient import TestClient
@@ -38,15 +35,6 @@ def client_with_jobs(client, tmp_path, monkeypatch):
     db.insert_batch_job("x1", "test", "model", "cancelled prompt", {})
     db.update_batch_job("x1", status="cancelled")
     return client
-
-
-# ── POST /api/batch/run-now ───────────────────────────────────────────────────
-
-
-def test_run_now_returns_ok(client):
-    r = client.post("/api/batch/run-now")
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
 
 
 # ── POST /api/batch/retry-failed ─────────────────────────────────────────────
