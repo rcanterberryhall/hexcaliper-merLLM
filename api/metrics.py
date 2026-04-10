@@ -109,6 +109,26 @@ def collect() -> list[tuple[str, float]]:
     except Exception as exc:
         log.warning("disk usage collection failed: %s", exc)
 
+    # Extra disks (configured via EXTRA_DISK_PATHS env var)
+    try:
+        import config as _cfg
+        for pair in _cfg.EXTRA_DISK_PATHS.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            label, path = pair.split("=", 1)
+            try:
+                edu = psutil.disk_usage(path.strip())
+                points += [
+                    (f"disk.{label.strip()}.used",  float(edu.used)),
+                    (f"disk.{label.strip()}.total", float(edu.total)),
+                    (f"disk.{label.strip()}.pct",   float(edu.percent)),
+                ]
+            except Exception as exc:
+                log.warning("disk usage collection for %s failed: %s", label, exc)
+    except Exception:
+        pass
+
     # Disk I/O
     try:
         dio = psutil.disk_io_counters()
@@ -170,6 +190,8 @@ def gpu_snapshot() -> list[dict]:
 async def collection_loop() -> None:
     """Background task: collect metrics every METRICS_INTERVAL_SEC seconds."""
     _init_nvml()
+    log.info("metrics collection started (interval=%ds, retain=%dd)",
+             config.METRICS_INTERVAL_SEC, config.METRICS_RETAIN_DAYS)
     while True:
         try:
             points = collect()

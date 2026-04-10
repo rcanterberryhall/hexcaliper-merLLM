@@ -31,6 +31,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+# Configure root logger so all merLLM modules are visible in container logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# Suppress noisy httpx request-level logging (merLLM logs its own proxy calls)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 _req_log = logging.getLogger("merllm.requests")
 log = logging.getLogger("merllm")
 

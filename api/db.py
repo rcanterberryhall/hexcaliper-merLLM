@@ -7,12 +7,15 @@ Three tables:
   settings    — key/value configuration overrides
 """
 import json
+import logging
 import sqlite3
 import threading
 import time
 from typing import Optional
 
 import config
+
+log = logging.getLogger(__name__)
 
 lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
@@ -26,6 +29,8 @@ def conn() -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
         _create_tables(_conn)
+        row_count = _conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
+        log.info("database opened: %s (%d metrics rows)", config.DB_PATH, row_count)
     return _conn
 
 
@@ -269,8 +274,8 @@ def get_metrics_history(name: str, since: float) -> list[dict]:
 def get_latest_metrics() -> dict:
     with lock:
         rows = conn().execute(
-            "SELECT name, value, ts FROM metrics m1 WHERE ts = "
-            "(SELECT MAX(ts) FROM metrics m2 WHERE m2.name = m1.name)"
+            "SELECT name, value, ts FROM metrics "
+            "WHERE ts = (SELECT MAX(ts) FROM metrics)"
         ).fetchall()
     return {r["name"]: {"value": r["value"], "ts": r["ts"]} for r in rows}
 
@@ -278,7 +283,9 @@ def get_latest_metrics() -> dict:
 def prune_old_metrics(retain_days: int) -> None:
     cutoff = time.time() - retain_days * 86400
     with lock:
-        conn().execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+        c = conn().execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+        if c.rowcount:
+            log.info("pruned %d metrics rows older than %d days", c.rowcount, retain_days)
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────

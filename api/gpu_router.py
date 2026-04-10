@@ -56,6 +56,8 @@ def _init_gpus() -> None:
     if not _gpus:
         for url in [config.OLLAMA_0_URL, config.OLLAMA_1_URL]:
             _gpus[url] = GpuState(url)
+        log.info("GPU states initialised: %s (default_model=%s)",
+                 list(_gpus.keys()), config.DEFAULT_MODEL)
 
 
 def _healthy_gpus() -> list[GpuState]:
