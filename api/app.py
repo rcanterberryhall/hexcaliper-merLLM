@@ -426,13 +426,28 @@ async def proxy_chat(request: Request):
 
 @app.post("/api/embeddings")
 async def proxy_embeddings(request: Request):
-    """Proxy POST /api/embeddings — round-robin routed across GPUs."""
+    """Proxy POST /api/embeddings — queued, round-robin routed across GPUs."""
     body = await request.json()
     model = body.get("model", "")
+    priority = _priority(request)
+
     target = gpu_router.get_target_url(model)
-    resp = await _proxy(target, "/api/embeddings", body)
-    gpu_router.record_activity(target)
-    return resp
+    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    if not acquired:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "GPU busy — all slots occupied",
+                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
+            },
+            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
+        )
+    try:
+        resp = await _proxy(target, "/api/embeddings", body)
+        gpu_router.record_activity(target)
+        return resp
+    finally:
+        queue_manager.release_gpu_slot(target)
 
 
 @app.get("/api/tags")
