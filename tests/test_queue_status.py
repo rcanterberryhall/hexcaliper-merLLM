@@ -133,10 +133,10 @@ def test_queue_status_emitted_when_slot_busy(tmp_path, monkeypatch):
     # Patch gpu_slot_busy so it reports the slot as busy (simulating contention).
     monkeypatch.setattr(qm, "gpu_slot_busy", lambda t: True)
     # acquire_gpu_slot should succeed immediately so the stream proceeds.
-    async def _instant_acquire(t, p):
+    async def _instant_acquire(t, p, tid=None):
         return True
     monkeypatch.setattr(qm, "acquire_gpu_slot", _instant_acquire)
-    monkeypatch.setattr(qm, "release_gpu_slot", lambda t: None)
+    monkeypatch.setattr(qm, "release_gpu_slot", lambda t, tid=None: None)
 
     done_chunk = json.dumps({"done": True, "prompt_eval_count": 10}).encode() + b"\n"
     monkeypatch.setattr(app_mod.httpx, "AsyncClient",

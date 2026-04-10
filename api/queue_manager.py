@@ -1,14 +1,18 @@
 """
-queue_manager.py — Priority queue and GPU slot management.
+queue_manager.py — Unified GPU queue with per-request tracking.
 
-Maintains an asyncio PriorityQueue with two levels:
-  0 = interactive (high priority)
-  1 = batch       (low priority)
+Every GPU request (interactive chat/generate, embeddings, batch jobs) is
+registered in an in-memory tracker before acquiring a GPU slot.  This gives
+the dashboard full visibility into what is queued, running, and recently
+completed on each GPU.
 
-Both levels run whenever a GPU slot is free. Interactive requests time out
-after INTERACTIVE_QUEUE_TIMEOUT seconds; batch requests wait indefinitely.
+Concurrency is still controlled by per-GPU asyncio.Semaphores (one slot per
+GPU by default).  The tracker layers metadata on top so the UI can show
+source app, model, request type, elapsed time, and target GPU for every
+request in the system.
 
-Failed requests are retried on the other GPU when possible (failover).
+Batch jobs remain SQLite-persisted for retry/review.  Interactive requests
+are transient — tracked while in-flight, removed on completion.
 """
 import asyncio
 import json
@@ -16,7 +20,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
@@ -29,30 +33,90 @@ import notifications
 PRIORITY_INTERACTIVE = 0
 PRIORITY_BATCH       = 1
 
-_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-
 # ── Per-GPU slot management ───────────────────────────────────────────────────
-# One asyncio.Semaphore per Ollama target URL, capped at GPU_MAX_CONCURRENT.
-# Interactive requests wait up to INTERACTIVE_QUEUE_TIMEOUT seconds then give up.
-# Batch requests wait indefinitely. Semaphore waiters are FIFO within priority.
 
 _gpu_semaphores: dict[str, asyncio.Semaphore] = {}
-_gpu_in_flight:  dict[str, int]               = {}
 
 
 def _gpu_sem(target: str) -> asyncio.Semaphore:
     if target not in _gpu_semaphores:
         _gpu_semaphores[target] = asyncio.Semaphore(config.GPU_MAX_CONCURRENT)
-        _gpu_in_flight[target]  = 0
     return _gpu_semaphores[target]
 
 
-async def acquire_gpu_slot(target: str, priority: int) -> bool:
+def gpu_slot_busy(target: str) -> bool:
+    """Return True if all GPU_MAX_CONCURRENT slots for target are occupied."""
+    return _gpu_sem(target)._value == 0
+
+
+# ── Request tracking ─────────────────────────────────────────────────────────
+
+@dataclass
+class TrackedRequest:
+    id: str
+    source: str            # "lancellmot", "parsival", "direct", ...
+    request_type: str      # "chat", "generate", "embeddings", "batch"
+    model: str
+    priority: int
+    target: str            # GPU URL
+    status: str            # "queued", "running", "completed", "failed"
+    submitted_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+    batch_job_id: Optional[str] = None
+
+
+_tracked: dict[str, TrackedRequest] = {}
+
+# Callback notified on every track/start/complete/fail so the SSE layer can
+# push updates.  Set by app.py at startup.
+_on_queue_change: Optional[callable] = None
+
+
+def set_queue_change_callback(cb: callable) -> None:
+    global _on_queue_change
+    _on_queue_change = cb
+
+
+def _notify_change() -> None:
+    if _on_queue_change:
+        try:
+            _on_queue_change()
+        except Exception:
+            pass
+
+
+def track_request(source: str, request_type: str, model: str,
+                  priority: int, target: str,
+                  batch_job_id: Optional[str] = None) -> str:
+    """Register a new request in the tracker. Returns a tracking ID."""
+    req_id = str(uuid.uuid4())
+    _tracked[req_id] = TrackedRequest(
+        id=req_id,
+        source=source,
+        request_type=request_type,
+        model=model,
+        priority=priority,
+        target=target,
+        status="queued",
+        submitted_at=time.time(),
+        batch_job_id=batch_job_id,
+    )
+    _notify_change()
+    return req_id
+
+
+async def acquire_gpu_slot(target: str, priority: int,
+                           tracking_id: Optional[str] = None) -> bool:
     """
     Acquire a generation slot for `target`.
 
+    If tracking_id is provided, the tracked entry transitions to "running"
+    on success.
+
     Interactive priority: waits up to INTERACTIVE_QUEUE_TIMEOUT seconds.
-    Returns False (→ caller should 503) if the slot is not available in time.
+    Returns False (caller should 503) if the slot is not available in time.
 
     Batch priority: waits indefinitely; always returns True.
     """
@@ -61,119 +125,102 @@ async def acquire_gpu_slot(target: str, priority: int) -> bool:
         try:
             await asyncio.wait_for(sem.acquire(), timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
         except asyncio.TimeoutError:
+            if tracking_id and tracking_id in _tracked:
+                _tracked[tracking_id].status = "failed"
+                _tracked[tracking_id].error = "Timed out waiting for GPU slot"
+                _tracked[tracking_id].completed_at = time.time()
+                _notify_change()
+                # Clean up failed interactive entries after a short delay
+                asyncio.get_event_loop().call_later(10, _remove_tracked, tracking_id)
             return False
     else:
         await sem.acquire()
-    _gpu_in_flight[target] = _gpu_in_flight.get(target, 0) + 1
+
+    if tracking_id and tracking_id in _tracked:
+        _tracked[tracking_id].status = "running"
+        _tracked[tracking_id].started_at = time.time()
+        _notify_change()
+
     return True
 
 
-def release_gpu_slot(target: str) -> None:
+def release_gpu_slot(target: str, tracking_id: Optional[str] = None) -> None:
     """Release a slot acquired by acquire_gpu_slot."""
     _gpu_semaphores[target].release()
-    _gpu_in_flight[target] = max(0, _gpu_in_flight.get(target, 0) - 1)
+
+    if tracking_id and tracking_id in _tracked:
+        entry = _tracked[tracking_id]
+        entry.status = "completed"
+        entry.completed_at = time.time()
+        _notify_change()
+        # Interactive requests: remove from tracker shortly after completion.
+        # Batch requests stay visible (persisted in SQLite anyway).
+        if entry.priority == PRIORITY_INTERACTIVE:
+            asyncio.get_event_loop().call_later(5, _remove_tracked, tracking_id)
 
 
-def gpu_slot_busy(target: str) -> bool:
-    """Return True if all GPU_MAX_CONCURRENT slots for target are occupied."""
-    return _gpu_sem(target)._value == 0
+def fail_request(tracking_id: str, error: str = "") -> None:
+    """Mark a tracked request as failed (e.g. Ollama error during generation)."""
+    if tracking_id in _tracked:
+        entry = _tracked[tracking_id]
+        entry.status = "failed"
+        entry.error = error
+        entry.completed_at = time.time()
+        _notify_change()
+        if entry.priority == PRIORITY_INTERACTIVE:
+            asyncio.get_event_loop().call_later(10, _remove_tracked, tracking_id)
 
 
-@dataclass(order=True)
-class QueuedRequest:
-    priority: int
-    ts:       float
-    future:   Any = field(compare=False)
-    target:   str = field(compare=False)
-    body:     dict = field(compare=False)
+def _remove_tracked(tracking_id: str) -> None:
+    _tracked.pop(tracking_id, None)
+    _notify_change()
 
 
-# ── Public submission ─────────────────────────────────────────────────────────
+# ── Queue visibility ─────────────────────────────────────────────────────────
 
 
-async def enqueue(target: str, body: dict, priority: int = PRIORITY_INTERACTIVE) -> asyncio.Future:
+def active_queue() -> list[dict]:
     """
-    Add an Ollama request to the priority queue.
-
-    Returns a Future that resolves to (status_code, content, headers) when
-    the request completes.
+    Return all currently tracked requests (queued + running + recently
+    completed), sorted by submitted_at.
     """
-    future: asyncio.Future = asyncio.get_event_loop().create_future()
-    item = QueuedRequest(
-        priority=priority,
-        ts=time.time(),
-        future=future,
-        target=target,
-        body=body,
-    )
-    await _queue.put(item)
-    return future
-
-
-# ── Worker ────────────────────────────────────────────────────────────────────
-
-
-async def worker_loop() -> None:
-    """Process queued requests (one Ollama call at a time per GPU)."""
-    import gpu_router
-
-    while True:
-        item: QueuedRequest = await _queue.get()
-        if item.future.cancelled():
-            _queue.task_done()
-            continue
-        try:
-            result = await _forward(item.target, item.body)
-            gpu_router.record_activity(item.target)
-            item.future.set_result(result)
-        except Exception as exc:
-            log.error("request to %s failed: %s", item.target, exc)
-            # Failover: try the other GPU if healthy.
-            other = _other_gpu(item.target)
-            if other:
-                try:
-                    log.info("failing over to %s", other)
-                    result = await _forward(other, item.body)
-                    gpu_router.record_activity(other)
-                    item.future.set_result(result)
-                except Exception as exc2:
-                    log.error("failover to %s also failed: %s", other, exc2)
-                    gpu_router.mark_failed(other)
-                    if not item.future.done():
-                        item.future.set_exception(exc2)
-            else:
-                if not item.future.done():
-                    item.future.set_exception(exc)
-            gpu_router.mark_failed(item.target)
-        finally:
-            _queue.task_done()
-
-
-def _other_gpu(target: str) -> Optional[str]:
-    """Return the other GPU URL if it's healthy, else None."""
-    import gpu_router
-    urls = [config.OLLAMA_0_URL, config.OLLAMA_1_URL]
-    for url in urls:
-        if url != target:
-            state = gpu_router._gpus.get(url)
-            if state and state.health == gpu_router.GpuHealth.HEALTHY:
-                return url
-    return None
-
-
-async def _forward(target: str, body: dict) -> tuple[int, bytes, dict]:
-    """Make an Ollama HTTP request and return (status, body, headers)."""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
-        resp = await client.post(f"{target}/api/generate", json=body)
-        return resp.status_code, resp.content, dict(resp.headers)
+    now = time.time()
+    result = []
+    for entry in sorted(_tracked.values(), key=lambda e: e.submitted_at):
+        d = {
+            "id":            entry.id,
+            "source":        entry.source,
+            "request_type":  entry.request_type,
+            "model":         entry.model,
+            "priority":      "interactive" if entry.priority == PRIORITY_INTERACTIVE else "batch",
+            "target":        entry.target,
+            "status":        entry.status,
+            "submitted_at":  entry.submitted_at,
+            "started_at":    entry.started_at,
+            "completed_at":  entry.completed_at,
+            "error":         entry.error,
+            "batch_job_id":  entry.batch_job_id,
+        }
+        if entry.status == "running" and entry.started_at:
+            d["elapsed_sec"] = round(now - entry.started_at, 1)
+        elif entry.status == "queued":
+            d["waiting_sec"] = round(now - entry.submitted_at, 1)
+        result.append(d)
+    return result
 
 
 def queue_depth() -> dict:
-    total_in_flight = sum(_gpu_in_flight.values())
-    result: dict = {"total": _queue.qsize(), "in_flight": total_in_flight, "gpus": {}}
-    for target, in_flight in _gpu_in_flight.items():
-        result["gpus"][target] = {"in_flight": in_flight}
-    return result
+    """Summary counts for the status endpoint."""
+    queued = sum(1 for e in _tracked.values() if e.status == "queued")
+    running = sum(1 for e in _tracked.values() if e.status == "running")
+
+    gpus: dict = {}
+    for entry in _tracked.values():
+        if entry.status in ("queued", "running"):
+            gpu = gpus.setdefault(entry.target, {"queued": 0, "running": 0})
+            gpu[entry.status] += 1
+
+    return {"queued": queued, "running": running, "total": queued + running, "gpus": gpus}
 
 
 # ── Batch job submission ──────────────────────────────────────────────────────
@@ -189,13 +236,12 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
     job_id = str(uuid.uuid4())
     db.insert_batch_job(job_id, source_app, model or config.DEFAULT_MODEL,
                         prompt, options or {})
-    # Schedule async execution.
     asyncio.ensure_future(_run_batch_job_async(job_id))
     return job_id
 
 
 async def _run_batch_job_async(job_id: str) -> None:
-    """Execute a batch job through the normal priority queue."""
+    """Execute a batch job through the tracked GPU queue."""
     import gpu_router
 
     job = db.get_batch_job(job_id)
@@ -220,10 +266,19 @@ async def _run_batch_job_async(job_id: str) -> None:
 
     target = gpu_router.get_target_url(job["model"])
 
+    # Track this batch job in the unified queue
+    tracking_id = track_request(
+        source=job["source_app"],
+        request_type="batch",
+        model=job["model"],
+        priority=PRIORITY_BATCH,
+        target=target,
+        batch_job_id=job_id,
+    )
+
     try:
-        acquired = await acquire_gpu_slot(target, PRIORITY_BATCH)
+        acquired = await acquire_gpu_slot(target, PRIORITY_BATCH, tracking_id)
         if not acquired:
-            # Should not happen for batch (waits indefinitely), but guard.
             raise RuntimeError("failed to acquire GPU slot")
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
@@ -241,11 +296,12 @@ async def _run_batch_job_async(job_id: str) -> None:
                     webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
                 ))
         finally:
-            release_gpu_slot(target)
+            release_gpu_slot(target, tracking_id)
     except Exception as exc:
+        fail_request(tracking_id, str(exc))
         prev_error = (job.get("error") or "").strip()
         if retries < config.BATCH_MAX_RETRIES:
-            backoff    = 30 * (4 ** retries)          # 30s, 120s, 480s …
+            backoff    = 30 * (4 ** retries)
             retry_after = time.time() + backoff
             new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
             db.update_batch_job(

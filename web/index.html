@@ -18,7 +18,7 @@
 
 <nav>
   <button class="active" data-tab="overview">Overview</button>
-  <button data-tab="batch">Batch Jobs</button>
+  <button data-tab="queue">GPU Queue</button>
   <button data-tab="metrics">Metrics</button>
   <button data-tab="logs">Logs</button>
   <button data-tab="terminal">SSH</button>
@@ -60,7 +60,7 @@
           <span id="ov-pending-model" class="stat-value" style="color:var(--yellow)">—</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Queue depth</span>
+          <span class="stat-label">Active requests</span>
           <span id="ov-queue" class="stat-value">—</span>
         </div>
         <div id="gpu-router-cards"></div>
@@ -71,7 +71,7 @@
         <div id="ollama-gpu0" class="instance-card">Loading&hellip;</div>
         <div id="ollama-gpu1" class="instance-card" style="margin-top:10px">Loading&hellip;</div>
         <div class="mt">
-          <h2>Batch Jobs</h2>
+          <h2>GPU Queue</h2>
           <div id="batch-counts"></div>
         </div>
       </div>
@@ -101,11 +101,33 @@
     </div>
   </div>
 
-  <!-- ── Batch Jobs ── -->
-  <div id="tab-batch" class="tab">
+  <!-- ── GPU Queue ── -->
+  <div id="tab-queue" class="tab">
+
+    <!-- Live queue -->
+    <div class="card" style="margin-bottom:16px">
+      <h2>Active Requests
+        <button class="btn" style="float:right;padding:2px 10px;font-size:11px" onclick="loadQueue()">Refresh</button>
+      </h2>
+      <p class="muted" style="font-size:12px;margin-bottom:8px">
+        Every GPU request (interactive, embedding, batch) is shown here while in-flight.
+      </p>
+      <div id="queue-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source</th><th>Type</th><th>Model</th><th>Priority</th><th>GPU</th><th>Status</th><th>Elapsed</th>
+            </tr>
+          </thead>
+          <tbody id="queue-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Batch jobs management -->
     <div class="grid-2">
       <div class="card">
-        <h2>Submit Job</h2>
+        <h2>Submit Batch Job</h2>
         <div class="batch-form">
           <input id="b-source" type="text" placeholder="Source app (e.g. lancellmot)" value="merllm-ui" />
           <input id="b-model" type="text" placeholder="Model (leave blank for default model)" />
@@ -117,7 +139,7 @@
         </div>
       </div>
       <div class="card">
-        <h2>Job Queue</h2>
+        <h2>Batch History</h2>
         <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn" onclick="loadBatchJobs()">Refresh</button>
           <button class="btn" onclick="batchRetryFailed()">Retry Failed</button>
@@ -301,13 +323,16 @@
       </div>
 
       <div class="card">
-        <h2>Priority Queue</h2>
+        <h2>GPU Queue</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          All <code>/api/generate</code> and <code>/api/chat</code> requests pass through a GPU slot queue.
+          Every GPU request — interactive chat/generate, embeddings, and batch jobs — is tracked in a single
+          unified queue. The <strong style="color:var(--text)">GPU Queue</strong> tab shows all active and
+          waiting requests with source app, model, target GPU, priority, status, and elapsed time.<br><br>
           Interactive requests proceed immediately if a GPU is available. When both GPUs are busy, the request
-          waits up to <code>INTERACTIVE_QUEUE_TIMEOUT</code> seconds (default 30) before returning 503.<br><br>
-          Batch-priority requests (<code>X-Priority: batch</code>) yield to queued interactive requests.
-          The queue tracks in-flight count per GPU for informed routing.<br><br>
+          waits up to <code>INTERACTIVE_QUEUE_TIMEOUT</code> seconds (default 30) before returning 503.
+          Batch-priority requests (<code>X-Priority: batch</code>) yield to queued interactive requests.<br><br>
+          Client apps can identify themselves with the <code>X-Source</code> header (e.g. <code>lancellmot</code>,
+          <code>parsival</code>). Requests without this header appear as <code>direct</code>.<br><br>
           <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
           <code>queue_status</code> event is emitted before generation starts, showing queue position
           and estimated wait time. LanceLLMot and Parsival display this as a waiting indicator.
@@ -445,6 +470,7 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
         <table style="font-size:12px">
           <tr><th>Endpoint</th><th>Description</th></tr>
           <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">GPU state, queue depth, health</td></tr>
+          <tr><td><code>GET  /api/merllm/queue</code></td><td class="muted">Unified GPU queue (all active/waiting requests)</td></tr>
           <tr><td><code>GET  /api/merllm/default-model</code></td><td class="muted">Current default model</td></tr>
           <tr><td><code>POST /api/merllm/gpu/{gpu}/reset</code></td><td class="muted">Manual GPU health reset</td></tr>
           <tr><td><code>GET  /api/merllm/settings</code></td><td class="muted">View current config</td></tr>

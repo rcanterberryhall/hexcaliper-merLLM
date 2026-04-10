@@ -10,6 +10,7 @@ Additional endpoints:
   GET/POST  /api/merllm/settings  — view/update configuration
   GET       /api/merllm/default-model — current default model
   POST      /api/merllm/gpu/{gpu}/reset — manual GPU health reset
+  GET       /api/merllm/queue     — unified GPU queue (all active/waiting requests)
   GET       /api/merllm/activity  — live per-instance request state + loaded models
   POST      /api/batch/submit     — queue a batch job (runs at low priority)
   GET       /api/batch/status     — poll job status
@@ -148,6 +149,8 @@ def _activity_snapshot() -> dict:
             result[key] = None
         else:
             result[key] = {**entry, "elapsed_sec": round(now - entry["started_at"], 1)}
+    result["queue"] = queue_manager.active_queue()
+    result["queue_summary"] = queue_manager.queue_depth()
     return result
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
@@ -185,9 +188,11 @@ async def lifespan(app: FastAPI):
     if recovered:
         log.info("recovered %d orphaned job(s) → queued", recovered)
 
+    # Wire queue-change notifications into the activity SSE stream
+    queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
+
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
-    asyncio.create_task(queue_manager.worker_loop())
     asyncio.create_task(gpu_router.reclaim_loop())
 
     log.info("started — routing=%s, default_model=%s",
@@ -237,6 +242,10 @@ def _client_ip(request: Request) -> str:
 def _priority(request: Request) -> int:
     h = request.headers.get("x-priority", "interactive").lower()
     return queue_manager.PRIORITY_BATCH if h == "batch" else queue_manager.PRIORITY_INTERACTIVE
+
+
+def _source(request: Request) -> str:
+    return request.headers.get("x-source", "direct")
 
 
 async def _generate_stream(target: str, path: str, body: dict, on_done=None):
@@ -294,14 +303,15 @@ async def _stream_proxy(target: str, path: str, body: dict,
 
 def _queue_reason(target: str) -> str:
     """Human-readable reason a request is waiting for a GPU slot."""
-    in_flight = queue_manager.queue_depth()["gpus"].get(target, {}).get("in_flight", 0)
-    if in_flight:
+    gpu_info = queue_manager.queue_depth()["gpus"].get(target, {})
+    if gpu_info.get("running", 0):
         return "GPU slot occupied by another request"
     return "GPU busy"
 
 
 async def _queued_stream(target: str, path: str, body: dict,
-                         priority: int) -> StreamingResponse:
+                         priority: int,
+                         tracking_id: str = "") -> StreamingResponse:
     """
     Streaming proxy that emits a ``queue_status`` NDJSON line if the GPU slot
     is not immediately available, giving the caller transparent visibility into
@@ -321,7 +331,7 @@ async def _queued_stream(target: str, path: str, body: dict,
                 "estimated_wait_seconds":  est,
             }).encode() + b"\n"
 
-        acquired = await queue_manager.acquire_gpu_slot(target, priority)
+        acquired = await queue_manager.acquire_gpu_slot(target, priority, tracking_id)
         if not acquired:
             yield json.dumps({
                 "error": "GPU busy — timed out waiting for slot",
@@ -330,7 +340,8 @@ async def _queued_stream(target: str, path: str, body: dict,
             _activity_clear(target)
             return
 
-        on_done = lambda: queue_manager.release_gpu_slot(target)
+        _tid = tracking_id
+        on_done = lambda: queue_manager.release_gpu_slot(target, _tid)
         async for chunk in _generate_stream(target, path, body, on_done):
             yield chunk
 
@@ -368,14 +379,17 @@ async def proxy_generate(request: Request):
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
+    source = _source(request)
 
     target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
-    if stream:
-        return await _queued_stream(target, "/api/generate", body, priority)
+    tid = queue_manager.track_request(source, "generate", model, priority, target)
 
-    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    if stream:
+        return await _queued_stream(target, "/api/generate", body, priority, tid)
+
+    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
     if not acquired:
         return JSONResponse(
             status_code=503,
@@ -390,7 +404,7 @@ async def proxy_generate(request: Request):
         gpu_router.record_activity(target)
         return resp
     finally:
-        queue_manager.release_gpu_slot(target)
+        queue_manager.release_gpu_slot(target, tid)
 
 
 @app.post("/api/chat")
@@ -399,14 +413,17 @@ async def proxy_chat(request: Request):
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
+    source = _source(request)
 
     target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
-    if stream:
-        return await _queued_stream(target, "/api/chat", body, priority)
+    tid = queue_manager.track_request(source, "chat", model, priority, target)
 
-    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    if stream:
+        return await _queued_stream(target, "/api/chat", body, priority, tid)
+
+    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
     if not acquired:
         return JSONResponse(
             status_code=503,
@@ -421,7 +438,7 @@ async def proxy_chat(request: Request):
         gpu_router.record_activity(target)
         return resp
     finally:
-        queue_manager.release_gpu_slot(target)
+        queue_manager.release_gpu_slot(target, tid)
 
 
 @app.post("/api/embeddings")
@@ -430,9 +447,12 @@ async def proxy_embeddings(request: Request):
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
+    source = _source(request)
 
     target = gpu_router.get_target_url(model)
-    acquired = await queue_manager.acquire_gpu_slot(target, priority)
+    tid = queue_manager.track_request(source, "embeddings", model, priority, target)
+
+    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
     if not acquired:
         return JSONResponse(
             status_code=503,
@@ -447,7 +467,7 @@ async def proxy_embeddings(request: Request):
         gpu_router.record_activity(target)
         return resp
     finally:
-        queue_manager.release_gpu_slot(target)
+        queue_manager.release_gpu_slot(target, tid)
 
 
 @app.get("/api/tags")
@@ -531,6 +551,18 @@ def _build_warnings(ollama_health: dict, latest: dict) -> list[str]:
         if temp and temp > 85:
             warnings.append(f"GPU {i} temperature {temp:.0f}°C — thermal throttle risk")
     return warnings
+
+
+@app.get("/api/merllm/queue")
+async def merllm_queue():
+    """
+    Unified GPU queue: all active, waiting, and recently completed requests
+    across interactive, embedding, and batch workloads.
+    """
+    return {
+        "queue":   queue_manager.active_queue(),
+        "summary": queue_manager.queue_depth(),
+    }
 
 
 @app.get("/api/merllm/activity")

@@ -1,4 +1,4 @@
-"""Tests for queue_manager.py — priority queue behaviour."""
+"""Tests for queue_manager.py — unified GPU queue with tracking."""
 import asyncio
 import os
 import sys
@@ -33,81 +33,77 @@ def test_priority_constants(qm):
 
 def test_queue_depth_empty(qm):
     d = qm.queue_depth()
+    assert d["queued"] == 0
+    assert d["running"] == 0
     assert d["total"] == 0
 
 
-@pytest.mark.asyncio
-async def test_enqueue_increases_depth(qm):
-    f = await qm.enqueue("http://localhost:11434", {"model": "test"})
-    assert qm.queue_depth()["total"] == 1
-    f.cancel()
+# ── Request tracking tests ───────────────────────────────────────────────────
+
+
+def test_track_request_returns_id(qm):
+    tid = qm.track_request("test", "generate", "qwen3:32b",
+                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    assert len(tid) == 36  # UUID format
+
+
+def test_track_request_appears_in_active_queue(qm):
+    tid = qm.track_request("lancellmot", "chat", "qwen3:32b",
+                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    queue = qm.active_queue()
+    assert len(queue) == 1
+    entry = queue[0]
+    assert entry["id"] == tid
+    assert entry["source"] == "lancellmot"
+    assert entry["request_type"] == "chat"
+    assert entry["model"] == "qwen3:32b"
+    assert entry["priority"] == "interactive"
+    assert entry["status"] == "queued"
+
+
+def test_track_request_shows_in_queue_depth(qm):
+    qm.track_request("test", "generate", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    d = qm.queue_depth()
+    assert d["queued"] == 1
+    assert d["total"] == 1
 
 
 @pytest.mark.asyncio
-async def test_priority_ordering(qm):
-    """Batch requests should be dequeued after interactive ones."""
-    loop = asyncio.get_event_loop()
-
-    # Enqueue batch first, then interactive
-    f_batch = await qm.enqueue("http://localhost:11434", {"model": "b"}, qm.PRIORITY_BATCH)
-    f_inter = await qm.enqueue("http://localhost:11434", {"model": "i"}, qm.PRIORITY_INTERACTIVE)
-
-    # Drain internal queue to inspect order
-    queue = qm._queue
-    first  = await queue.get()
-    second = await queue.get()
-
-    assert first.priority  == qm.PRIORITY_INTERACTIVE
-    assert second.priority == qm.PRIORITY_BATCH
-
-    f_batch.cancel()
-    f_inter.cancel()
+async def test_acquire_transitions_to_running(qm):
+    tid = qm.track_request("test", "generate", "m",
+                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    acquired = await qm.acquire_gpu_slot("http://gpu0:11434",
+                                          qm.PRIORITY_INTERACTIVE, tid)
+    assert acquired is True
+    queue = qm.active_queue()
+    assert queue[0]["status"] == "running"
+    assert queue[0]["started_at"] is not None
+    d = qm.queue_depth()
+    assert d["running"] == 1
+    assert d["queued"] == 0
+    qm.release_gpu_slot("http://gpu0:11434", tid)
 
 
 @pytest.mark.asyncio
-async def test_enqueue_returns_future(qm):
-    f = await qm.enqueue("http://localhost:11434", {"model": "x"})
-    assert isinstance(f, asyncio.Future)
-    f.cancel()
+async def test_release_transitions_to_completed(qm):
+    tid = qm.track_request("test", "chat", "m",
+                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    await qm.acquire_gpu_slot("http://gpu0:11434", qm.PRIORITY_INTERACTIVE, tid)
+    qm.release_gpu_slot("http://gpu0:11434", tid)
+    queue = qm.active_queue()
+    assert queue[0]["status"] == "completed"
+    assert queue[0]["completed_at"] is not None
 
 
-def test_submit_batch_job_returns_id(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
-    job_id = qm.submit_batch_job("test_app", "qwen3:32b", "hello world")
-    assert len(job_id) == 36   # UUID format
-
-
-def test_get_job_status_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
-    assert qm.get_job_status("nonexistent-id") is None
-
-
-def test_get_job_result_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
-    assert qm.get_job_result("nonexistent-id") is None
-
-
-def test_submit_and_retrieve_job_status(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
-    job_id = qm.submit_batch_job("parsival", "qwen3:32b", "analyze this")
-    status = qm.get_job_status(job_id)
-    assert status is not None
-    assert status["id"] == job_id
-    assert status["status"] == "queued"
-    assert status["source_app"] == "parsival"
-    assert status["model"] == "qwen3:32b"
+@pytest.mark.asyncio
+async def test_fail_request(qm):
+    tid = qm.track_request("test", "generate", "m",
+                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    await qm.acquire_gpu_slot("http://gpu0:11434", qm.PRIORITY_INTERACTIVE, tid)
+    qm.fail_request(tid, "Ollama OOM")
+    queue = qm.active_queue()
+    assert queue[0]["status"] == "failed"
+    assert queue[0]["error"] == "Ollama OOM"
 
 
 # ── GPU slot tests ────────────────────────────────────────────────────────────
@@ -119,9 +115,9 @@ async def test_acquire_and_release_slot(qm):
     target = "http://gpu0:11434"
     acquired = await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE)
     assert acquired is True
-    assert qm.queue_depth()["gpus"][target]["in_flight"] == 1
+    assert qm.gpu_slot_busy(target) is True
     qm.release_gpu_slot(target)
-    assert qm.queue_depth()["gpus"][target]["in_flight"] == 0
+    assert qm.gpu_slot_busy(target) is False
 
 
 @pytest.mark.asyncio
@@ -133,8 +129,8 @@ async def test_two_gpus_independent(qm):
     ok1 = await qm.acquire_gpu_slot(gpu1, qm.PRIORITY_INTERACTIVE)
     assert ok0 is True
     assert ok1 is True
-    assert qm.queue_depth()["gpus"][gpu0]["in_flight"] == 1
-    assert qm.queue_depth()["gpus"][gpu1]["in_flight"] == 1
+    assert qm.gpu_slot_busy(gpu0) is True
+    assert qm.gpu_slot_busy(gpu1) is True
     qm.release_gpu_slot(gpu0)
     qm.release_gpu_slot(gpu1)
 
@@ -185,19 +181,35 @@ async def test_batch_waits_for_slot(qm):
 
 
 @pytest.mark.asyncio
-async def test_queue_depth_reports_in_flight(qm):
-    """queue_depth includes per-GPU in_flight counts."""
+async def test_queue_depth_tracks_running(qm):
+    """queue_depth reports per-GPU running counts from tracked requests."""
     target = "http://gpu0:11434"
-    depth_before = qm.queue_depth()
-    assert depth_before["gpus"].get(target, {}).get("in_flight", 0) == 0
+    d0 = qm.queue_depth()
+    assert d0["running"] == 0
 
-    await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE)
-    assert qm.queue_depth()["gpus"][target]["in_flight"] == 1
-    qm.release_gpu_slot(target)
-    assert qm.queue_depth()["gpus"][target]["in_flight"] == 0
+    tid = qm.track_request("test", "generate", "m",
+                            qm.PRIORITY_INTERACTIVE, target)
+    await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE, tid)
+    d1 = qm.queue_depth()
+    assert d1["running"] == 1
+    assert d1["gpus"][target]["running"] == 1
+
+    qm.release_gpu_slot(target, tid)
 
 
-# ── Batch retry tests ─────────────────────────────────────────────────────────
+# ── Active queue ordering ────────────────────────────────────────────────────
+
+
+def test_active_queue_sorted_by_submitted_at(qm):
+    """active_queue returns entries sorted by submission time."""
+    t1 = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    t2 = qm.track_request("b", "generate", "m", qm.PRIORITY_BATCH, "http://gpu1:11435")
+    queue = qm.active_queue()
+    assert queue[0]["id"] == t1
+    assert queue[1]["id"] == t2
+
+
+# ── Batch job tests ──────────────────────────────────────────────────────────
 
 
 def _fresh_qm(tmp_path, monkeypatch, extra_env=None):
@@ -212,28 +224,43 @@ def _fresh_qm(tmp_path, monkeypatch, extra_env=None):
     return queue_manager
 
 
-class _MockResp:
-    status_code = 200
-    def raise_for_status(self): pass
-    def json(self): return {"response": "ok"}
+def test_submit_batch_job_returns_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ["db", "config", "queue_manager"]:
+        sys.modules.pop(mod, None)
+    import queue_manager as qm
+    job_id = qm.submit_batch_job("test_app", "qwen3:32b", "hello world")
+    assert len(job_id) == 36   # UUID format
 
 
-class _MockFailResp:
-    def raise_for_status(self):
-        raise RuntimeError("Ollama OOM")
+def test_get_job_status_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ["db", "config", "queue_manager"]:
+        sys.modules.pop(mod, None)
+    import queue_manager as qm
+    assert qm.get_job_status("nonexistent-id") is None
 
 
-def _mock_client_factory(responses):
-    """Return a mock httpx.AsyncClient class that yields responses in order."""
-    call_iter = iter(responses)
+def test_get_job_result_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ["db", "config", "queue_manager"]:
+        sys.modules.pop(mod, None)
+    import queue_manager as qm
+    assert qm.get_job_result("nonexistent-id") is None
 
-    class _Client:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def post(self, *args, **kwargs):
-            return next(call_iter)
 
-    return lambda **kwargs: _Client()
+def test_submit_and_retrieve_job_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ["db", "config", "queue_manager"]:
+        sys.modules.pop(mod, None)
+    import queue_manager as qm
+    job_id = qm.submit_batch_job("parsival", "qwen3:32b", "analyze this")
+    status = qm.get_job_status(job_id)
+    assert status is not None
+    assert status["id"] == job_id
+    assert status["status"] == "queued"
+    assert status["source_app"] == "parsival"
+    assert status["model"] == "qwen3:32b"
 
 
 @pytest.mark.asyncio
@@ -288,3 +315,37 @@ def test_batch_submit_accepts_prompt_within_limit(tmp_path, monkeypatch):
     })
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+
+
+# ── Queue change callback ────────────────────────────────────────────────────
+
+
+def test_queue_change_callback_fires(qm):
+    """set_queue_change_callback is called on track/release."""
+    calls = []
+    qm.set_queue_change_callback(lambda: calls.append(1))
+    qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    assert len(calls) >= 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_marks_tracked_as_failed(monkeypatch, qm):
+    """Interactive timeout should mark the tracked entry as failed."""
+    monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "0")
+    for mod in list(sys.modules.keys()):
+        if mod in ("config", "queue_manager"):
+            del sys.modules[mod]
+    import queue_manager as qm2
+    target = "http://gpu0:11434"
+    # Occupy the slot
+    await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE)
+    # Track and try to acquire — will timeout
+    tid = qm2.track_request("test", "generate", "m",
+                             qm2.PRIORITY_INTERACTIVE, target)
+    result = await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE, tid)
+    assert result is False
+    queue = qm2.active_queue()
+    failed_entries = [e for e in queue if e["id"] == tid]
+    assert len(failed_entries) == 1
+    assert failed_entries[0]["status"] == "failed"
+    qm2.release_gpu_slot(target)

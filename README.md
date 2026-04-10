@@ -63,23 +63,15 @@ All settings are environment variables in `docker-compose.yml`. They can also be
 | `VNC_HOST` | `host.docker.internal` | VNC server host |
 | `VNC_PORT` | `5900` | VNC server port |
 
-## Day / Night mode
+## GPU routing
 
-**Day mode** — two Ollama instances run simultaneously, each pinned to one GPU. Requests are routed by model name: `DAY_MODEL_GPU1` goes to GPU 1, everything else goes to GPU 0.
+Both Ollama instances run continuously. Requests are round-robined across healthy GPUs. When a request specifies a non-default model, merLLM waits for an idle GPU, swaps it to the requested model, and routes subsequent matching requests there. After `RECLAIM_TIMEOUT` seconds of idle with a non-default model, the GPU is reclaimed back to `DEFAULT_MODEL`.
 
-**Night mode** — activates automatically when both conditions are met:
-1. No interactive requests for `INACTIVITY_TIMEOUT_MIN` minutes
-2. Current time is past `BASE_DAY_END_LOCAL` (adjusted for the client's timezone via GeoIP)
-
-In night mode, merLLM switches to the `ollama-night` service (both GPUs combined, larger context) and drains the batch job queue. Any new interactive request triggers an immediate return to day mode.
-
-Mode transitions fail honestly — if a systemctl call fails, the mode is not changed and the failure is recorded in the transition history with an explicit error. The `POST /api/merllm/mode` endpoint returns the failure status so the UI can display it. When `OLLAMA_MANAGE_VIA=none`, transitions are skipped entirely.
-
-Manual override is available via the dashboard Mode controls or `POST /api/merllm/mode`.
+**Health tracking** — if a GPU fails, it is marked *degraded* and excluded from routing. Health probes use exponential backoff. After `HEALTH_FAULT_TIMEOUT` seconds of continuous failure, the GPU is declared *faulted* and requires manual reset.
 
 ## Batch jobs
 
-Jobs submitted via `POST /api/batch/submit` are held in SQLite until night mode activates, then processed sequentially with `NIGHT_NUM_CTX` context. LanceLLMot and Parsival use this for deep-analysis tasks that benefit from extended context.
+Jobs submitted via `POST /api/batch/submit` are persisted in SQLite and run at low priority whenever a GPU slot is available. Interactive requests always take priority.
 
 Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
@@ -103,19 +95,19 @@ curl http://localhost:11400/api/batch/results/<uuid>
 
 merLLM is a drop-in replacement for `OLLAMA_BASE_URL`. All standard endpoints are proxied.
 
-**Priority queue** — all `/api/generate` and `/api/chat` requests pass through a GPU slot queue. Interactive requests proceed immediately if a GPU is available; when both GPUs are busy, the request waits up to `INTERACTIVE_QUEUE_TIMEOUT` seconds (default 30) before returning 503. Batch-priority requests yield to queued interactive requests. The queue tracks in-flight count per GPU for informed routing decisions.
+**Unified GPU queue** — every request (interactive, embedding, batch) is tracked in a single queue visible via `GET /api/merllm/queue`. The dashboard shows all active and waiting requests with source app, model, target GPU, priority, status, and elapsed time. Client apps identify themselves with the `X-Source` header (e.g. `lancellmot`, `parsival`).
 
 **Transparent wait** — when a request is queued, a `queue_status` NDJSON line is emitted before generation starts:
 ```json
-{"type": "queue_status", "position": 2, "reason": "transitioning to day mode", "estimated_wait_seconds": 35}
+{"type": "queue_status", "reason": "GPU slot occupied by another request", "estimated_wait_seconds": 30}
 ```
 LanceLLMot and Parsival recognise this event and display a waiting indicator with the reason.
 
 | Endpoint | Notes |
 |---|---|
-| `POST /api/generate` | Routed by model via priority queue; interactive requests update activity timer |
+| `POST /api/generate` | Round-robin routed by model; tracked in unified queue |
 | `POST /api/chat` | Same routing as generate |
-| `POST /api/embeddings` | Always GPU 0 |
+| `POST /api/embeddings` | Round-robin routed; tracked in unified queue |
 | `GET /api/tags` | Model list from GPU 0 (shared model store) |
 | `POST /api/show` | GPU 0 |
 | `POST /api/pull` | GPU 0 (shared store) |
@@ -137,16 +129,6 @@ The overview dashboard subscribes to `GET /api/merllm/activity/stream` (Server-S
 `null` means the GPU is idle. Events are pushed immediately on request start/end and rate-limited to 10/sec during streaming. A keepalive comment (`: keepalive`) is sent every 5 s when idle to keep the connection alive through proxies.
 
 LanceLLMot and Parsival dashboards consume this stream to show live token output without polling.
-
-## GeoIP setup
-
-Download the free MaxMind GeoLite2-City database:
-
-1. Register at https://www.maxmind.com/en/geolite2/signup
-2. Download `GeoLite2-City.mmdb`
-3. Place it at `./data/GeoLite2-City.mmdb` (mounted as `/data/` in the container)
-
-Without the database, merLLM falls back to the `BASE_DAY_END_LOCAL` schedule with no timezone adjustment.
 
 ## Log container name mapping
 

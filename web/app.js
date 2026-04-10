@@ -125,6 +125,12 @@ function _startActivityStream() {
       // not included (those come from the poll).  Merge with last known loaded state.
       if (a.gpu0 !== undefined) _mergeAndRenderInstance("ollama-gpu0", "GPU 0", a.gpu0);
       if (a.gpu1 !== undefined) _mergeAndRenderInstance("ollama-gpu1", "GPU 1", a.gpu1);
+      // Live queue updates from SSE
+      if (a.queue !== undefined) renderQueueTable(a.queue);
+      if (a.queue_summary !== undefined) {
+        const qTotal = (a.queue_summary.queued || 0) + (a.queue_summary.running || 0);
+        set("ov-queue", qTotal);
+      }
     } catch (_) {}
   };
 
@@ -242,7 +248,7 @@ function renderOverview(s) {
   set("ov-routing", s.routing || "round_robin");
   set("ov-default-model", s.default_model || "—");
   const q = s.queue || {};
-  const qTotal = (q.total || 0) + (q.in_flight || 0);
+  const qTotal = (q.queued || 0) + (q.running || 0);
   set("ov-queue", s.queue ? qTotal : "—");
 
   // Pending model change
@@ -302,12 +308,20 @@ function renderOverview(s) {
     }
   }
 
-  // Batch counts
-  if (s.batch_counts) {
-    const bc = document.getElementById("batch-counts");
-    bc.innerHTML = Object.entries(s.batch_counts).map(([k, v]) =>
-      `<div class="stat-row"><span class="stat-label">${esc(k)}</span><span class="stat-value">${v}</span></div>`
-    ).join("");
+  // Queue summary + batch counts
+  const bc = document.getElementById("batch-counts");
+  if (bc) {
+    let rows = "";
+    if (s.queue) {
+      rows += `<div class="stat-row"><span class="stat-label">Running</span><span class="stat-value">${s.queue.running || 0}</span></div>`;
+      rows += `<div class="stat-row"><span class="stat-label">Queued</span><span class="stat-value">${s.queue.queued || 0}</span></div>`;
+    }
+    if (s.batch_counts) {
+      Object.entries(s.batch_counts).forEach(([k, v]) => {
+        rows += `<div class="stat-row"><span class="stat-label">Batch ${esc(k)}</span><span class="stat-value">${v}</span></div>`;
+      });
+    }
+    bc.innerHTML = rows || '<span class="muted">No queue data</span>';
   }
 
   // GPU hardware metrics
@@ -419,6 +433,56 @@ async function resetGpu(gpu) {
   } catch (err) {
     alert("GPU reset failed: " + err.message);
   }
+}
+
+// ── GPU Queue ─────────────────────────────────────────────────────────────────
+
+async function loadQueue() {
+  try {
+    const data = await api("/api/merllm/queue");
+    renderQueueTable(data.queue || []);
+  } catch (err) {
+    console.error("Queue load error:", err);
+  }
+}
+
+function _gpuLabel(url) {
+  if (!url) return "—";
+  if (url.includes("11434")) return "GPU 0";
+  if (url.includes("11435")) return "GPU 1";
+  return url.split("//").pop();
+}
+
+function _fmtElapsed(sec) {
+  if (sec == null) return "—";
+  if (sec >= 60) return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
+  return sec + "s";
+}
+
+function renderQueueTable(queue) {
+  const tbody = document.getElementById("queue-tbody");
+  if (!tbody) return;
+  if (!queue || !queue.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">No active requests.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = queue.map(r => {
+    const statusCls = r.status === "running" ? "pill-running"
+      : r.status === "queued" ? "pill-queued"
+      : r.status === "failed" ? "pill-failed" : "pill-completed";
+    const elapsed = r.status === "running" ? _fmtElapsed(r.elapsed_sec)
+      : r.status === "queued" ? "waiting " + _fmtElapsed(r.waiting_sec)
+      : "—";
+    return `<tr>
+      <td>${esc(r.source)}</td>
+      <td>${esc(r.request_type)}</td>
+      <td>${esc(r.model)}</td>
+      <td>${esc(r.priority)}</td>
+      <td>${_gpuLabel(r.target)}</td>
+      <td><span class="status-pill ${statusCls}">${r.status}</span></td>
+      <td class="mono" style="font-size:11px">${elapsed}</td>
+    </tr>`;
+  }).join("");
 }
 
 // ── Batch jobs ────────────────────────────────────────────────────────────────
@@ -1296,6 +1360,7 @@ function fmtBytes(bytes) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 loadSettings();
+loadQueue();
 loadBatchJobs();
 loadFans().catch(() => {});
 startPolling();

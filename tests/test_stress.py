@@ -256,58 +256,32 @@ class TestRouterStress:
 
 
 class TestQueueStress:
-    """Ensure the priority queue handles burst traffic correctly."""
+    """Ensure the tracked queue handles burst traffic correctly."""
 
-    async def test_burst_enqueue_ordering(self):
-        """Enqueue a mix of interactive and batch requests — interactive
-        should always dequeue first."""
+    async def test_burst_tracking(self):
+        """Track a large batch of requests — queue_depth should reflect them."""
         import queue_manager
 
-        queue_manager._queue = asyncio.PriorityQueue()
         queue_manager._gpu_semaphores.clear()
-        queue_manager._gpu_in_flight.clear()
+        queue_manager._tracked.clear()
 
-        N_INTERACTIVE = 500
-        N_BATCH = 500
-        futures = []
-
-        # Enqueue batch first, then interactive
-        for i in range(N_BATCH):
-            f = await queue_manager.enqueue(
-                "http://gpu:11434", {"model": "m", "id": f"batch-{i}"},
-                priority=queue_manager.PRIORITY_BATCH,
+        N = 500
+        for i in range(N):
+            queue_manager.track_request(
+                "test", "generate", "m",
+                queue_manager.PRIORITY_INTERACTIVE, "http://gpu:11434",
             )
-            futures.append(("batch", f))
-        for i in range(N_INTERACTIVE):
-            f = await queue_manager.enqueue(
-                "http://gpu:11434", {"model": "m", "id": f"interactive-{i}"},
-                priority=queue_manager.PRIORITY_INTERACTIVE,
-            )
-            futures.append(("interactive", f))
 
-        # Drain the queue manually and check ordering
-        dequeued = []
-        while not queue_manager._queue.empty():
-            item = queue_manager._queue.get_nowait()
-            dequeued.append(item.priority)
-            queue_manager._queue.task_done()
-
-        # All interactive (0) should come before all batch (1)
-        interactive_block = dequeued[:N_INTERACTIVE]
-        batch_block = dequeued[N_INTERACTIVE:]
-        assert all(p == 0 for p in interactive_block), (
-            "interactive requests did not dequeue first"
-        )
-        assert all(p == 1 for p in batch_block), (
-            "batch requests not in correct position"
-        )
+        depth = queue_manager.queue_depth()
+        assert depth["queued"] == N
+        assert depth["total"] == N
 
     async def test_semaphore_contention(self):
         """Many concurrent acquire attempts should not deadlock or error."""
         import queue_manager
 
         queue_manager._gpu_semaphores.clear()
-        queue_manager._gpu_in_flight.clear()
+        queue_manager._tracked.clear()
 
         target = "http://gpu:11434"
         acquired = 0
@@ -333,17 +307,16 @@ class TestQueueStress:
         assert acquired > 0
 
     async def test_queue_depth_reporting(self):
-        """queue_depth() should accurately reflect enqueued items."""
+        """queue_depth() should accurately reflect tracked items."""
         import queue_manager
 
-        queue_manager._queue = asyncio.PriorityQueue()
         queue_manager._gpu_semaphores.clear()
-        queue_manager._gpu_in_flight.clear()
+        queue_manager._tracked.clear()
 
         for i in range(200):
-            await queue_manager.enqueue(
-                "http://gpu:11434", {"model": "m"},
-                priority=queue_manager.PRIORITY_INTERACTIVE,
+            queue_manager.track_request(
+                "test", "generate", "m",
+                queue_manager.PRIORITY_INTERACTIVE, "http://gpu:11434",
             )
 
         depth = queue_manager.queue_depth()
