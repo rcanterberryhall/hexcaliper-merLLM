@@ -1,24 +1,46 @@
 """
-queue_manager.py — Unified GPU queue with per-request tracking.
+queue_manager.py — Late-binding GPU dispatcher with priority pipes.
 
-Every GPU request (interactive chat/generate, embeddings, batch jobs) is
-registered in an in-memory tracker before acquiring a GPU slot.  This gives
-the dashboard full visibility into what is queued, running, and recently
-completed on each GPU.
+Requests enter one of two FIFO pipes by priority (interactive / batch).  A
+central dispatcher assigns a GPU to the head of each pipe only when a GPU
+becomes idle.  Callers do not pick a GPU at submission time — the target is
+determined by the dispatcher at the moment one can actually serve the
+request.  This is "late binding": the analogue of a thread scheduler that
+commits a thread to a CPU only at dispatch time.
 
-Concurrency is still controlled by per-GPU asyncio.Semaphores (one slot per
-GPU by default).  The tracker layers metadata on top so the UI can show
-source app, model, request type, elapsed time, and target GPU for every
-request in the system.
+Design rules
+────────────
+1. Late binding.  ``track_request`` registers the request with target=None.
+   ``wait_for_dispatch`` pushes it onto a pipe and awaits the assigned URL.
+2. Strict priority.  The high-pri pipe drains completely before the
+   dispatcher looks at the low-pri pipe.  No preemption.
+3. Static swap cost.  ``config.MODEL_SWAP_COST_SECONDS`` is the conservative
+   upper bound on loading the largest model.  The decision rule treats a
+   swap as always preferable to waiting behind a busy match, because the
+   swap cost is deterministic while the wait is unbounded.
+4. No preemption.  A running job is never interrupted; the dispatcher only
+   acts at job-completion events (release, swap-completion, new arrival,
+   health change).
 
-Batch jobs remain SQLite-persisted for retry/review.  Interactive requests
-are transient — tracked while in-flight, removed on completion.
+Dispatch decision rule at the head of a pipe
+────────────────────────────────────────────
+At dispatch time (some GPU is idle), ``_best_candidate_for(req)``:
+
+  - If an idle GPU already holds the requested model → that GPU (zero cost).
+  - Else if any GPU is idle → the least-recently-active idle GPU (will be
+    swapped before dispatch, ≤ MODEL_SWAP_COST_SECONDS cost).
+  - Else → None (request stays at the head of the pipe; dispatcher retries
+    on the next idle event).
+
+Batch job submission stays in this module (SQLite-persisted, retryable) but
+executes through the same dispatcher as interactive requests.
 """
 import asyncio
 import json
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,23 +55,13 @@ import notifications
 PRIORITY_INTERACTIVE = 0
 PRIORITY_BATCH       = 1
 
-# ── Per-GPU slot management ───────────────────────────────────────────────────
 
-_gpu_semaphores: dict[str, asyncio.Semaphore] = {}
-
-
-def _gpu_sem(target: str) -> asyncio.Semaphore:
-    if target not in _gpu_semaphores:
-        _gpu_semaphores[target] = asyncio.Semaphore(config.GPU_MAX_CONCURRENT)
-    return _gpu_semaphores[target]
-
-
-def gpu_slot_busy(target: str) -> bool:
-    """Return True if all GPU_MAX_CONCURRENT slots for target are occupied."""
-    return _gpu_sem(target)._value == 0
+class DispatchTimeout(Exception):
+    """Raised when an interactive request exceeds INTERACTIVE_QUEUE_TIMEOUT."""
 
 
 # ── Request tracking ─────────────────────────────────────────────────────────
+
 
 @dataclass
 class TrackedRequest:
@@ -58,7 +70,7 @@ class TrackedRequest:
     request_type: str      # "chat", "generate", "embeddings", "batch"
     model: str
     priority: int
-    target: str            # GPU URL
+    target: Optional[str]  # GPU URL assigned by dispatcher (None until dispatched)
     status: str            # "queued", "running", "completed", "failed"
     submitted_at: float
     started_at: Optional[float] = None
@@ -69,9 +81,63 @@ class TrackedRequest:
 
 _tracked: dict[str, TrackedRequest] = {}
 
+
+@dataclass
+class _PendingRequest:
+    tid: str
+    model: str
+    priority: int
+    future: "asyncio.Future[str]"   # resolves to assigned target URL
+
+
+# ── Dispatcher state ─────────────────────────────────────────────────────────
+
+_hi: deque[_PendingRequest] = deque()
+_lo: deque[_PendingRequest] = deque()
+_gpu_busy: dict[str, bool] = {}
+_state_changed: Optional[asyncio.Event] = None
+_dispatcher_task: Optional[asyncio.Task] = None
+
 # Callback notified on every track/start/complete/fail so the SSE layer can
 # push updates.  Set by app.py at startup.
 _on_queue_change: Optional[callable] = None
+
+
+def _gpu_targets() -> list[str]:
+    """Return the configured GPU target URLs."""
+    return [config.OLLAMA_0_URL, config.OLLAMA_1_URL]
+
+
+def _ensure_gpu_state() -> None:
+    """Populate ``_gpu_busy`` for any configured GPU not yet seen."""
+    for url in _gpu_targets():
+        _gpu_busy.setdefault(url, False)
+
+
+def _ensure_dispatcher() -> None:
+    """
+    Start the dispatcher loop lazily on first use.
+
+    Called from ``track_request`` so both the app lifespan and tests pick up
+    the dispatcher without extra wiring.  Safe to call repeatedly.
+    """
+    global _state_changed, _dispatcher_task
+    _ensure_gpu_state()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop yet (e.g. import-time in a sync test) — defer.
+        return
+    if _state_changed is None:
+        _state_changed = asyncio.Event()
+    if _dispatcher_task is None or _dispatcher_task.done():
+        _dispatcher_task = loop.create_task(_dispatcher_loop())
+
+
+def gpu_slot_busy(target: str) -> bool:
+    """Return True if ``target`` is currently running or swapping."""
+    _ensure_gpu_state()
+    return _gpu_busy.get(target, False)
 
 
 def set_queue_change_callback(cb: callable) -> None:
@@ -87,10 +153,21 @@ def _notify_change() -> None:
             pass
 
 
+def _wake_dispatcher() -> None:
+    if _state_changed is not None:
+        _state_changed.set()
+
+
 def track_request(source: str, request_type: str, model: str,
-                  priority: int, target: str,
+                  priority: int,
                   batch_job_id: Optional[str] = None) -> str:
-    """Register a new request in the tracker. Returns a tracking ID."""
+    """
+    Register a new request in the tracker.
+
+    The request starts with ``target=None``; the dispatcher assigns a URL at
+    dispatch time.  Returns a tracking ID.
+    """
+    _ensure_dispatcher()
     req_id = str(uuid.uuid4())
     _tracked[req_id] = TrackedRequest(
         id=req_id,
@@ -98,7 +175,7 @@ def track_request(source: str, request_type: str, model: str,
         request_type=request_type,
         model=model,
         priority=priority,
-        target=target,
+        target=None,
         status="queued",
         submitted_at=time.time(),
         batch_job_id=batch_job_id,
@@ -107,73 +184,252 @@ def track_request(source: str, request_type: str, model: str,
     return req_id
 
 
-async def acquire_gpu_slot(target: str, priority: int,
-                           tracking_id: Optional[str] = None) -> bool:
+async def wait_for_dispatch(tracking_id: str) -> str:
     """
-    Acquire a generation slot for `target`.
+    Push the tracked request onto the appropriate priority pipe and await
+    a GPU assignment from the dispatcher.
 
-    If tracking_id is provided, the tracked entry transitions to "running"
-    on success.
-
-    Interactive priority: waits up to INTERACTIVE_QUEUE_TIMEOUT seconds.
-    Returns False (caller should 503) if the slot is not available in time.
-
-    Batch priority: waits indefinitely; always returns True.
+    Returns the target URL once the dispatcher has marked the GPU busy and
+    completed any required model swap.  Raises :class:`DispatchTimeout` if
+    an interactive request exceeds ``config.INTERACTIVE_QUEUE_TIMEOUT``;
+    batch requests wait indefinitely.
     """
-    sem = _gpu_sem(target)
-    if priority == PRIORITY_INTERACTIVE:
-        try:
-            await asyncio.wait_for(sem.acquire(), timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
-        except asyncio.TimeoutError:
-            if tracking_id and tracking_id in _tracked:
-                _tracked[tracking_id].status = "failed"
-                _tracked[tracking_id].error = "Timed out waiting for GPU slot"
-                _tracked[tracking_id].completed_at = time.time()
-                _notify_change()
-                # Clean up failed interactive entries after a short delay
-                asyncio.get_event_loop().call_later(10, _remove_tracked, tracking_id)
-            return False
+    entry = _tracked.get(tracking_id)
+    if entry is None:
+        raise RuntimeError(f"unknown tracking_id {tracking_id}")
+
+    _ensure_dispatcher()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+
+    pending = _PendingRequest(
+        tid=tracking_id,
+        model=entry.model or config.DEFAULT_MODEL,
+        priority=entry.priority,
+        future=future,
+    )
+    if entry.priority == PRIORITY_INTERACTIVE:
+        _hi.append(pending)
     else:
-        await sem.acquire()
+        _lo.append(pending)
 
-    if tracking_id and tracking_id in _tracked:
-        _tracked[tracking_id].status = "running"
-        _tracked[tracking_id].started_at = time.time()
-        _notify_change()
+    _wake_dispatcher()
 
-    return True
-
-
-def release_gpu_slot(target: str, tracking_id: Optional[str] = None) -> None:
-    """Release a slot acquired by acquire_gpu_slot."""
-    _gpu_semaphores[target].release()
-
-    if tracking_id and tracking_id in _tracked:
-        entry = _tracked[tracking_id]
-        entry.status = "completed"
-        entry.completed_at = time.time()
-        _notify_change()
-        # Interactive requests: remove from tracker shortly after completion.
-        # Batch requests stay visible (persisted in SQLite anyway).
+    try:
         if entry.priority == PRIORITY_INTERACTIVE:
-            asyncio.get_event_loop().call_later(5, _remove_tracked, tracking_id)
+            target = await asyncio.wait_for(future, timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
+        else:
+            target = await future
+    except asyncio.TimeoutError:
+        _remove_pending(tracking_id)
+        if tracking_id in _tracked:
+            _tracked[tracking_id].status = "failed"
+            _tracked[tracking_id].error = "Timed out waiting for GPU slot"
+            _tracked[tracking_id].completed_at = time.time()
+            _notify_change()
+            loop.call_later(10, _remove_tracked, tracking_id)
+        raise DispatchTimeout("interactive request exceeded INTERACTIVE_QUEUE_TIMEOUT")
+
+    return target
+
+
+def _remove_pending(tracking_id: str) -> None:
+    """Remove a pending request from whichever pipe it's in (if any)."""
+    for pipe in (_hi, _lo):
+        for i, p in enumerate(pipe):
+            if p.tid == tracking_id:
+                del pipe[i]
+                return
+
+
+def release(tracking_id: str) -> None:
+    """
+    Mark a dispatched request complete and return its GPU to the idle pool.
+
+    Wakes the dispatcher so the next pipe head can be evaluated.
+    """
+    entry = _tracked.get(tracking_id)
+    if entry is None:
+        return
+
+    if entry.target is not None:
+        _gpu_busy[entry.target] = False
+
+    entry.status = "completed"
+    entry.completed_at = time.time()
+    _notify_change()
+    _wake_dispatcher()
+
+    # Interactive requests drop from the tracker shortly after completion.
+    # Batch requests stay visible (persisted in SQLite anyway).
+    if entry.priority == PRIORITY_INTERACTIVE:
+        try:
+            asyncio.get_running_loop().call_later(5, _remove_tracked, tracking_id)
+        except RuntimeError:
+            _remove_tracked(tracking_id)
 
 
 def fail_request(tracking_id: str, error: str = "") -> None:
-    """Mark a tracked request as failed (e.g. Ollama error during generation)."""
-    if tracking_id in _tracked:
-        entry = _tracked[tracking_id]
-        entry.status = "failed"
-        entry.error = error
-        entry.completed_at = time.time()
-        _notify_change()
-        if entry.priority == PRIORITY_INTERACTIVE:
-            asyncio.get_event_loop().call_later(10, _remove_tracked, tracking_id)
+    """
+    Mark a tracked request as failed (e.g. Ollama error during generation)
+    and return its GPU to the idle pool.
+    """
+    entry = _tracked.get(tracking_id)
+    if entry is None:
+        return
+
+    if entry.target is not None:
+        _gpu_busy[entry.target] = False
+
+    entry.status = "failed"
+    entry.error = error
+    entry.completed_at = time.time()
+    _notify_change()
+    _wake_dispatcher()
+
+    if entry.priority == PRIORITY_INTERACTIVE:
+        try:
+            asyncio.get_running_loop().call_later(10, _remove_tracked, tracking_id)
+        except RuntimeError:
+            _remove_tracked(tracking_id)
 
 
 def _remove_tracked(tracking_id: str) -> None:
     _tracked.pop(tracking_id, None)
     _notify_change()
+
+
+# ── Dispatcher core ──────────────────────────────────────────────────────────
+
+
+def _best_candidate_for(model: str) -> Optional[str]:
+    """
+    Return the URL of the best idle GPU for ``model``, or None if no GPU
+    is currently dispatchable.
+
+    Decision rule:
+      1. Prefer an idle GPU that already holds the requested model (affinity).
+      2. Otherwise, any idle GPU is a candidate (will be swapped).
+      3. Exclude unhealthy GPUs.
+    """
+    # Deferred import to avoid module-load cycle.
+    import gpu_router
+
+    _ensure_gpu_state()
+    healthy = {g.url for g in gpu_router._healthy_gpus()}
+    if not healthy:
+        return None
+
+    idle = [url for url in _gpu_targets()
+            if url in healthy and not _gpu_busy.get(url, False)]
+    if not idle:
+        return None
+
+    # Prefer an idle GPU that already holds the requested model.
+    for url in idle:
+        gpu_state = gpu_router._gpus.get(url)
+        if gpu_state and gpu_state.model == model:
+            return url
+
+    # No affinity match — any idle GPU will do. Pick the least-recently-active
+    # one so load spreads evenly over time.
+    idle.sort(key=lambda u: gpu_router._gpus[u].last_active if u in gpu_router._gpus else 0)
+    return idle[0]
+
+
+def _try_dispatch_heads() -> None:
+    """
+    Walk the high-pri pipe then the low-pri pipe.  For each head, try to
+    assign a GPU.  Stop at the first head that cannot be dispatched — FIFO
+    must be preserved within a pipe, so we never skip a head.
+    """
+    for pipe in (_hi, _lo):
+        while pipe:
+            req = pipe[0]
+            target = _best_candidate_for(req.model)
+            if target is None:
+                break
+            pipe.popleft()
+            _gpu_busy[target] = True
+            _tracked[req.tid].target = target if req.tid in _tracked else None
+            asyncio.create_task(_dispatch(req, target))
+
+
+async def _dispatch(req: _PendingRequest, target: str) -> None:
+    """
+    Perform any required model swap for ``target`` and then resolve the
+    waiter's future with the assigned URL.  Runs as a background task so
+    the dispatcher loop itself never blocks on the swap.
+    """
+    import gpu_router
+    try:
+        gpu_state = gpu_router._gpus.get(target)
+        if gpu_state is not None and gpu_state.model != req.model:
+            # Swap cost is bounded by MODEL_SWAP_COST_SECONDS in practice.
+            # The dispatcher has already marked the GPU busy so no other
+            # request can land here until the swap completes.
+            await gpu_router._reload_model(gpu_state, req.model)
+
+        entry = _tracked.get(req.tid)
+        if entry is not None:
+            entry.status = "running"
+            entry.started_at = time.time()
+            entry.target = target
+            _notify_change()
+
+        if not req.future.done():
+            req.future.set_result(target)
+    except Exception as exc:
+        log.exception("dispatch failed for %s on %s", req.tid, target)
+        _gpu_busy[target] = False
+        if not req.future.done():
+            req.future.set_exception(exc)
+        _wake_dispatcher()
+
+
+async def _dispatcher_loop() -> None:
+    """
+    Central dispatch loop: wakes on every relevant state change (new
+    arrival, release, swap completion, health transition) and tries to
+    assign work to any idle GPU.
+    """
+    global _state_changed
+    if _state_changed is None:
+        _state_changed = asyncio.Event()
+
+    while True:
+        try:
+            await _state_changed.wait()
+            _state_changed.clear()
+            _try_dispatch_heads()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("dispatcher loop iteration failed — continuing")
+            # Don't hot-loop on repeated failures.
+            await asyncio.sleep(0.1)
+
+
+# ── Reclaim-loop cooperation ─────────────────────────────────────────────────
+
+
+def reserve_gpu(target: str) -> bool:
+    """
+    Mark a GPU busy from outside the dispatcher (e.g. the reclaim loop in
+    ``gpu_router`` before a scheduled model swap).  Returns False if the
+    GPU was already busy.
+    """
+    _ensure_gpu_state()
+    if _gpu_busy.get(target, False):
+        return False
+    _gpu_busy[target] = True
+    return True
+
+
+def unreserve_gpu(target: str) -> None:
+    """Release a GPU previously reserved via ``reserve_gpu`` and wake the dispatcher."""
+    _gpu_busy[target] = False
+    _wake_dispatcher()
 
 
 # ── Queue visibility ─────────────────────────────────────────────────────────
@@ -216,11 +472,16 @@ def queue_depth() -> dict:
 
     gpus: dict = {}
     for entry in _tracked.values():
-        if entry.status in ("queued", "running"):
+        if entry.status in ("queued", "running") and entry.target:
             gpu = gpus.setdefault(entry.target, {"queued": 0, "running": 0})
             gpu[entry.status] += 1
 
     return {"queued": queued, "running": running, "total": queued + running, "gpus": gpus}
+
+
+def pipe_depth() -> dict:
+    """Depth of the dispatcher's priority pipes (pre-dispatch waiters)."""
+    return {"interactive": len(_hi), "batch": len(_lo)}
 
 
 # ── Batch job submission ──────────────────────────────────────────────────────
@@ -241,7 +502,7 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
 
 
 async def _run_batch_job_async(job_id: str) -> None:
-    """Execute a batch job through the tracked GPU queue."""
+    """Execute a batch job through the late-binding dispatcher."""
     import gpu_router
 
     job = db.get_batch_job(job_id)
@@ -264,22 +525,16 @@ async def _run_batch_job_async(job_id: str) -> None:
         "options": options,
     }
 
-    target = gpu_router.get_target_url(job["model"])
-
-    # Track this batch job in the unified queue
     tracking_id = track_request(
         source=job["source_app"],
         request_type="batch",
         model=job["model"],
         priority=PRIORITY_BATCH,
-        target=target,
         batch_job_id=job_id,
     )
 
     try:
-        acquired = await acquire_gpu_slot(target, PRIORITY_BATCH, tracking_id)
-        if not acquired:
-            raise RuntimeError("failed to acquire GPU slot")
+        target = await wait_for_dispatch(tracking_id)
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
@@ -296,7 +551,7 @@ async def _run_batch_job_async(job_id: str) -> None:
                     webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
                 ))
         finally:
-            release_gpu_slot(target, tracking_id)
+            release(tracking_id)
     except Exception as exc:
         fail_request(tracking_id, str(exc))
         prev_error = (job.get("error") or "").strip()

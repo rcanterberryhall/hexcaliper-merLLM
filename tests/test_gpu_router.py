@@ -1,4 +1,10 @@
-"""Tests for gpu_router.py — round-robin routing, health, reclaim."""
+"""Tests for gpu_router.py — GPU state, health probes, reclaim cooperation.
+
+Dispatch logic (which GPU serves a request) lives in queue_manager and is
+exercised by test_queue_manager.py.  This file only covers state ownership
+that gpu_router still holds: health transitions, reclaim conditions,
+record_activity, and the status snapshot.
+"""
 import asyncio
 import os
 import sys
@@ -20,12 +26,12 @@ def fresh_modules(tmp_path, monkeypatch):
     monkeypatch.setenv("HEALTH_FAULT_TIMEOUT", "60")
     for mod in list(sys.modules.keys()):
         if mod in ("gpu_router", "queue_manager", "db", "config",
-                   "gpu_router", "metrics", "notifications"):
+                   "metrics", "notifications"):
             sys.modules.pop(mod, None)
     yield
     for mod in list(sys.modules.keys()):
         if mod in ("gpu_router", "queue_manager", "db", "config",
-                   "gpu_router", "metrics", "notifications"):
+                   "metrics", "notifications"):
             sys.modules.pop(mod, None)
 
 
@@ -34,70 +40,20 @@ def _get_router():
     import config
     # Force re-init with current config values.
     gpu_router._gpus.clear()
-    gpu_router._rr_index = 0
     gpu_router._pending_default_model = None
     gpu_router._init_gpus()
     return gpu_router, config
 
 
-# ── Round-robin tests ─────────────────────────────────────────────────────────
-
-
-def test_round_robin_alternates():
-    """Both GPUs healthy, same model → alternates."""
-    router, config = _get_router()
-    url1 = router.get_target_url("test-model:7b")
-    url2 = router.get_target_url("test-model:7b")
-    assert url1 != url2
-    assert {url1, url2} == {config.OLLAMA_0_URL, config.OLLAMA_1_URL}
-
-
-def test_round_robin_uses_default_for_empty_model():
-    """Empty model string uses DEFAULT_MODEL."""
-    router, config = _get_router()
-    url = router.get_target_url("")
-    assert url in (config.OLLAMA_0_URL, config.OLLAMA_1_URL)
-
-
-def test_prefers_free_gpu(monkeypatch):
-    """When one GPU is busy, route to the free one."""
-    router, config = _get_router()
-    import queue_manager
-
-    # Make GPU 0 busy.
-    monkeypatch.setattr(queue_manager, "gpu_slot_busy",
-                        lambda url: url == config.OLLAMA_0_URL)
-
-    for _ in range(4):
-        assert router.get_target_url("test-model:7b") == config.OLLAMA_1_URL
-
-
-# ── Model routing tests ──────────────────────────────────────────────────────
-
-
-def test_routes_to_matching_gpu():
-    """When GPUs have different models, route to the matching one."""
-    router, config = _get_router()
-    # Simulate GPU 1 having a different model.
-    router._gpus[config.OLLAMA_1_URL].model = "other-model:7b"
-
-    url = router.get_target_url("test-model:7b")
-    assert url == config.OLLAMA_0_URL
-
-    url = router.get_target_url("other-model:7b")
-    assert url == config.OLLAMA_1_URL
-
-
-def test_model_mismatch_picks_gpu_and_updates():
-    """Request for unloaded model → picks a GPU and updates tracking."""
-    router, config = _get_router()
-    url = router.get_target_url("brand-new:13b")
-    assert url in (config.OLLAMA_0_URL, config.OLLAMA_1_URL)
-    # The GPU should now track the new model.
-    assert router._gpus[url].model == "brand-new:13b"
-
-
 # ── Health tests ─────────────────────────────────────────────────────────────
+
+
+def test_init_creates_both_gpus():
+    router, config = _get_router()
+    assert config.OLLAMA_0_URL in router._gpus
+    assert config.OLLAMA_1_URL in router._gpus
+    assert all(g.health == router.GpuHealth.HEALTHY
+               for g in router._gpus.values())
 
 
 def test_mark_failed_sets_degraded():
@@ -106,13 +62,19 @@ def test_mark_failed_sets_degraded():
     assert router._gpus[config.OLLAMA_0_URL].health == router.GpuHealth.DEGRADED
 
 
-def test_degraded_gpu_excluded_from_routing():
-    """Degraded GPU should not receive requests."""
+def test_mark_failed_does_nothing_for_unknown_target():
+    router, _ = _get_router()
+    router.mark_failed("http://nowhere:1234")
+    # Just shouldn't raise.
+
+
+def test_healthy_gpus_excludes_degraded():
     router, config = _get_router()
     router.mark_failed(config.OLLAMA_0_URL)
-
-    for _ in range(5):
-        assert router.get_target_url("test-model:7b") == config.OLLAMA_1_URL
+    healthy = router._healthy_gpus()
+    urls = [g.url for g in healthy]
+    assert config.OLLAMA_0_URL not in urls
+    assert config.OLLAMA_1_URL in urls
 
 
 def test_reset_gpu_restores_healthy():
@@ -126,14 +88,9 @@ def test_reset_gpu_restores_healthy():
     assert router._gpus[config.OLLAMA_0_URL].model == config.DEFAULT_MODEL
 
 
-def test_all_gpus_down_falls_back():
-    """When all GPUs are degraded, return GPU 0 as fallback."""
-    router, config = _get_router()
-    router.mark_failed(config.OLLAMA_0_URL)
-    router.mark_failed(config.OLLAMA_1_URL)
-
-    url = router.get_target_url("test-model:7b")
-    assert url == config.OLLAMA_0_URL
+def test_reset_unknown_gpu_returns_false():
+    router, _ = _get_router()
+    assert router.reset_gpu("http://nowhere:1234") is False
 
 
 # ── Reclaim tests ────────────────────────────────────────────────────────────

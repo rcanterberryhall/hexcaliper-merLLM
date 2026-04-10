@@ -183,62 +183,17 @@ class TestMetricsQueryPerformance:
         )
 
 
-# ── GPU router under load ───────────────────────────────────────────────────
+# ── GPU router status under load ────────────────────────────────────────────
 
 
 class TestRouterStress:
-    """Ensure routing decisions stay consistent under rapid-fire calls."""
-
-    def test_rapid_round_robin_is_balanced(self):
-        """10k routing calls should distribute roughly 50/50."""
-        import gpu_router
-        import config
-
-        gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
-        gpu_router._init_gpus()
-
-        counts = {config.OLLAMA_0_URL: 0, config.OLLAMA_1_URL: 0}
-        N = 10_000
-
-        start = time.monotonic()
-        for _ in range(N):
-            url = gpu_router.get_target_url("test-model:7b")
-            counts[url] += 1
-        elapsed = time.monotonic() - start
-
-        # Should be exactly 50/50 for round-robin with both healthy
-        assert counts[config.OLLAMA_0_URL] == N // 2
-        assert counts[config.OLLAMA_1_URL] == N // 2
-        assert elapsed < 1.0, (
-            f"{N} routing decisions took {elapsed:.3f}s (limit 1.0s)"
-        )
-
-    def test_routing_with_one_degraded(self):
-        """All requests should go to the healthy GPU, quickly."""
-        import gpu_router
-        import config
-
-        gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
-        gpu_router._init_gpus()
-        gpu_router.mark_failed(config.OLLAMA_0_URL)
-
-        N = 10_000
-        start = time.monotonic()
-        for _ in range(N):
-            url = gpu_router.get_target_url("test-model:7b")
-            assert url == config.OLLAMA_1_URL
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 1.0
+    """Status snapshots are polled on every dashboard tick — keep them fast."""
 
     def test_status_under_load(self):
         """status() is called on every dashboard poll — must be fast."""
         import gpu_router
 
         gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
         gpu_router._init_gpus()
 
         start = time.monotonic()
@@ -262,61 +217,64 @@ class TestQueueStress:
         """Track a large batch of requests — queue_depth should reflect them."""
         import queue_manager
 
-        queue_manager._gpu_semaphores.clear()
         queue_manager._tracked.clear()
 
         N = 500
         for i in range(N):
             queue_manager.track_request(
                 "test", "generate", "m",
-                queue_manager.PRIORITY_INTERACTIVE, "http://gpu:11434",
+                queue_manager.PRIORITY_INTERACTIVE,
             )
 
         depth = queue_manager.queue_depth()
         assert depth["queued"] == N
         assert depth["total"] == N
 
-    async def test_semaphore_contention(self):
-        """Many concurrent acquire attempts should not deadlock or error."""
+    async def test_dispatcher_contention(self, monkeypatch):
+        """Many concurrent dispatch waiters should serialise without deadlock."""
         import queue_manager
+        import gpu_router
 
-        queue_manager._gpu_semaphores.clear()
         queue_manager._tracked.clear()
+        queue_manager._hi.clear()
+        queue_manager._lo.clear()
+        for url in queue_manager._gpu_targets():
+            queue_manager._gpu_busy[url] = False
 
-        target = "http://gpu:11434"
-        acquired = 0
-        released = 0
+        async def _noop_reload(gpu, model):
+            gpu.model = model
+        monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
-        async def acquire_and_release():
-            nonlocal acquired, released
-            ok = await queue_manager.acquire_gpu_slot(
-                target, queue_manager.PRIORITY_INTERACTIVE
+        completed = 0
+
+        async def request_cycle():
+            nonlocal completed
+            tid = queue_manager.track_request(
+                "stress", "chat", "m", queue_manager.PRIORITY_INTERACTIVE,
             )
-            if ok:
-                acquired += 1
-                await asyncio.sleep(0.001)
-                queue_manager.release_gpu_slot(target)
-                released += 1
+            target = await queue_manager.wait_for_dispatch(tid)
+            await asyncio.sleep(0.001)
+            queue_manager.release(tid)
+            assert target in queue_manager._gpu_targets()
+            completed += 1
 
-        # 100 concurrent acquirers, but only 1 slot (GPU_MAX_CONCURRENT=1)
-        tasks = [asyncio.create_task(acquire_and_release()) for _ in range(100)]
+        # 100 concurrent requests competing for 2 GPU slots.
+        tasks = [asyncio.create_task(request_cycle()) for _ in range(100)]
         done, pending = await asyncio.wait(tasks, timeout=30)
 
         assert len(pending) == 0, f"{len(pending)} tasks timed out"
-        assert acquired == released
-        assert acquired > 0
+        assert completed == 100
 
     async def test_queue_depth_reporting(self):
         """queue_depth() should accurately reflect tracked items."""
         import queue_manager
 
-        queue_manager._gpu_semaphores.clear()
         queue_manager._tracked.clear()
 
         for i in range(200):
             queue_manager.track_request(
                 "test", "generate", "m",
-                queue_manager.PRIORITY_INTERACTIVE, "http://gpu:11434",
+                queue_manager.PRIORITY_INTERACTIVE,
             )
 
         depth = queue_manager.queue_depth()
@@ -412,7 +370,6 @@ class TestConcurrentAsync:
         import gpu_router
 
         gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
         gpu_router._init_gpus()
 
         async def call_status():
@@ -425,24 +382,34 @@ class TestConcurrentAsync:
         assert all(r["routing"] == "round_robin" for r in results)
         assert elapsed < 1.0
 
-    async def test_concurrent_routing_decisions(self):
-        """Parallel routing decisions should not corrupt shared state."""
+    async def test_concurrent_dispatch_decisions(self, monkeypatch):
+        """Parallel dispatcher waiters should not corrupt shared state."""
         import gpu_router
+        import queue_manager
         import config
 
         gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
         gpu_router._init_gpus()
+        queue_manager._tracked.clear()
+        queue_manager._hi.clear()
+        queue_manager._lo.clear()
+        for url in queue_manager._gpu_targets():
+            queue_manager._gpu_busy[url] = False
 
-        urls = set()
+        async def _noop_reload(gpu, model):
+            gpu.model = model
+        monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
-        async def route():
-            url = gpu_router.get_target_url("test-model:7b")
-            urls.add(url)
-            return url
+        async def cycle():
+            tid = queue_manager.track_request(
+                "stress", "chat", "test-model:7b",
+                queue_manager.PRIORITY_INTERACTIVE,
+            )
+            target = await queue_manager.wait_for_dispatch(tid)
+            queue_manager.release(tid)
+            return target
 
-        results = await asyncio.gather(*[route() for _ in range(1000)])
-        # All returned URLs should be valid GPU URLs
+        results = await asyncio.gather(*[cycle() for _ in range(500)])
         assert all(
             r in (config.OLLAMA_0_URL, config.OLLAMA_1_URL) for r in results
         )
@@ -456,7 +423,6 @@ class TestConcurrentAsync:
         import gpu_router
 
         gpu_router._gpus.clear()
-        gpu_router._rr_index = 0
         gpu_router._init_gpus()
 
         counter = 0

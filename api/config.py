@@ -54,10 +54,18 @@ BATCH_MAX_PROMPT_LEN = int(_get("BATCH_MAX_PROMPT_LEN", "100000"))
 # ── Queue / GPU slot management ──────────────────────────────────────────────
 
 # Seconds an interactive request will wait for a GPU slot before returning 503.
-INTERACTIVE_QUEUE_TIMEOUT = int(_get("INTERACTIVE_QUEUE_TIMEOUT", "30"))
+# Sized to roughly 2× MODEL_SWAP_COST_SECONDS so a single worst-case swap plus
+# normal queue wait does not trip the deadline. Genuine overload still sheds.
+INTERACTIVE_QUEUE_TIMEOUT = int(_get("INTERACTIVE_QUEUE_TIMEOUT", "40"))
 
 # Max concurrent generation requests per GPU instance. 1 = fully serialised.
 GPU_MAX_CONCURRENT = int(_get("GPU_MAX_CONCURRENT", "1"))
+
+# Conservative upper bound (seconds) for loading the largest model this system
+# serves. Used by the dispatcher as a static cost for the "swap vs wait"
+# decision. Tune only when hardware or the largest model changes.
+# Default 20s is calibrated for qwen3:32b (~19 GB Q4_K_M) on a Tesla P40.
+MODEL_SWAP_COST_SECONDS = int(_get("MODEL_SWAP_COST_SECONDS", "20"))
 
 # ── API server ────────────────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""Tests for queue_manager.py — unified GPU queue with tracking."""
+"""Tests for queue_manager.py — late-binding dispatcher with priority pipes."""
 import asyncio
 import os
 import sys
@@ -11,18 +11,55 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 
 
 @pytest.fixture(autouse=True)
-def reset_queue():
+def reset_queue(tmp_path, monkeypatch):
     """Re-import queue_manager fresh for each test to reset module state."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     for mod in list(sys.modules.keys()):
-        if mod in ("queue_manager", "config", "db", "gpu_router"):
-            del sys.modules[mod]
+        if mod in ("queue_manager", "config", "db", "gpu_router",
+                   "metrics", "notifications"):
+            sys.modules.pop(mod, None)
     yield
+    # Cancel any background dispatcher task before tearing down the module.
+    qm = sys.modules.get("queue_manager")
+    if qm is not None and getattr(qm, "_dispatcher_task", None):
+        task = qm._dispatcher_task
+        try:
+            if not task.done():
+                task.cancel()
+        except RuntimeError:
+            # The test's event loop has already closed — nothing to clean up.
+            pass
+    for mod in list(sys.modules.keys()):
+        if mod in ("queue_manager", "config", "db", "gpu_router",
+                   "metrics", "notifications"):
+            sys.modules.pop(mod, None)
 
 
 @pytest.fixture
 def qm():
     import queue_manager
     return queue_manager
+
+
+@pytest.fixture
+def gpu_urls():
+    """Return the configured GPU target URLs after env reset."""
+    import config
+    return config.OLLAMA_0_URL, config.OLLAMA_1_URL
+
+
+@pytest.fixture
+def patch_reload(monkeypatch):
+    """Stub out the model swap so the dispatcher does not hit httpx."""
+    import gpu_router
+
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
+
+
+# ── Basic constants and empty state ──────────────────────────────────────────
 
 
 def test_priority_constants(qm):
@@ -38,18 +75,24 @@ def test_queue_depth_empty(qm):
     assert d["total"] == 0
 
 
+def test_pipe_depth_empty(qm):
+    p = qm.pipe_depth()
+    assert p["interactive"] == 0
+    assert p["batch"] == 0
+
+
 # ── Request tracking tests ───────────────────────────────────────────────────
 
 
 def test_track_request_returns_id(qm):
     tid = qm.track_request("test", "generate", "qwen3:32b",
-                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+                           qm.PRIORITY_INTERACTIVE)
     assert len(tid) == 36  # UUID format
 
 
 def test_track_request_appears_in_active_queue(qm):
     tid = qm.track_request("lancellmot", "chat", "qwen3:32b",
-                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+                           qm.PRIORITY_INTERACTIVE)
     queue = qm.active_queue()
     assert len(queue) == 1
     entry = queue[0]
@@ -59,151 +102,224 @@ def test_track_request_appears_in_active_queue(qm):
     assert entry["model"] == "qwen3:32b"
     assert entry["priority"] == "interactive"
     assert entry["status"] == "queued"
+    # Late binding: target is unset until dispatch.
+    assert entry["target"] is None
 
 
 def test_track_request_shows_in_queue_depth(qm):
-    qm.track_request("test", "generate", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    qm.track_request("test", "generate", "m", qm.PRIORITY_INTERACTIVE)
     d = qm.queue_depth()
     assert d["queued"] == 1
     assert d["total"] == 1
 
 
+# ── Late-binding dispatcher tests ────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_acquire_transitions_to_running(qm):
-    tid = qm.track_request("test", "generate", "m",
-                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
-    acquired = await qm.acquire_gpu_slot("http://gpu0:11434",
-                                          qm.PRIORITY_INTERACTIVE, tid)
-    assert acquired is True
+async def test_wait_for_dispatch_assigns_target_and_marks_running(
+        qm, gpu_urls, patch_reload):
+    tid = qm.track_request("test", "generate", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert target in gpu_urls
     queue = qm.active_queue()
-    assert queue[0]["status"] == "running"
-    assert queue[0]["started_at"] is not None
-    d = qm.queue_depth()
-    assert d["running"] == 1
-    assert d["queued"] == 0
-    qm.release_gpu_slot("http://gpu0:11434", tid)
-
-
-@pytest.mark.asyncio
-async def test_release_transitions_to_completed(qm):
-    tid = qm.track_request("test", "chat", "m",
-                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
-    await qm.acquire_gpu_slot("http://gpu0:11434", qm.PRIORITY_INTERACTIVE, tid)
-    qm.release_gpu_slot("http://gpu0:11434", tid)
-    queue = qm.active_queue()
-    assert queue[0]["status"] == "completed"
-    assert queue[0]["completed_at"] is not None
-
-
-@pytest.mark.asyncio
-async def test_fail_request(qm):
-    tid = qm.track_request("test", "generate", "m",
-                            qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
-    await qm.acquire_gpu_slot("http://gpu0:11434", qm.PRIORITY_INTERACTIVE, tid)
-    qm.fail_request(tid, "Ollama OOM")
-    queue = qm.active_queue()
-    assert queue[0]["status"] == "failed"
-    assert queue[0]["error"] == "Ollama OOM"
-
-
-# ── GPU slot tests ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_acquire_and_release_slot(qm):
-    """Acquiring and then releasing a slot should leave it free."""
-    target = "http://gpu0:11434"
-    acquired = await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE)
-    assert acquired is True
+    entry = next(e for e in queue if e["id"] == tid)
+    assert entry["status"] == "running"
+    assert entry["started_at"] is not None
+    assert entry["target"] == target
     assert qm.gpu_slot_busy(target) is True
-    qm.release_gpu_slot(target)
+    qm.release(tid)
+
+
+@pytest.mark.asyncio
+async def test_release_transitions_to_completed_and_frees_gpu(
+        qm, patch_reload):
+    tid = qm.track_request("test", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    qm.release(tid)
+    queue = qm.active_queue()
+    entry = next(e for e in queue if e["id"] == tid)
+    assert entry["status"] == "completed"
+    assert entry["completed_at"] is not None
     assert qm.gpu_slot_busy(target) is False
 
 
 @pytest.mark.asyncio
-async def test_two_gpus_independent(qm):
-    """Slots for different GPU targets are completely independent."""
-    gpu0 = "http://gpu0:11434"
-    gpu1 = "http://gpu1:11435"
-    ok0 = await qm.acquire_gpu_slot(gpu0, qm.PRIORITY_INTERACTIVE)
-    ok1 = await qm.acquire_gpu_slot(gpu1, qm.PRIORITY_INTERACTIVE)
-    assert ok0 is True
-    assert ok1 is True
-    assert qm.gpu_slot_busy(gpu0) is True
-    assert qm.gpu_slot_busy(gpu1) is True
-    qm.release_gpu_slot(gpu0)
-    qm.release_gpu_slot(gpu1)
+async def test_fail_request_frees_gpu(qm, patch_reload):
+    tid = qm.track_request("test", "generate", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    qm.fail_request(tid, "Ollama OOM")
+    queue = qm.active_queue()
+    entry = next(e for e in queue if e["id"] == tid)
+    assert entry["status"] == "failed"
+    assert entry["error"] == "Ollama OOM"
+    assert qm.gpu_slot_busy(target) is False
 
 
 @pytest.mark.asyncio
-async def test_interactive_timeout_when_slot_busy(monkeypatch, qm):
-    """Interactive request returns False when GPU slot is held and timeout elapses."""
-    import os
-    monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "0")
-    # Re-import config so the patched env var takes effect
+async def test_two_gpus_dispatched_independently(qm, gpu_urls, patch_reload):
+    """Two requests can run concurrently — one per GPU."""
+    tid_a = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    tid_b = qm.track_request("b", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target_a = await qm.wait_for_dispatch(tid_a)
+    target_b = await qm.wait_for_dispatch(tid_b)
+    assert {target_a, target_b} == set(gpu_urls)
+    assert qm.gpu_slot_busy(target_a) is True
+    assert qm.gpu_slot_busy(target_b) is True
+    qm.release(tid_a)
+    qm.release(tid_b)
+
+
+@pytest.mark.asyncio
+async def test_third_request_waits_until_release(qm, patch_reload):
+    """With both GPUs busy, the third request waits for a release."""
+    tid_a = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    tid_b = qm.track_request("b", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target_a = await qm.wait_for_dispatch(tid_a)
+    target_b = await qm.wait_for_dispatch(tid_b)
+
+    tid_c = qm.track_request("c", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    waiter = asyncio.create_task(qm.wait_for_dispatch(tid_c))
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+    assert qm.pipe_depth()["interactive"] == 1
+
+    qm.release(tid_a)
+    target_c = await asyncio.wait_for(waiter, timeout=2.0)
+    assert target_c == target_a
+    qm.release(tid_b)
+    qm.release(tid_c)
+
+
+@pytest.mark.asyncio
+async def test_interactive_dispatch_timeout(monkeypatch):
+    """Interactive request raises DispatchTimeout when no GPU frees up."""
+    monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "1")
     for mod in list(sys.modules.keys()):
         if mod in ("config", "queue_manager"):
-            del sys.modules[mod]
+            sys.modules.pop(mod, None)
     import queue_manager as qm2
-    target = "http://gpu0:11434"
-    # Occupy the slot
-    await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE)
-    # Second interactive request should time out immediately
-    result = await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE)
-    assert result is False
-    qm2.release_gpu_slot(target)
+    import gpu_router
+
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
+
+    # Saturate both GPUs via the reclaim-loop reservation hook so the
+    # dispatcher cannot pick either one.
+    for url in qm2._gpu_targets():
+        assert qm2.reserve_gpu(url) is True
+
+    tid = qm2.track_request("c", "chat", "m", qm2.PRIORITY_INTERACTIVE)
+    with pytest.raises(qm2.DispatchTimeout):
+        await qm2.wait_for_dispatch(tid)
+
+    queue = qm2.active_queue()
+    failed = [e for e in queue if e["id"] == tid]
+    assert len(failed) == 1
+    assert failed[0]["status"] == "failed"
+
+    for url in qm2._gpu_targets():
+        qm2.unreserve_gpu(url)
 
 
 @pytest.mark.asyncio
-async def test_batch_waits_for_slot(qm):
-    """Batch request acquires the slot once it is released."""
-    target = "http://gpu0:11434"
-    await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE)
+async def test_interactive_drains_before_batch(qm, patch_reload):
+    """Strict priority: interactive head must dispatch before any batch."""
+    # Saturate both GPUs.
+    tid_a = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    tid_b = qm.track_request("b", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    await qm.wait_for_dispatch(tid_a)
+    await qm.wait_for_dispatch(tid_b)
 
-    batch_acquired = asyncio.get_event_loop().create_future()
+    # Enqueue a batch and an interactive — order: batch first, interactive
+    # second. The interactive must still be dispatched first when a slot
+    # frees, because the high-priority pipe drains before the low-pri pipe.
+    tid_batch = qm.track_request("bat", "generate", "m", qm.PRIORITY_BATCH)
+    batch_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_batch))
+    await asyncio.sleep(0)  # let the batch land in its pipe
 
-    async def _batch_waiter():
-        ok = await qm.acquire_gpu_slot(target, qm.PRIORITY_BATCH)
-        batch_acquired.set_result(ok)
+    tid_int = qm.track_request("int", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    int_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_int))
+    await asyncio.sleep(0)
 
-    asyncio.create_task(_batch_waiter())
-    await asyncio.sleep(0)  # yield so _batch_waiter starts waiting
+    qm.release(tid_a)
 
-    # Slot is still held — batch should not have acquired it yet
-    assert not batch_acquired.done()
+    # Interactive must resolve first.
+    done, pending = await asyncio.wait(
+        [int_waiter, batch_waiter],
+        timeout=2.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    assert int_waiter in done
+    assert batch_waiter in pending
 
-    qm.release_gpu_slot(target)
-    await asyncio.sleep(0)  # yield so _batch_waiter can acquire
-
-    assert batch_acquired.done()
-    assert batch_acquired.result() is True
-    qm.release_gpu_slot(target)
+    qm.release(tid_int)
+    # Now batch can dispatch.
+    await asyncio.wait_for(batch_waiter, timeout=2.0)
+    qm.release(tid_b)
+    qm.release(tid_batch)
 
 
 @pytest.mark.asyncio
-async def test_queue_depth_tracks_running(qm):
-    """queue_depth reports per-GPU running counts from tracked requests."""
-    target = "http://gpu0:11434"
-    d0 = qm.queue_depth()
-    assert d0["running"] == 0
+async def test_dispatcher_prefers_affinity(qm, gpu_urls, patch_reload):
+    """When one GPU already holds the requested model, that GPU is chosen."""
+    import gpu_router
+    gpu_router._init_gpus()
+    url0, url1 = gpu_urls
+    gpu_router._gpus[url0].model = "default-model"
+    gpu_router._gpus[url1].model = "rare-model"
 
-    tid = qm.track_request("test", "generate", "m",
-                            qm.PRIORITY_INTERACTIVE, target)
-    await qm.acquire_gpu_slot(target, qm.PRIORITY_INTERACTIVE, tid)
-    d1 = qm.queue_depth()
-    assert d1["running"] == 1
-    assert d1["gpus"][target]["running"] == 1
+    tid = qm.track_request("test", "chat", "rare-model",
+                           qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert target == url1
+    qm.release(tid)
 
-    qm.release_gpu_slot(target, tid)
+
+@pytest.mark.asyncio
+async def test_dispatcher_swaps_when_no_affinity(qm, patch_reload):
+    """No GPU holds the model → dispatcher picks one and swaps it in."""
+    import gpu_router
+    gpu_router._init_gpus()
+
+    tid = qm.track_request("test", "chat", "fresh-model:13b",
+                           qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert gpu_router._gpus[target].model == "fresh-model:13b"
+    qm.release(tid)
+
+
+# ── Reclaim cooperation ──────────────────────────────────────────────────────
+
+
+def test_reserve_gpu_blocks_when_busy(qm, gpu_urls):
+    url0, _ = gpu_urls
+    assert qm.reserve_gpu(url0) is True
+    assert qm.reserve_gpu(url0) is False
+    qm.unreserve_gpu(url0)
+    assert qm.gpu_slot_busy(url0) is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skipped_while_reserved(qm, gpu_urls, patch_reload):
+    """A GPU reserved by the reclaim loop is not picked by the dispatcher."""
+    url0, url1 = gpu_urls
+    assert qm.reserve_gpu(url0) is True
+
+    tid = qm.track_request("test", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert target == url1
+    qm.release(tid)
+    qm.unreserve_gpu(url0)
 
 
 # ── Active queue ordering ────────────────────────────────────────────────────
 
 
 def test_active_queue_sorted_by_submitted_at(qm):
-    """active_queue returns entries sorted by submission time."""
-    t1 = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
-    t2 = qm.track_request("b", "generate", "m", qm.PRIORITY_BATCH, "http://gpu1:11435")
+    t1 = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    t2 = qm.track_request("b", "generate", "m", qm.PRIORITY_BATCH)
     queue = qm.active_queue()
     assert queue[0]["id"] == t1
     assert queue[1]["id"] == t2
@@ -225,35 +341,23 @@ def _fresh_qm(tmp_path, monkeypatch, extra_env=None):
 
 
 def test_submit_batch_job_returns_id(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
+    qm = _fresh_qm(tmp_path, monkeypatch)
     job_id = qm.submit_batch_job("test_app", "qwen3:32b", "hello world")
     assert len(job_id) == 36   # UUID format
 
 
 def test_get_job_status_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
+    qm = _fresh_qm(tmp_path, monkeypatch)
     assert qm.get_job_status("nonexistent-id") is None
 
 
 def test_get_job_result_missing(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
+    qm = _fresh_qm(tmp_path, monkeypatch)
     assert qm.get_job_result("nonexistent-id") is None
 
 
 def test_submit_and_retrieve_job_status(tmp_path, monkeypatch):
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    for mod in ["db", "config", "queue_manager"]:
-        sys.modules.pop(mod, None)
-    import queue_manager as qm
+    qm = _fresh_qm(tmp_path, monkeypatch)
     job_id = qm.submit_batch_job("parsival", "qwen3:32b", "analyze this")
     status = qm.get_job_status(job_id)
     assert status is not None
@@ -324,28 +428,5 @@ def test_queue_change_callback_fires(qm):
     """set_queue_change_callback is called on track/release."""
     calls = []
     qm.set_queue_change_callback(lambda: calls.append(1))
-    qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE, "http://gpu0:11434")
+    qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
     assert len(calls) >= 1
-
-
-@pytest.mark.asyncio
-async def test_timeout_marks_tracked_as_failed(monkeypatch, qm):
-    """Interactive timeout should mark the tracked entry as failed."""
-    monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "0")
-    for mod in list(sys.modules.keys()):
-        if mod in ("config", "queue_manager"):
-            del sys.modules[mod]
-    import queue_manager as qm2
-    target = "http://gpu0:11434"
-    # Occupy the slot
-    await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE)
-    # Track and try to acquire — will timeout
-    tid = qm2.track_request("test", "generate", "m",
-                             qm2.PRIORITY_INTERACTIVE, target)
-    result = await qm2.acquire_gpu_slot(target, qm2.PRIORITY_INTERACTIVE, tid)
-    assert result is False
-    queue = qm2.active_queue()
-    failed_entries = [e for e in queue if e["id"] == tid]
-    assert len(failed_entries) == 1
-    assert failed_entries[0]["status"] == "failed"
-    qm2.release_gpu_slot(target)

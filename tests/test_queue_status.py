@@ -87,7 +87,13 @@ def test_context_tokens_injected_into_done_line(tmp_path, monkeypatch):
             sys.modules.pop(mod, None)
 
     import app as app_mod
+    import gpu_router
     from fastapi.testclient import TestClient
+
+    # Stub model swap so the dispatcher does not try to reach a real Ollama.
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     done_chunk = json.dumps({
         "model": "test", "created_at": "2026-01-01T00:00:00Z",
@@ -117,7 +123,7 @@ def test_context_tokens_injected_into_done_line(tmp_path, monkeypatch):
 
 
 def test_queue_status_emitted_when_slot_busy(tmp_path, monkeypatch):
-    """When the GPU slot is held, queue_status NDJSON must appear before tokens."""
+    """When all GPU slots are held, queue_status NDJSON must appear before tokens."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
     monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "5")
     for mod in list(sys.modules.keys()):
@@ -126,17 +132,25 @@ def test_queue_status_emitted_when_slot_busy(tmp_path, monkeypatch):
             sys.modules.pop(mod, None)
 
     import queue_manager as qm
+    import config
     import app as app_mod
     from fastapi.testclient import TestClient
 
-    target = "http://host.docker.internal:11434"
-    # Patch gpu_slot_busy so it reports the slot as busy (simulating contention).
+    # Patch gpu_slot_busy so every GPU reports as busy (simulating contention).
     monkeypatch.setattr(qm, "gpu_slot_busy", lambda t: True)
-    # acquire_gpu_slot should succeed immediately so the stream proceeds.
-    async def _instant_acquire(t, p, tid=None):
-        return True
-    monkeypatch.setattr(qm, "acquire_gpu_slot", _instant_acquire)
-    monkeypatch.setattr(qm, "release_gpu_slot", lambda t, tid=None: None)
+
+    # Stub the dispatcher so the request proceeds immediately to streaming.
+    target = config.OLLAMA_0_URL
+
+    async def _instant_dispatch(tid):
+        entry = qm._tracked.get(tid)
+        if entry is not None:
+            entry.target = target
+            entry.status = "running"
+        return target
+
+    monkeypatch.setattr(qm, "wait_for_dispatch", _instant_dispatch)
+    monkeypatch.setattr(qm, "release", lambda tid=None: None)
 
     done_chunk = json.dumps({"done": True, "prompt_eval_count": 10}).encode() + b"\n"
     monkeypatch.setattr(app_mod.httpx, "AsyncClient",

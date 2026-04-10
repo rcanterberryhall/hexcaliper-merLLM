@@ -2,8 +2,9 @@
 app.py — merLLM: centralized LLM traffic control for the Hexcaliper ecosystem.
 
 Exposes a drop-in Ollama API proxy on :11400. Both LanceLLMot and Parsival
-point their OLLAMA_BASE_URL here. merLLM round-robins requests across both
-GPU-pinned Ollama instances with priority queuing and health tracking.
+point their OLLAMA_BASE_URL here. Requests flow through a late-binding GPU
+dispatcher with strict priority pipes (interactive / batch) and health
+tracking — the target GPU is chosen only when one actually becomes idle.
 
 Additional endpoints:
   GET/POST  /api/merllm/status    — GPU state, queue depth, health
@@ -301,48 +302,47 @@ async def _stream_proxy(target: str, path: str, body: dict,
                              media_type="application/x-ndjson")
 
 
-def _queue_reason(target: str) -> str:
-    """Human-readable reason a request is waiting for a GPU slot."""
-    gpu_info = queue_manager.queue_depth()["gpus"].get(target, {})
-    if gpu_info.get("running", 0):
-        return "GPU slot occupied by another request"
-    return "GPU busy"
+def _any_gpu_busy() -> bool:
+    """True if any configured GPU is currently busy or swapping."""
+    return any(queue_manager.gpu_slot_busy(url)
+               for url in (config.OLLAMA_0_URL, config.OLLAMA_1_URL))
 
 
-async def _queued_stream(target: str, path: str, body: dict,
-                         priority: int,
-                         tracking_id: str = "") -> StreamingResponse:
+async def _queued_stream(path: str, body: dict,
+                         tracking_id: str) -> StreamingResponse:
     """
-    Streaming proxy that emits a ``queue_status`` NDJSON line if the GPU slot
-    is not immediately available, giving the caller transparent visibility into
-    queue state before generation begins.
-    """
-    model = body.get("model", "")
-    _activity_set(target, model, path)
+    Streaming proxy backed by the late-binding dispatcher.
 
+    Emits a ``queue_status`` NDJSON line if no GPU is immediately available,
+    then awaits dispatch, then streams the Ollama response.  The assigned
+    target URL is determined by the dispatcher at dispatch time.
+    """
     async def generate():
-        # If the slot is busy, tell the caller before we start waiting.
-        if queue_manager.gpu_slot_busy(target):
-            reason = _queue_reason(target)
-            est    = config.INTERACTIVE_QUEUE_TIMEOUT
+        # If the system is saturated, tell the caller before we start waiting.
+        if _any_gpu_busy():
             yield json.dumps({
                 "type":                    "queue_status",
-                "reason":                  reason,
-                "estimated_wait_seconds":  est,
+                "reason":                  "all GPU slots occupied — queued for dispatch",
+                "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
             }).encode() + b"\n"
 
-        acquired = await queue_manager.acquire_gpu_slot(target, priority, tracking_id)
-        if not acquired:
+        try:
+            target = await queue_manager.wait_for_dispatch(tracking_id)
+        except queue_manager.DispatchTimeout:
             yield json.dumps({
                 "error": "GPU busy — timed out waiting for slot",
                 "done":  True,
             }).encode() + b"\n"
-            _activity_clear(target)
             return
 
+        _activity_set(target, body.get("model", ""), path)
+
         _tid = tracking_id
-        on_done = lambda: queue_manager.release_gpu_slot(target, _tid)
-        async for chunk in _generate_stream(target, path, body, on_done):
+        def _on_done():
+            _activity_clear(target)
+            queue_manager.release(_tid)
+
+        async for chunk in _generate_stream(target, path, body, _on_done):
             yield chunk
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
@@ -373,101 +373,98 @@ async def _proxy_get(target: str, path: str) -> Response:
 # ── Ollama API proxy ──────────────────────────────────────────────────────────
 
 
+def _dispatch_timeout_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "GPU busy — timed out waiting for slot",
+            "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
+        },
+        headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
+    )
+
+
 @app.post("/api/generate")
 async def proxy_generate(request: Request):
-    """Proxy POST /api/generate — round-robin routed across GPUs."""
+    """Proxy POST /api/generate through the late-binding dispatcher."""
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
     source = _source(request)
-
-    target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
-    tid = queue_manager.track_request(source, "generate", model, priority, target)
+    tid = queue_manager.track_request(source, "generate", model, priority)
 
     if stream:
-        return await _queued_stream(target, "/api/generate", body, priority, tid)
+        return await _queued_stream("/api/generate", body, tid)
 
-    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
-    if not acquired:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "GPU busy — all slots occupied",
-                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
-            },
-            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
-        )
+    try:
+        target = await queue_manager.wait_for_dispatch(tid)
+    except queue_manager.DispatchTimeout:
+        return _dispatch_timeout_response()
     try:
         resp = await _proxy(target, "/api/generate", body)
         gpu_router.record_activity(target)
         return resp
+    except Exception as exc:
+        queue_manager.fail_request(tid, str(exc))
+        raise
     finally:
-        queue_manager.release_gpu_slot(target, tid)
+        queue_manager.release(tid)
 
 
 @app.post("/api/chat")
 async def proxy_chat(request: Request):
-    """Proxy POST /api/chat — round-robin routed across GPUs."""
+    """Proxy POST /api/chat through the late-binding dispatcher."""
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
     source = _source(request)
-
-    target = gpu_router.get_target_url(model)
     stream = body.get("stream", True)
 
-    tid = queue_manager.track_request(source, "chat", model, priority, target)
+    tid = queue_manager.track_request(source, "chat", model, priority)
 
     if stream:
-        return await _queued_stream(target, "/api/chat", body, priority, tid)
+        return await _queued_stream("/api/chat", body, tid)
 
-    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
-    if not acquired:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "GPU busy — all slots occupied",
-                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
-            },
-            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
-        )
+    try:
+        target = await queue_manager.wait_for_dispatch(tid)
+    except queue_manager.DispatchTimeout:
+        return _dispatch_timeout_response()
     try:
         resp = await _proxy(target, "/api/chat", body)
         gpu_router.record_activity(target)
         return resp
+    except Exception as exc:
+        queue_manager.fail_request(tid, str(exc))
+        raise
     finally:
-        queue_manager.release_gpu_slot(target, tid)
+        queue_manager.release(tid)
 
 
 @app.post("/api/embeddings")
 async def proxy_embeddings(request: Request):
-    """Proxy POST /api/embeddings — queued, round-robin routed across GPUs."""
+    """Proxy POST /api/embeddings through the late-binding dispatcher."""
     body = await request.json()
     model = body.get("model", "")
     priority = _priority(request)
     source = _source(request)
 
-    target = gpu_router.get_target_url(model)
-    tid = queue_manager.track_request(source, "embeddings", model, priority, target)
+    tid = queue_manager.track_request(source, "embeddings", model, priority)
 
-    acquired = await queue_manager.acquire_gpu_slot(target, priority, tid)
-    if not acquired:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "GPU busy — all slots occupied",
-                "estimated_wait_seconds": config.INTERACTIVE_QUEUE_TIMEOUT,
-            },
-            headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
-        )
+    try:
+        target = await queue_manager.wait_for_dispatch(tid)
+    except queue_manager.DispatchTimeout:
+        return _dispatch_timeout_response()
     try:
         resp = await _proxy(target, "/api/embeddings", body)
         gpu_router.record_activity(target)
         return resp
+    except Exception as exc:
+        queue_manager.fail_request(tid, str(exc))
+        raise
     finally:
-        queue_manager.release_gpu_slot(target, tid)
+        queue_manager.release(tid)
 
 
 @app.get("/api/tags")

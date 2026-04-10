@@ -1,12 +1,17 @@
 """
-gpu_router.py — Round-robin GPU routing with health tracking.
+gpu_router.py — GPU state, health tracking, and reclaim loop.
 
-Both Ollama instances run continuously. Requests are round-robined across
-healthy GPUs. When a GPU loads a non-default model (forced by a request),
-it reclaims back to DEFAULT_MODEL after an idle timeout.
+Both Ollama instances run continuously.  This module owns per-GPU metadata
+(loaded model, health state, last-active timestamp) and the background
+reclaim loop that returns idle non-default GPUs to the default model.
+
+GPU *dispatch* (choosing which GPU serves a request) lives in
+``queue_manager``'s late-binding dispatcher.  This module no longer picks
+targets for incoming requests — it only exposes state that the dispatcher
+reads and tools to reload models when the dispatcher decides to swap.
 
 GPU health states:
-  healthy   — accepting requests, included in round-robin
+  healthy   — accepting requests, eligible for dispatch
   degraded  — failed recently, being probed with exponential backoff
   faulted   — probes exhausted, requires manual reset
 """
@@ -47,7 +52,6 @@ class GpuState:
 # ── Module state ─────────────────────────────────────────────────────────────
 
 _gpus: dict[str, GpuState] = {}
-_rr_index: int = 0
 _pending_default_model: Optional[str] = None  # set when DEFAULT_MODEL change is pending
 
 
@@ -63,68 +67,6 @@ def _init_gpus() -> None:
 def _healthy_gpus() -> list[GpuState]:
     _init_gpus()
     return [g for g in _gpus.values() if g.health == GpuHealth.HEALTHY]
-
-
-# ── Routing ──────────────────────────────────────────────────────────────────
-
-
-def get_target_url(model: str) -> str:
-    """
-    Pick the best GPU for this request.
-
-    - If model matches both GPUs → round-robin (prefer free GPU).
-    - If model matches one GPU → route there.
-    - If model matches neither → pick least-busy healthy GPU (Ollama will
-      swap models; the semaphore guarantees the GPU is idle first).
-    """
-    global _rr_index
-    _init_gpus()
-    model = model or config.DEFAULT_MODEL
-
-    healthy = _healthy_gpus()
-    if not healthy:
-        # All GPUs down — fall back to GPU 0; request will fail and trigger
-        # mark_failed, but we need to return *something*.
-        log.warning("no healthy GPUs — falling back to %s", config.OLLAMA_0_URL)
-        return config.OLLAMA_0_URL
-
-    # GPUs whose loaded model matches the request.
-    matching = [g for g in healthy if g.model == model]
-
-    if len(matching) == len(healthy):
-        # All healthy GPUs have the right model → round-robin.
-        return _round_robin(healthy)
-
-    if matching:
-        # Some GPUs match — prefer the free one among matches.
-        for g in matching:
-            if not queue_manager.gpu_slot_busy(g.url):
-                return g.url
-        return matching[0].url
-
-    # No GPU has this model loaded.  Pick the least-busy healthy GPU.
-    # The semaphore ensures it will be idle before the request runs,
-    # so the model swap won't evict an in-progress job.
-    target = _round_robin(healthy)
-    gpu = _gpus[target]
-    log.info("model %r not loaded — GPU %s will swap from %r",
-             model, target, gpu.model)
-    gpu.model = model
-    return target
-
-
-def _round_robin(candidates: list[GpuState]) -> str:
-    """Pick from candidates: prefer a free GPU, else alternate."""
-    global _rr_index
-
-    free = [g for g in candidates if not queue_manager.gpu_slot_busy(g.url)]
-    if len(free) == 1:
-        return free[0].url
-
-    pool = free if free else candidates
-    target = pool[_rr_index % len(pool)].url
-    _rr_index += 1
-    return target
 
 
 # ── Activity tracking ────────────────────────────────────────────────────────
@@ -184,6 +126,10 @@ async def reclaim_loop() -> None:
     - Healthy GPUs with non-default model idle > RECLAIM_TIMEOUT → reload default.
     - Pending DEFAULT_MODEL change → reload idle GPUs.
     - Degraded GPUs → probe with exponential backoff.
+
+    Reclaim model reloads cooperate with the dispatcher by calling
+    ``queue_manager.reserve_gpu`` before the swap and ``unreserve_gpu``
+    afterwards, so no request is dispatched onto a GPU mid-reload.
     """
     global _pending_default_model
     _init_gpus()
@@ -196,18 +142,23 @@ async def reclaim_loop() -> None:
             # ── Healthy GPU: reclaim or pending model change ─────────
             if gpu.health == GpuHealth.HEALTHY:
                 # Pending DEFAULT_MODEL change — reload when idle.
-                if (_pending_default_model
-                        and not queue_manager.gpu_slot_busy(gpu.url)):
-                    await _reload_model(gpu, _pending_default_model)
+                if _pending_default_model and queue_manager.reserve_gpu(gpu.url):
+                    try:
+                        await _reload_model(gpu, _pending_default_model)
+                    finally:
+                        queue_manager.unreserve_gpu(gpu.url)
 
                 # Reclaim non-default model after idle timeout.
                 elif (gpu.model != config.DEFAULT_MODEL
                       and (now - gpu.last_active) >= config.RECLAIM_TIMEOUT
-                      and not queue_manager.gpu_slot_busy(gpu.url)):
-                    log.info("GPU %s idle %.0fs with model %r — reclaiming to %r",
-                             gpu.url, now - gpu.last_active, gpu.model,
-                             config.DEFAULT_MODEL)
-                    await _reload_model(gpu, config.DEFAULT_MODEL)
+                      and queue_manager.reserve_gpu(gpu.url)):
+                    try:
+                        log.info("GPU %s idle %.0fs with model %r — reclaiming to %r",
+                                 gpu.url, now - gpu.last_active, gpu.model,
+                                 config.DEFAULT_MODEL)
+                        await _reload_model(gpu, config.DEFAULT_MODEL)
+                    finally:
+                        queue_manager.unreserve_gpu(gpu.url)
 
             # ── Degraded GPU: probe with backoff ─────────────────────
             elif gpu.health == GpuHealth.DEGRADED:
