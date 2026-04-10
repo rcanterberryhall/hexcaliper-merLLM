@@ -1,14 +1,16 @@
-name: Tests
+name: Stress Tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual trigger from Actions tab
+  workflow_dispatch:
+  # Weekly schedule — Sunday 03:00 UTC
+  schedule:
+    - cron: "0 3 * * 0"
 
 jobs:
-  test:
+  stress:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +23,8 @@ jobs:
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements-dev.txt
 
-      - name: Run tests
-        run: pytest tests/ -v --tb=short -m "not stress"
+      - name: Run stress tests
+        run: pytest tests/test_stress.py -v --tb=short
         env:
-          DB_PATH: ":memory:"
           OLLAMA_0_URL: "http://localhost:11434"
           OLLAMA_1_URL: "http://localhost:11435"
