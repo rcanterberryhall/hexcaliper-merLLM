@@ -379,6 +379,78 @@ async def test_submit_batch_job_creates_job(tmp_path, monkeypatch):
     assert job["model"] == "model"
 
 
+@pytest.mark.asyncio
+async def test_run_batch_job_marks_activity_during_dispatch(tmp_path, monkeypatch):
+    """Batch jobs must populate ``_activity`` for the duration of the dispatch.
+
+    Regression test for the bug where ``_run_batch_job_async`` made a raw
+    httpx POST and skipped the per-instance activity tracker, leaving the
+    Ollama Instances card and the SSE stream reporting "idle" while a GPU
+    was being hammered by parsival re-analyze.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "queue_manager", "db", "config", "gpu_router",
+                   "metrics", "notifications"):
+            sys.modules.pop(mod, None)
+
+    import app as app_mod
+    import queue_manager as qm
+    import gpu_router
+
+    # Stub the model swap so the dispatcher does not hit httpx itself.
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
+
+    # Fake httpx client that blocks inside post() until released, so the
+    # test can observe ``_activity`` while the batch job is mid-flight.
+    in_flight = asyncio.Event()
+    release_post = asyncio.Event()
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"response": "ok"}
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, json=None):
+            in_flight.set()
+            await release_post.wait()
+            return _FakeResp()
+
+    monkeypatch.setattr(qm.httpx, "AsyncClient", _FakeClient)
+
+    # Submit a batch job and let the background task run.
+    qm.submit_batch_job("test", "qwen3:32b", "hello")
+
+    # Wait until the fake post is in flight, then assert at least one GPU
+    # has a non-None activity entry. Without the fix, both stay None forever.
+    await asyncio.wait_for(in_flight.wait(), timeout=5.0)
+    active_gpus = [k for k, v in app_mod._activity.items() if v is not None]
+    assert active_gpus, "no GPU shows as active during batch dispatch"
+    entry = app_mod._activity[active_gpus[0]]
+    assert entry["model"] == "qwen3:32b"
+    assert entry["endpoint"] == "/api/generate"
+
+    # Let the post complete and the cleanup run.
+    release_post.set()
+    for _ in range(100):
+        if all(v is None for v in app_mod._activity.values()):
+            break
+        await asyncio.sleep(0.02)
+    assert all(v is None for v in app_mod._activity.values()), \
+        "_activity should be cleared after batch job completes"
+
+
 def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
     """POST /api/batch/submit returns 422 when prompt exceeds BATCH_MAX_PROMPT_LEN."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))

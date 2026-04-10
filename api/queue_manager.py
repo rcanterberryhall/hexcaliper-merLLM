@@ -504,6 +504,12 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
 async def _run_batch_job_async(job_id: str) -> None:
     """Execute a batch job through the late-binding dispatcher."""
     import gpu_router
+    # Deferred import: app imports queue_manager at module load time, so we
+    # cannot import app at the top of this file. Batch jobs must funnel
+    # through the same activity tracker that ``app._proxy`` uses, otherwise
+    # the Ollama Instances card and the SSE stream show the GPU as idle for
+    # the entire duration of the batch run even though it's hammering away.
+    import app as _app
 
     job = db.get_batch_job(job_id)
     if not job or job["status"] != "queued":
@@ -535,6 +541,7 @@ async def _run_batch_job_async(job_id: str) -> None:
 
     try:
         target = await wait_for_dispatch(tracking_id)
+        _app._activity_set(target, job["model"], "/api/generate")
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
@@ -551,6 +558,7 @@ async def _run_batch_job_async(job_id: str) -> None:
                     webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
                 ))
         finally:
+            _app._activity_clear(target)
             release(tracking_id)
     except Exception as exc:
         fail_request(tracking_id, str(exc))
