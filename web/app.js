@@ -441,6 +441,7 @@ async function loadQueue() {
   try {
     const data = await api("/api/merllm/queue");
     renderQueueTable(data.queue || []);
+    renderBucketLanes(data.buckets || {});
   } catch (err) {
     console.error("Queue load error:", err);
   }
@@ -457,6 +458,24 @@ function _fmtElapsed(sec) {
   if (sec == null) return "—";
   if (sec >= 60) return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
   return sec + "s";
+}
+
+// Priority bucket ordering — matches the Priority IntEnum in queue_manager.py.
+// The dispatcher drains these strictly top-down: a bucket only gets a turn
+// once every bucket above it is empty.
+const _BUCKET_ORDER = ["chat", "reserved", "short", "feedback", "background"];
+
+const _BUCKET_DESCRIPTIONS = {
+  chat:       "Real-time chat tokens to the user",
+  reserved:   "Reserved for future use — always empty",
+  short:      "Live scan, situation synthesis, contacts parsing, on-demand clicks",
+  feedback:   "LLM work spawned by background jobs",
+  background: "Reanalyze items, briefings, extractor, document upload",
+};
+
+function _priorityBadge(name) {
+  const safe = (name || "background").toLowerCase();
+  return `<span class="priority-badge priority-${esc(safe)}">${esc(safe)}</span>`;
 }
 
 function renderQueueTable(queue) {
@@ -477,11 +496,29 @@ function renderQueueTable(queue) {
       <td>${esc(r.source)}</td>
       <td>${esc(r.request_type)}</td>
       <td>${esc(r.model)}</td>
-      <td>${esc(r.priority)}</td>
+      <td>${_priorityBadge(r.priority)}</td>
       <td>${_gpuLabel(r.target)}</td>
       <td><span class="status-pill ${statusCls}">${r.status}</span></td>
       <td class="mono" style="font-size:11px">${elapsed}</td>
     </tr>`;
+  }).join("");
+}
+
+function renderBucketLanes(buckets) {
+  const wrap = document.getElementById("bucket-lanes");
+  if (!wrap) return;
+  wrap.innerHTML = _BUCKET_ORDER.map((name, idx) => {
+    const depth = buckets[name] || 0;
+    const desc  = _BUCKET_DESCRIPTIONS[name] || "";
+    const empty = depth === 0 ? " lane-empty" : "";
+    return `<div class="bucket-lane${empty}">
+      <div class="bucket-lane-head">
+        <span class="bucket-num">${idx + 1}</span>
+        ${_priorityBadge(name)}
+        <span class="bucket-depth mono">${depth}</span>
+      </div>
+      <div class="bucket-lane-desc muted">${esc(desc)}</div>
+    </div>`;
   }).join("");
 }
 

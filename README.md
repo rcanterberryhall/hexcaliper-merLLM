@@ -50,7 +50,7 @@ All settings are environment variables in `docker-compose.yml`. They can also be
 | `DRAIN_TIMEOUT_SEC` | `300` | Max seconds to wait for in-flight requests before transitioning |
 | `BATCH_MAX_RETRIES` | `2` | Max automatic retries for a failed batch job (2 = 3 total attempts) |
 | `BATCH_MAX_PROMPT_LEN` | `100000` | Max prompt length in characters accepted by `POST /api/batch/submit` (422 if exceeded) |
-| `INTERACTIVE_QUEUE_TIMEOUT` | `30` | Seconds an interactive request waits for a GPU slot before returning 503 |
+| `INTERACTIVE_QUEUE_TIMEOUT` | `30` | Seconds a `chat`-bucket request waits for a GPU slot before returning 503 (other buckets wait indefinitely) |
 | `GPU_MAX_CONCURRENT` | `1` | Max concurrent generation requests per GPU (1 = fully serialised) |
 | `DB_PATH` | `/data/merllm.db` | SQLite database path (inside container) |
 | `METRICS_INTERVAL_SEC` | `10` | How often system metrics are collected |
@@ -69,9 +69,25 @@ Both Ollama instances run continuously. Requests are round-robined across health
 
 **Health tracking** — if a GPU fails, it is marked *degraded* and excluded from routing. Health probes use exponential backoff. After `HEALTH_FAULT_TIMEOUT` seconds of continuous failure, the GPU is declared *faulted* and requires manual reset.
 
+## Priority buckets
+
+Every request that lands on merLLM is placed in one of five priority buckets. The dispatcher drains them **strictly top-down** — bucket *N* must be empty before bucket *N+1* gets a GPU slot. Within a bucket the order is FIFO. There is no preemption, no fairness, and no aging: a steady stream of chat would starve background forever (and that's the point — chat is cheap and background is resumable).
+
+| # | Bucket       | `X-Priority` value | Intended for |
+|---|--------------|--------------------|--------------|
+| 1 | **chat**       | `chat` (alias: `interactive`) | Real-time human chat. Anything a user is actively waiting on. |
+| 2 | **reserved**   | `reserved`         | Intentionally unused. Room to grow — don't route traffic here. |
+| 3 | **short**      | `short`            | Short, bounded Parsival work: contacts parsing, extraction, situation summaries. |
+| 4 | **feedback**   | `feedback`         | LLM work *spawned by* background work — e.g. a reanalyze job that needs a follow-up summary. Higher than bucket 5 so long-running batch work can unblock itself without jumping ahead of user-facing work. |
+| 5 | **background** | `background` (alias: `batch`) | Batch analysis, bulk reanalyze, LanceLLMot document ingestion, overnight work. |
+
+**Call-site assignment rule** — each call site picks its bucket once and declares it on every request via the `X-Priority` header. Callers do not get to promote themselves at runtime. If a request has no `X-Priority` header, merLLM currently defaults it to `chat` for back-compat during the rollout; unknown string values fall back to `background` so typos cannot escalate.
+
+The dispatcher state is visible on the dashboard's Queue tab (one lane per bucket, with live depth) and machine-readably at `GET /api/merllm/queue`, which includes a `buckets` map keyed by bucket name.
+
 ## Batch jobs
 
-Jobs submitted via `POST /api/batch/submit` are persisted in SQLite and run at low priority whenever a GPU slot is available. Interactive requests always take priority.
+Jobs submitted via `POST /api/batch/submit` are persisted in SQLite and run in the **background** bucket (bucket 5) whenever every higher bucket is empty. They survive restarts; directly-submitted `X-Priority: background` requests do not.
 
 Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
@@ -95,7 +111,7 @@ curl http://localhost:11400/api/batch/results/<uuid>
 
 merLLM is a drop-in replacement for `OLLAMA_BASE_URL`. All standard endpoints are proxied.
 
-**Unified GPU queue** — every request (interactive, embedding, batch) is tracked in a single queue visible via `GET /api/merllm/queue`. The dashboard shows all active and waiting requests with source app, model, target GPU, priority, status, and elapsed time. Client apps identify themselves with the `X-Source` header (e.g. `lancellmot`, `parsival`).
+**Unified GPU queue** — every request is tracked in a single queue visible via `GET /api/merllm/queue`. The dashboard shows all active and waiting requests with source app, model, target GPU, priority bucket, status, and elapsed time. Client apps identify themselves with the `X-Source` header (e.g. `lancellmot`, `parsival`) and pick a bucket with `X-Priority` (see [Priority buckets](#priority-buckets)).
 
 **Transparent wait** — when a request is queued, a `queue_status` NDJSON line is emitted before generation starts:
 ```json
@@ -113,7 +129,7 @@ LanceLLMot and Parsival recognise this event and display a waiting indicator wit
 | `POST /api/pull` | GPU 0 (shared store) |
 | `GET /api/ps` | Aggregates loaded models from both instances |
 
-Set `X-Priority: batch` on a request to place it in the low-priority queue without submitting a batch job.
+Set `X-Priority: <bucket>` on any proxied request to select a priority bucket (`chat`, `reserved`, `short`, `feedback`, `background`; the legacy values `interactive`/`batch` still work). See [Priority buckets](#priority-buckets) for the full semantics.
 
 ## Activity SSE stream
 

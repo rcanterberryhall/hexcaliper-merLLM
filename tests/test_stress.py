@@ -236,8 +236,8 @@ class TestQueueStress:
         import gpu_router
 
         queue_manager._tracked.clear()
-        queue_manager._hi.clear()
-        queue_manager._lo.clear()
+        for _bucket in queue_manager._buckets:
+            _bucket.clear()
         for url in queue_manager._gpu_targets():
             queue_manager._gpu_busy[url] = False
 
@@ -391,8 +391,8 @@ class TestConcurrentAsync:
         gpu_router._gpus.clear()
         gpu_router._init_gpus()
         queue_manager._tracked.clear()
-        queue_manager._hi.clear()
-        queue_manager._lo.clear()
+        for _bucket in queue_manager._buckets:
+            _bucket.clear()
         for url in queue_manager._gpu_targets():
             queue_manager._gpu_busy[url] = False
 

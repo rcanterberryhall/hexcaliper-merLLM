@@ -62,10 +62,46 @@ def patch_reload(monkeypatch):
 # ── Basic constants and empty state ──────────────────────────────────────────
 
 
-def test_priority_constants(qm):
-    assert qm.PRIORITY_INTERACTIVE == 0
-    assert qm.PRIORITY_BATCH == 1
-    assert qm.PRIORITY_INTERACTIVE < qm.PRIORITY_BATCH
+def test_priority_enum_values(qm):
+    """Five buckets, CHAT highest, BACKGROUND lowest, strict int ordering."""
+    assert qm.Priority.CHAT == 0
+    assert qm.Priority.RESERVED == 1
+    assert qm.Priority.SHORT == 2
+    assert qm.Priority.FEEDBACK == 3
+    assert qm.Priority.BACKGROUND == 4
+    assert qm.Priority.CHAT < qm.Priority.RESERVED < qm.Priority.SHORT \
+        < qm.Priority.FEEDBACK < qm.Priority.BACKGROUND
+
+
+def test_back_compat_priority_aliases(qm):
+    """Old PRIORITY_INTERACTIVE / PRIORITY_BATCH names still point at the
+    right buckets so parsival and lancellmot keep working during migration."""
+    assert qm.PRIORITY_INTERACTIVE == qm.Priority.CHAT
+    assert qm.PRIORITY_BATCH == qm.Priority.BACKGROUND
+
+
+def test_priority_from_name_canonical(qm):
+    assert qm.priority_from_name("chat") == qm.Priority.CHAT
+    assert qm.priority_from_name("reserved") == qm.Priority.RESERVED
+    assert qm.priority_from_name("short") == qm.Priority.SHORT
+    assert qm.priority_from_name("feedback") == qm.Priority.FEEDBACK
+    assert qm.priority_from_name("background") == qm.Priority.BACKGROUND
+
+
+def test_priority_from_name_legacy_aliases(qm):
+    """Legacy header values accepted during the one-release migration."""
+    assert qm.priority_from_name("interactive") == qm.Priority.CHAT
+    assert qm.priority_from_name("batch") == qm.Priority.BACKGROUND
+    assert qm.priority_from_name("BATCH") == qm.Priority.BACKGROUND
+
+
+def test_priority_from_name_unknown_falls_back_to_background(qm):
+    """Typos must not silently escalate; unknown non-empty values → BACKGROUND."""
+    assert qm.priority_from_name("urgent") == qm.Priority.BACKGROUND
+    assert qm.priority_from_name("high") == qm.Priority.BACKGROUND
+    # None/blank → default parameter, which defaults to BACKGROUND here.
+    assert qm.priority_from_name(None) == qm.Priority.BACKGROUND
+    assert qm.priority_from_name("") == qm.Priority.BACKGROUND
 
 
 def test_queue_depth_empty(qm):
@@ -77,6 +113,12 @@ def test_queue_depth_empty(qm):
 
 def test_pipe_depth_empty(qm):
     p = qm.pipe_depth()
+    # All five buckets, plus back-compat aliases.
+    assert p["chat"] == 0
+    assert p["reserved"] == 0
+    assert p["short"] == 0
+    assert p["feedback"] == 0
+    assert p["background"] == 0
     assert p["interactive"] == 0
     assert p["batch"] == 0
 
@@ -92,7 +134,7 @@ def test_track_request_returns_id(qm):
 
 def test_track_request_appears_in_active_queue(qm):
     tid = qm.track_request("lancellmot", "chat", "qwen3:32b",
-                           qm.PRIORITY_INTERACTIVE)
+                           qm.Priority.CHAT)
     queue = qm.active_queue()
     assert len(queue) == 1
     entry = queue[0]
@@ -100,10 +142,25 @@ def test_track_request_appears_in_active_queue(qm):
     assert entry["source"] == "lancellmot"
     assert entry["request_type"] == "chat"
     assert entry["model"] == "qwen3:32b"
-    assert entry["priority"] == "interactive"
+    assert entry["priority"] == "chat"
     assert entry["status"] == "queued"
     # Late binding: target is unset until dispatch.
     assert entry["target"] is None
+
+
+def test_active_queue_reports_each_bucket_name(qm):
+    """The priority field in active_queue() uses the canonical bucket name."""
+    qm.track_request("a", "chat", "m", qm.Priority.CHAT)
+    qm.track_request("b", "generate", "m", qm.Priority.SHORT)
+    qm.track_request("c", "generate", "m", qm.Priority.FEEDBACK)
+    qm.track_request("d", "generate", "m", qm.Priority.BACKGROUND)
+    by_source = {e["source"]: e["priority"] for e in qm.active_queue()}
+    assert by_source == {
+        "a": "chat",
+        "b": "short",
+        "c": "feedback",
+        "d": "background",
+    }
 
 
 def test_track_request_shows_in_queue_depth(qm):
@@ -182,6 +239,8 @@ async def test_third_request_waits_until_release(qm, patch_reload):
     waiter = asyncio.create_task(qm.wait_for_dispatch(tid_c))
     await asyncio.sleep(0.05)
     assert not waiter.done()
+    assert qm.pipe_depth()["chat"] == 1
+    # Back-compat alias still works.
     assert qm.pipe_depth()["interactive"] == 1
 
     qm.release(tid_a)
@@ -225,40 +284,148 @@ async def test_interactive_dispatch_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_interactive_drains_before_batch(qm, patch_reload):
-    """Strict priority: interactive head must dispatch before any batch."""
+    """Strict priority: CHAT head must dispatch before any BACKGROUND."""
     # Saturate both GPUs.
-    tid_a = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)
-    tid_b = qm.track_request("b", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    tid_a = qm.track_request("a", "chat", "m", qm.Priority.CHAT)
+    tid_b = qm.track_request("b", "chat", "m", qm.Priority.CHAT)
     await qm.wait_for_dispatch(tid_a)
     await qm.wait_for_dispatch(tid_b)
 
-    # Enqueue a batch and an interactive — order: batch first, interactive
-    # second. The interactive must still be dispatched first when a slot
-    # frees, because the high-priority pipe drains before the low-pri pipe.
-    tid_batch = qm.track_request("bat", "generate", "m", qm.PRIORITY_BATCH)
-    batch_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_batch))
-    await asyncio.sleep(0)  # let the batch land in its pipe
+    # Enqueue a BACKGROUND then a CHAT. Order of submission: background
+    # first, chat second. The chat must still be dispatched first when a
+    # slot frees, because CHAT drains before BACKGROUND.
+    tid_bg = qm.track_request("bg", "generate", "m", qm.Priority.BACKGROUND)
+    bg_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_bg))
+    await asyncio.sleep(0)  # let the background request land in its bucket
 
-    tid_int = qm.track_request("int", "chat", "m", qm.PRIORITY_INTERACTIVE)
-    int_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_int))
+    tid_chat = qm.track_request("chat", "chat", "m", qm.Priority.CHAT)
+    chat_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_chat))
     await asyncio.sleep(0)
 
     qm.release(tid_a)
 
-    # Interactive must resolve first.
+    # CHAT must resolve first.
     done, pending = await asyncio.wait(
-        [int_waiter, batch_waiter],
+        [chat_waiter, bg_waiter],
         timeout=2.0,
         return_when=asyncio.FIRST_COMPLETED,
     )
-    assert int_waiter in done
-    assert batch_waiter in pending
+    assert chat_waiter in done
+    assert bg_waiter in pending
 
-    qm.release(tid_int)
-    # Now batch can dispatch.
-    await asyncio.wait_for(batch_waiter, timeout=2.0)
+    qm.release(tid_chat)
+    # Now BACKGROUND can dispatch.
+    await asyncio.wait_for(bg_waiter, timeout=2.0)
     qm.release(tid_b)
-    qm.release(tid_batch)
+    qm.release(tid_bg)
+
+
+@pytest.mark.asyncio
+async def test_strict_priority_drain_top_down(qm, patch_reload):
+    """Every bucket drains before any lower bucket dispatches.
+
+    Submit one request in CHAT, SHORT, FEEDBACK, BACKGROUND (RESERVED stays
+    empty, as it does in production). Saturate both GPUs with dummy CHAT
+    requests first. Then release slots one at a time and assert the
+    dispatch order is CHAT → SHORT → FEEDBACK → BACKGROUND regardless of
+    the order the requests were submitted in.
+    """
+    # Saturate both GPUs with holder requests.
+    tid_hold_a = qm.track_request("hold_a", "chat", "m", qm.Priority.CHAT)
+    tid_hold_b = qm.track_request("hold_b", "chat", "m", qm.Priority.CHAT)
+    await qm.wait_for_dispatch(tid_hold_a)
+    await qm.wait_for_dispatch(tid_hold_b)
+
+    # Submit one item per priority in *reverse* order — the point is to
+    # prove dispatch order follows priority, not submission order.
+    tid_bg = qm.track_request("bg", "generate", "m", qm.Priority.BACKGROUND)
+    bg_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_bg))
+    await asyncio.sleep(0)
+
+    tid_fb = qm.track_request("fb", "generate", "m", qm.Priority.FEEDBACK)
+    fb_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_fb))
+    await asyncio.sleep(0)
+
+    tid_sh = qm.track_request("sh", "generate", "m", qm.Priority.SHORT)
+    sh_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_sh))
+    await asyncio.sleep(0)
+
+    tid_ch = qm.track_request("ch", "chat", "m", qm.Priority.CHAT)
+    ch_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_ch))
+    await asyncio.sleep(0)
+
+    depths = qm.pipe_depth()
+    assert depths["chat"] == 1
+    assert depths["reserved"] == 0
+    assert depths["short"] == 1
+    assert depths["feedback"] == 1
+    assert depths["background"] == 1
+
+    # Release one slot at a time and verify the next-highest-priority head
+    # is the one that dispatches. After each step, assert the remaining
+    # waiters are still pending — a BACKGROUND waiter resolving before its
+    # turn would indicate a priority inversion.
+    def _assert_pending(*waiters):
+        for w in waiters:
+            assert not w.done()
+
+    qm.release(tid_hold_a)
+    await asyncio.wait_for(ch_waiter, timeout=2.0)
+    _assert_pending(sh_waiter, fb_waiter, bg_waiter)
+
+    qm.release(tid_hold_b)
+    await asyncio.wait_for(sh_waiter, timeout=2.0)
+    _assert_pending(fb_waiter, bg_waiter)
+
+    qm.release(tid_ch)
+    await asyncio.wait_for(fb_waiter, timeout=2.0)
+    _assert_pending(bg_waiter)
+
+    qm.release(tid_sh)
+    await asyncio.wait_for(bg_waiter, timeout=2.0)
+
+    qm.release(tid_fb)
+    qm.release(tid_bg)
+
+
+@pytest.mark.asyncio
+async def test_background_cannot_preempt_waiting_chat(qm, patch_reload):
+    """Regression guard: a BACKGROUND item waiting in the queue must not
+    run while a CHAT item is also waiting, even if the BACKGROUND was
+    enqueued first and the CHAT arrives only milliseconds before a slot
+    frees."""
+    # Saturate both GPUs.
+    tid_a = qm.track_request("a", "chat", "m", qm.Priority.CHAT)
+    tid_b = qm.track_request("b", "chat", "m", qm.Priority.CHAT)
+    await qm.wait_for_dispatch(tid_a)
+    await qm.wait_for_dispatch(tid_b)
+
+    # Background arrives first and waits.
+    tid_bg = qm.track_request("bg", "generate", "m", qm.Priority.BACKGROUND)
+    bg_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_bg))
+    await asyncio.sleep(0.01)
+
+    # Chat arrives slightly later but is higher priority.
+    tid_chat = qm.track_request("chat", "chat", "m", qm.Priority.CHAT)
+    chat_waiter = asyncio.create_task(qm.wait_for_dispatch(tid_chat))
+    await asyncio.sleep(0.01)
+
+    # Only release one GPU — exactly one slot is available.
+    qm.release(tid_a)
+
+    # Chat must win despite arriving second.
+    done, pending = await asyncio.wait(
+        [chat_waiter, bg_waiter],
+        timeout=2.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    assert chat_waiter in done
+    assert bg_waiter in pending
+
+    qm.release(tid_chat)
+    await asyncio.wait_for(bg_waiter, timeout=2.0)
+    qm.release(tid_b)
+    qm.release(tid_bg)
 
 
 @pytest.mark.asyncio

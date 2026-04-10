@@ -104,13 +104,22 @@
   <!-- ── GPU Queue ── -->
   <div id="tab-queue" class="tab">
 
+    <!-- Priority bucket lanes -->
+    <div class="card" style="margin-bottom:16px">
+      <h2>Priority Buckets</h2>
+      <p class="muted" style="font-size:12px;margin-bottom:8px">
+        Five buckets, drained strictly top-down. A lower bucket only dispatches when every bucket above it is empty.
+      </p>
+      <div id="bucket-lanes"></div>
+    </div>
+
     <!-- Live queue -->
     <div class="card" style="margin-bottom:16px">
       <h2>Active Requests
         <button class="btn" style="float:right;padding:2px 10px;font-size:11px" onclick="loadQueue()">Refresh</button>
       </h2>
       <p class="muted" style="font-size:12px;margin-bottom:8px">
-        Every GPU request (interactive, embedding, batch) is shown here while in-flight.
+        Every GPU request (chat, short, feedback, background) is shown here while in-flight.
       </p>
       <div id="queue-table-wrap">
         <table>
@@ -325,14 +334,28 @@
       <div class="card">
         <h2>GPU Queue</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          Every GPU request — interactive chat/generate, embeddings, and batch jobs — is tracked in a single
-          unified queue. The <strong style="color:var(--text)">GPU Queue</strong> tab shows all active and
-          waiting requests with source app, model, target GPU, priority, status, and elapsed time.<br><br>
-          Interactive requests proceed immediately if a GPU is available. When both GPUs are busy, the request
-          waits up to <code>INTERACTIVE_QUEUE_TIMEOUT</code> seconds (default 30) before returning 503.
-          Batch-priority requests (<code>X-Priority: batch</code>) yield to queued interactive requests.<br><br>
-          Client apps can identify themselves with the <code>X-Source</code> header (e.g. <code>lancellmot</code>,
+          Every GPU request is tracked in a single unified queue split across <strong style="color:var(--text)">five
+          priority buckets</strong> that drain strictly top-down. A lower bucket only dispatches when every bucket
+          above it is empty.
+        </p>
+        <table style="margin-top:8px;font-size:12px">
+          <tr><td><code>1. chat</code></td><td class="muted">Real-time chat tokens to the user. Only this.</td></tr>
+          <tr><td><code>2. reserved</code></td><td class="muted">Empty. Reserved for future use.</td></tr>
+          <tr><td><code>3. short</code></td><td class="muted">Live scan analyze, situation synthesis during a scan, contacts parsing, on-demand "regenerate" clicks.</td></tr>
+          <tr><td><code>4. feedback</code></td><td class="muted">LLM work spawned <em>because</em> a background job produced something that needs timely downstream processing.</td></tr>
+          <tr><td><code>5. background</code></td><td class="muted">Bulk: reanalyze items, end-of-run briefings, lancellmot extractor, document upload/indexing.</td></tr>
+        </table>
+        <p style="color:var(--muted);font-size:13px;line-height:1.7;margin-top:8px">
+          Callers declare their bucket with <code>X-Priority: &lt;name&gt;</code>. <code>chat</code> requests proceed
+          immediately if a GPU is available; if both GPUs are busy, they wait up to
+          <code>INTERACTIVE_QUEUE_TIMEOUT</code> seconds (default 30) before returning 503. All other buckets wait
+          indefinitely. The legacy <code>interactive</code> and <code>batch</code> values are still accepted as
+          aliases for <code>chat</code> and <code>background</code> during the client migration.<br><br>
+          Client apps identify themselves with the <code>X-Source</code> header (e.g. <code>lancellmot</code>,
           <code>parsival</code>). Requests without this header appear as <code>direct</code>.<br><br>
+          <strong style="color:var(--text)">Call-site rule</strong> — when a new LLM call site is added in any repo,
+          read this table, pick the bucket, and cite it in a code comment. Keeping the bucket assignment explicit at
+          every call site is what prevents the tiers from drifting back into an accidental mix.<br><br>
           <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
           <code>queue_status</code> event is emitted before generation starts, showing queue position
           and estimated wait time. LanceLLMot and Parsival display this as a waiting indicator.
@@ -342,8 +365,8 @@
       <div class="card">
         <h2>Batch Jobs</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          Batch jobs are low-priority generation requests that run whenever a GPU slot is available.
-          Interactive requests always take priority.<br><br>
+          Batch jobs run at bucket 5 (<code>background</code>) — they only dispatch when every higher bucket is
+          empty. Chat, short foreground work, and feedback work all take priority.<br><br>
           <strong style="color:var(--text)">Automatic retry</strong> — failed jobs are retried up to
           <code>BATCH_MAX_RETRIES</code> times (default 2, giving 3 total attempts) with exponential
           backoff (30s, 120s). On final failure, the error messages are stored on the job record.<br><br>
@@ -405,8 +428,10 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           <tr><td><code>GET  /api/ps</code></td><td class="muted">Aggregated from both</td></tr>
         </table>
         <p style="color:var(--muted);font-size:13px;margin-top:8px">
-          Add <code>X-Priority: batch</code> to a request to place it in the low-priority queue
-          without submitting a formal batch job.
+          Set <code>X-Priority: background</code> (or <code>chat</code> / <code>short</code> / <code>feedback</code>)
+          on any request to place it in the corresponding bucket without submitting a formal batch job.
+          See the <strong style="color:var(--text)">GPU Queue</strong> card above for the call-site rule and
+          bucket definitions.
         </p>
       </div>
 

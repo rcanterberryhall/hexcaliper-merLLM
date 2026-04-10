@@ -240,9 +240,28 @@ def _client_ip(request: Request) -> str:
     )
 
 
-def _priority(request: Request) -> int:
-    h = request.headers.get("x-priority", "interactive").lower()
-    return queue_manager.PRIORITY_BATCH if h == "batch" else queue_manager.PRIORITY_INTERACTIVE
+def _priority(request: Request) -> queue_manager.Priority:
+    """Parse the X-Priority header into one of the five priority buckets.
+
+    Accepts canonical names (``chat`` / ``reserved`` / ``short`` /
+    ``feedback`` / ``background``) and the legacy ``interactive`` / ``batch``
+    aliases.
+
+    Missing values fall back to ``CHAT`` for backwards compatibility with
+    clients that predate the header — the same behavior as the old
+    two-tier system. Unknown (non-empty) values fall back to ``BACKGROUND``
+    so typos cannot silently escalate work to a higher lane.
+
+    TODO: once parsival and lancellmot are both sending explicit
+    ``X-Priority`` on every call, tighten the missing-header default to
+    ``BACKGROUND`` so we catch any new code path that forgets to declare.
+    """
+    raw = request.headers.get("x-priority")
+    if raw is None:
+        return queue_manager.Priority.CHAT
+    return queue_manager.priority_from_name(
+        raw, default=queue_manager.Priority.BACKGROUND
+    )
 
 
 def _source(request: Request) -> str:
@@ -554,11 +573,16 @@ def _build_warnings(ollama_health: dict, latest: dict) -> list[str]:
 async def merllm_queue():
     """
     Unified GPU queue: all active, waiting, and recently completed requests
-    across interactive, embedding, and batch workloads.
+    across every priority bucket.
+
+    ``buckets`` reports pre-dispatch depth per bucket (how many waiters each
+    priority lane currently holds). The dashboard uses this to show the five
+    drain lanes.
     """
     return {
         "queue":   queue_manager.active_queue(),
         "summary": queue_manager.queue_depth(),
+        "buckets": queue_manager.pipe_depth(),
     }
 
 

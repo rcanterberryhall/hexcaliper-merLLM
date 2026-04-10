@@ -1,19 +1,32 @@
 """
-queue_manager.py — Late-binding GPU dispatcher with priority pipes.
+queue_manager.py — Late-binding GPU dispatcher with five priority buckets.
 
-Requests enter one of two FIFO pipes by priority (interactive / batch).  A
-central dispatcher assigns a GPU to the head of each pipe only when a GPU
-becomes idle.  Callers do not pick a GPU at submission time — the target is
-determined by the dispatcher at the moment one can actually serve the
-request.  This is "late binding": the analogue of a thread scheduler that
-commits a thread to a CPU only at dispatch time.
+Requests enter one of five FIFO buckets by priority.  A central dispatcher
+assigns a GPU to the head of each bucket only when a GPU becomes idle.
+Callers do not pick a GPU at submission time — the target is determined by
+the dispatcher at the moment one can actually serve the request.  This is
+"late binding": the analogue of a thread scheduler that commits a thread to
+a CPU only at dispatch time.
+
+Priority buckets
+────────────────
+1. CHAT       — real-time chat tokens to the user. Only this.
+2. RESERVED   — empty. Reserved for future use.
+3. SHORT      — parsival short work: live scan analyze, situation synthesis
+                during a scan, contacts parsing, on-demand single-item clicks.
+4. FEEDBACK   — LLM work spawned because a background job produced something
+                that needs timely downstream processing.
+5. BACKGROUND — bulk: reanalyze items, end-of-run briefings, lancellmot
+                extractor, document upload/indexing.
+
+Strict priority: bucket N only dispatches when buckets 1..N-1 are all empty.
 
 Design rules
 ────────────
 1. Late binding.  ``track_request`` registers the request with target=None.
-   ``wait_for_dispatch`` pushes it onto a pipe and awaits the assigned URL.
-2. Strict priority.  The high-pri pipe drains completely before the
-   dispatcher looks at the low-pri pipe.  No preemption.
+   ``wait_for_dispatch`` pushes it onto a bucket and awaits the assigned URL.
+2. Strict priority.  Higher buckets drain completely before the dispatcher
+   looks at lower buckets.  No preemption.
 3. Static swap cost.  ``config.MODEL_SWAP_COST_SECONDS`` is the conservative
    upper bound on loading the largest model.  The decision rule treats a
    swap as always preferable to waiting behind a busy match, because the
@@ -22,18 +35,19 @@ Design rules
    acts at job-completion events (release, swap-completion, new arrival,
    health change).
 
-Dispatch decision rule at the head of a pipe
-────────────────────────────────────────────
+Dispatch decision rule at the head of a bucket
+──────────────────────────────────────────────
 At dispatch time (some GPU is idle), ``_best_candidate_for(req)``:
 
   - If an idle GPU already holds the requested model → that GPU (zero cost).
   - Else if any GPU is idle → the least-recently-active idle GPU (will be
     swapped before dispatch, ≤ MODEL_SWAP_COST_SECONDS cost).
-  - Else → None (request stays at the head of the pipe; dispatcher retries
+  - Else → None (request stays at the head of the bucket; dispatcher retries
     on the next idle event).
 
 Batch job submission stays in this module (SQLite-persisted, retryable) but
-executes through the same dispatcher as interactive requests.
+executes through the same dispatcher as interactive requests, always at
+``Priority.BACKGROUND``.
 """
 import asyncio
 import json
@@ -42,7 +56,8 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import IntEnum
+from typing import Optional, Union
 
 import httpx
 
@@ -52,12 +67,58 @@ import config
 import db
 import notifications
 
-PRIORITY_INTERACTIVE = 0
-PRIORITY_BATCH       = 1
+
+class Priority(IntEnum):
+    """Five priority buckets, drained strictly top-down.
+
+    Lower integer value = higher priority. The dispatcher walks buckets in
+    order and a bucket only gets a turn when every bucket above it is empty.
+    """
+    CHAT       = 0   # real-time chat from the user
+    RESERVED   = 1   # empty; reserved for future use
+    SHORT      = 2   # parsival short foreground work
+    FEEDBACK   = 3   # LLM work spawned by background jobs
+    BACKGROUND = 4   # bulk: reanalyze, briefings, extractor
+
+
+# Back-compat aliases — kept for one release while parsival and lancellmot migrate.
+PRIORITY_INTERACTIVE = Priority.CHAT         # old "interactive" → CHAT
+PRIORITY_BATCH       = Priority.BACKGROUND   # old "batch"       → BACKGROUND
+
+# Canonical name → Priority mapping used by the header parser.
+_PRIORITY_BY_NAME: dict[str, Priority] = {
+    "chat":        Priority.CHAT,
+    "reserved":    Priority.RESERVED,
+    "short":       Priority.SHORT,
+    "feedback":    Priority.FEEDBACK,
+    "background":  Priority.BACKGROUND,
+    # Back-compat aliases.
+    "interactive": Priority.CHAT,
+    "batch":       Priority.BACKGROUND,
+}
+
+
+def priority_from_name(name: Optional[str], default: Priority = Priority.BACKGROUND) -> Priority:
+    """Parse an ``X-Priority`` header value into a :class:`Priority`.
+
+    Missing, blank, or unknown names fall back to ``default`` (BACKGROUND by
+    default — safest: typos can't silently escalate work to a higher lane).
+    """
+    if not name:
+        return default
+    return _PRIORITY_BY_NAME.get(name.strip().lower(), default)
+
+
+def priority_name(priority: Union[Priority, int]) -> str:
+    """Return the canonical lowercase name for a priority value."""
+    try:
+        return Priority(int(priority)).name.lower()
+    except (ValueError, TypeError):
+        return "background"
 
 
 class DispatchTimeout(Exception):
-    """Raised when an interactive request exceeds INTERACTIVE_QUEUE_TIMEOUT."""
+    """Raised when a CHAT request exceeds INTERACTIVE_QUEUE_TIMEOUT."""
 
 
 # ── Request tracking ─────────────────────────────────────────────────────────
@@ -92,8 +153,10 @@ class _PendingRequest:
 
 # ── Dispatcher state ─────────────────────────────────────────────────────────
 
-_hi: deque[_PendingRequest] = deque()
-_lo: deque[_PendingRequest] = deque()
+# One deque per Priority bucket, indexed by the IntEnum value. The dispatcher
+# walks these in order (CHAT first, BACKGROUND last) and strictly drains each
+# bucket before moving to the next one down.
+_buckets: list[deque["_PendingRequest"]] = [deque() for _ in Priority]
 _gpu_busy: dict[str, bool] = {}
 _state_changed: Optional[asyncio.Event] = None
 _dispatcher_task: Optional[asyncio.Task] = None
@@ -159,13 +222,15 @@ def _wake_dispatcher() -> None:
 
 
 def track_request(source: str, request_type: str, model: str,
-                  priority: int,
+                  priority: Union[Priority, int],
                   batch_job_id: Optional[str] = None) -> str:
     """
     Register a new request in the tracker.
 
     The request starts with ``target=None``; the dispatcher assigns a URL at
     dispatch time.  Returns a tracking ID.
+
+    ``priority`` may be a :class:`Priority` enum member or its int value.
     """
     _ensure_dispatcher()
     req_id = str(uuid.uuid4())
@@ -174,7 +239,7 @@ def track_request(source: str, request_type: str, model: str,
         source=source,
         request_type=request_type,
         model=model,
-        priority=priority,
+        priority=int(priority),
         target=None,
         status="queued",
         submitted_at=time.time(),
@@ -186,13 +251,13 @@ def track_request(source: str, request_type: str, model: str,
 
 async def wait_for_dispatch(tracking_id: str) -> str:
     """
-    Push the tracked request onto the appropriate priority pipe and await
-    a GPU assignment from the dispatcher.
+    Push the tracked request onto its priority bucket and await a GPU
+    assignment from the dispatcher.
 
     Returns the target URL once the dispatcher has marked the GPU busy and
     completed any required model swap.  Raises :class:`DispatchTimeout` if
-    an interactive request exceeds ``config.INTERACTIVE_QUEUE_TIMEOUT``;
-    batch requests wait indefinitely.
+    a ``CHAT`` request exceeds ``config.INTERACTIVE_QUEUE_TIMEOUT``; all
+    other buckets wait indefinitely.
     """
     entry = _tracked.get(tracking_id)
     if entry is None:
@@ -208,15 +273,12 @@ async def wait_for_dispatch(tracking_id: str) -> str:
         priority=entry.priority,
         future=future,
     )
-    if entry.priority == PRIORITY_INTERACTIVE:
-        _hi.append(pending)
-    else:
-        _lo.append(pending)
+    _buckets[entry.priority].append(pending)
 
     _wake_dispatcher()
 
     try:
-        if entry.priority == PRIORITY_INTERACTIVE:
+        if entry.priority == Priority.CHAT:
             target = await asyncio.wait_for(future, timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
         else:
             target = await future
@@ -228,17 +290,17 @@ async def wait_for_dispatch(tracking_id: str) -> str:
             _tracked[tracking_id].completed_at = time.time()
             _notify_change()
             loop.call_later(10, _remove_tracked, tracking_id)
-        raise DispatchTimeout("interactive request exceeded INTERACTIVE_QUEUE_TIMEOUT")
+        raise DispatchTimeout("chat request exceeded INTERACTIVE_QUEUE_TIMEOUT")
 
     return target
 
 
 def _remove_pending(tracking_id: str) -> None:
-    """Remove a pending request from whichever pipe it's in (if any)."""
-    for pipe in (_hi, _lo):
-        for i, p in enumerate(pipe):
+    """Remove a pending request from whichever bucket it's in (if any)."""
+    for bucket in _buckets:
+        for i, p in enumerate(bucket):
             if p.tid == tracking_id:
-                del pipe[i]
+                del bucket[i]
                 return
 
 
@@ -260,9 +322,9 @@ def release(tracking_id: str) -> None:
     _notify_change()
     _wake_dispatcher()
 
-    # Interactive requests drop from the tracker shortly after completion.
-    # Batch requests stay visible (persisted in SQLite anyway).
-    if entry.priority == PRIORITY_INTERACTIVE:
+    # Non-batch requests drop from the tracker shortly after completion.
+    # Jobs backed by a batch_job_id stay visible (persisted in SQLite anyway).
+    if entry.batch_job_id is None:
         try:
             asyncio.get_running_loop().call_later(5, _remove_tracked, tracking_id)
         except RuntimeError:
@@ -287,7 +349,7 @@ def fail_request(tracking_id: str, error: str = "") -> None:
     _notify_change()
     _wake_dispatcher()
 
-    if entry.priority == PRIORITY_INTERACTIVE:
+    if entry.batch_job_id is None:
         try:
             asyncio.get_running_loop().call_later(10, _remove_tracked, tracking_id)
         except RuntimeError:
@@ -339,19 +401,27 @@ def _best_candidate_for(model: str) -> Optional[str]:
 
 def _try_dispatch_heads() -> None:
     """
-    Walk the high-pri pipe then the low-pri pipe.  For each head, try to
-    assign a GPU.  Stop at the first head that cannot be dispatched — FIFO
-    must be preserved within a pipe, so we never skip a head.
+    Walk the priority buckets from CHAT down to BACKGROUND.  For each
+    bucket, try to assign a GPU to the head.  Stop at the first head that
+    cannot be dispatched — FIFO must be preserved within a bucket, so we
+    never skip a head.  A lower-priority bucket only gets a turn when every
+    higher-priority bucket is empty.
     """
-    for pipe in (_hi, _lo):
-        while pipe:
-            req = pipe[0]
+    for bucket in _buckets:
+        while bucket:
+            req = bucket[0]
             target = _best_candidate_for(req.model)
             if target is None:
-                break
-            pipe.popleft()
+                # Head of this bucket cannot dispatch right now. We must not
+                # fall through to a lower-priority bucket while a higher
+                # bucket still has pending work — strict priority forbids
+                # any inversion, even when the lower bucket's head happens
+                # to be a better model fit.
+                return
+            bucket.popleft()
             _gpu_busy[target] = True
-            _tracked[req.tid].target = target if req.tid in _tracked else None
+            if req.tid in _tracked:
+                _tracked[req.tid].target = target
             asyncio.create_task(_dispatch(req, target))
 
 
@@ -448,7 +518,7 @@ def active_queue() -> list[dict]:
             "source":        entry.source,
             "request_type":  entry.request_type,
             "model":         entry.model,
-            "priority":      "interactive" if entry.priority == PRIORITY_INTERACTIVE else "batch",
+            "priority":      priority_name(entry.priority),
             "target":        entry.target,
             "status":        entry.status,
             "submitted_at":  entry.submitted_at,
@@ -480,8 +550,19 @@ def queue_depth() -> dict:
 
 
 def pipe_depth() -> dict:
-    """Depth of the dispatcher's priority pipes (pre-dispatch waiters)."""
-    return {"interactive": len(_hi), "batch": len(_lo)}
+    """Depth of each dispatcher bucket (pre-dispatch waiters).
+
+    Returns one key per :class:`Priority` name plus legacy ``interactive`` /
+    ``batch`` aliases (CHAT / BACKGROUND) so existing dashboards and tests
+    that read the old keys keep working during the transition.
+    """
+    depths: dict = {
+        priority_name(p): len(_buckets[p]) for p in Priority
+    }
+    # Back-compat aliases.
+    depths["interactive"] = depths["chat"]
+    depths["batch"]       = depths["background"]
+    return depths
 
 
 # ── Batch job submission ──────────────────────────────────────────────────────
@@ -535,7 +616,7 @@ async def _run_batch_job_async(job_id: str) -> None:
         source=job["source_app"],
         request_type="batch",
         model=job["model"],
-        priority=PRIORITY_BATCH,
+        priority=Priority.BACKGROUND,
         batch_job_id=job_id,
     )
 
