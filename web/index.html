@@ -12,7 +12,7 @@
 <header>
   <img src="merllm-wizard.svg" alt="merLLM" style="width:28px;height:28px;flex-shrink:0" />
   <h1>Hexcaliper — merLLM</h1>
-  <span id="mode-badge" class="badge-day">day</span>
+  <span id="routing-badge" class="badge-routing">round robin</span>
   <span id="refresh-indicator">refreshing&hellip;</span>
 </header>
 
@@ -46,32 +46,24 @@
     <div class="grid-3">
 
       <div class="card">
-        <h2>Mode</h2>
+        <h2>GPU Router</h2>
         <div class="stat-row">
-          <span class="stat-label">Current</span>
-          <span id="ov-mode" class="stat-value">—</span>
+          <span class="stat-label">Routing</span>
+          <span id="ov-routing" class="stat-value">—</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Override</span>
-          <span id="ov-override" class="stat-value muted">none</span>
+          <span class="stat-label">Default model</span>
+          <span id="ov-default-model" class="stat-value">—</span>
         </div>
-        <div class="stat-row">
-          <span class="stat-label">Last activity</span>
-          <span id="ov-activity" class="stat-value">—</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">Inactivity timeout</span>
-          <span id="ov-timeout" class="stat-value">—</span>
+        <div id="ov-pending-model-row" class="stat-row" style="display:none">
+          <span class="stat-label">Pending model</span>
+          <span id="ov-pending-model" class="stat-value" style="color:var(--yellow)">—</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">Queue depth</span>
           <span id="ov-queue" class="stat-value">—</span>
         </div>
-        <div class="mt" id="mode-controls">
-          <button class="btn primary" onclick="setMode('day')">Day</button>
-          <button class="btn" style="color:#a78bfa;border-color:#7c3aed" onclick="setMode('night')">Night</button>
-          <button class="btn" onclick="setMode('auto')">Auto</button>
-        </div>
+        <div id="gpu-router-cards"></div>
       </div>
 
       <div class="card">
@@ -90,8 +82,8 @@
       </div>
 
       <div class="card span-2">
-        <h2>Recent Transitions</h2>
-        <div id="transitions-list"></div>
+        <h2>Recent Activity</h2>
+        <div id="activity-feed" class="muted" style="font-size:12px">No recent activity.</div>
       </div>
 
       <div class="card">
@@ -116,7 +108,7 @@
         <h2>Submit Job</h2>
         <div class="batch-form">
           <input id="b-source" type="text" placeholder="Source app (e.g. lancellmot)" value="merllm-ui" />
-          <input id="b-model" type="text" placeholder="Model (leave blank for default night model)" />
+          <input id="b-model" type="text" placeholder="Model (leave blank for default model)" />
           <textarea id="b-prompt" placeholder="Prompt text…"></textarea>
           <div>
             <button class="btn primary" onclick="submitBatchJob()">Submit</button>
@@ -128,7 +120,6 @@
         <h2>Job Queue</h2>
         <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn" onclick="loadBatchJobs()">Refresh</button>
-          <button class="btn" onclick="batchRunNow()">Run Now</button>
           <button class="btn" onclick="batchRetryFailed()">Retry Failed</button>
           <button class="btn" style="color:var(--warning,#f0a030)" onclick="batchDrain()">Drain Queue</button>
           <button class="btn" onclick="batchClearCompleted()">Clear Completed</button>
@@ -176,7 +167,7 @@
         <div class="chart-wrap"><canvas id="chart-disk"></canvas></div>
       </div>
 
-      <div class="card span-2">
+      <div class="card">
         <h2>GPU 0</h2>
         <div id="gpu0-metrics"></div>
         <div class="chart-wrap"><canvas id="chart-gpu0"></canvas></div>
@@ -205,7 +196,6 @@
         <select id="log-service">
           <option value="ollama-gpu0">ollama-gpu0</option>
           <option value="ollama-gpu1">ollama-gpu1</option>
-          <option value="ollama-night">ollama-night</option>
           <option value="lancellmot-api">lancellmot-api</option>
           <option value="lancellmot-nginx">lancellmot-nginx</option>
           <option value="parsival-api">parsival-api</option>
@@ -292,21 +282,21 @@
     <div class="grid-2">
 
       <div class="card">
-        <h2>Day / Night Mode</h2>
+        <h2>GPU Router</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          <strong style="color:var(--text)">Day mode</strong> runs two Ollama instances simultaneously — one per GPU —
-          and routes requests by model name. The model assigned to GPU 1 (<code>DAY_MODEL_GPU1</code>) goes to that
-          instance; everything else goes to GPU 0.<br><br>
-          <strong style="color:var(--text)">Night mode</strong> activates automatically when both conditions are met:
-          no interactive requests for <code>INACTIVITY_TIMEOUT_MIN</code> minutes <em>and</em> the current time is
-          past the schedule hint (<code>BASE_DAY_END_LOCAL</code>, optionally adjusted for your timezone via GeoIP).
-          In night mode, merLLM switches to a dual-GPU Ollama instance and drains the batch queue with extended
-          context (<code>NIGHT_NUM_CTX</code>).<br><br>
-          Any interactive request during night mode triggers an immediate return to day mode.<br><br>
-          <strong style="color:var(--text)">Manual override</strong> — use the Day / Night / Auto buttons on the
-          Overview tab. Auto clears the override and returns to schedule-driven behaviour.<br><br>
-          <strong style="color:var(--text)">Honest failures</strong> — if a systemctl call fails during a transition,
-          the mode is not changed and the failure is recorded in the transition history. The UI shows the error.
+          merLLM round-robins all requests across both GPUs. Both GPUs normally load the same
+          <code>DEFAULT_MODEL</code>. When a request specifies a different model, merLLM waits for an
+          idle GPU, swaps it to the requested model, and routes subsequent matching requests there.<br><br>
+          <strong style="color:var(--text)">Reclaim</strong> — when a GPU running a non-default model has been
+          idle for <code>RECLAIM_TIMEOUT</code> seconds (default 300), merLLM reloads the default model and
+          resumes round-robin on both GPUs.<br><br>
+          <strong style="color:var(--text)">Health tracking</strong> — if a GPU fails, it is marked
+          <em>degraded</em> and excluded from routing. Health probes use exponential backoff
+          (<code>HEALTH_BACKOFF_BASE</code> &rarr; doubled each attempt &rarr; capped at <code>HEALTH_BACKOFF_CAP</code>).
+          After <code>HEALTH_FAULT_TIMEOUT</code> seconds of continuous failure, the GPU is declared
+          <em>faulted</em>. Recovery requires a manual reset via the Overview tab.<br><br>
+          <strong style="color:var(--text)">Default model change</strong> — changing the default model in
+          Settings requires confirmation. merLLM waits for each GPU to go idle before reloading.
         </p>
       </div>
 
@@ -319,17 +309,16 @@
           Batch-priority requests (<code>X-Priority: batch</code>) yield to queued interactive requests.
           The queue tracks in-flight count per GPU for informed routing.<br><br>
           <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
-          <code>queue_status</code> event is emitted before generation starts, showing queue position,
-          reason (e.g. "transitioning to day mode"), and estimated wait time. LanceLLMot and Parsival
-          display this as a waiting indicator.
+          <code>queue_status</code> event is emitted before generation starts, showing queue position
+          and estimated wait time. LanceLLMot and Parsival display this as a waiting indicator.
         </p>
       </div>
 
       <div class="card">
         <h2>Batch Jobs</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          Batch jobs are generation requests that run during night mode with a larger context window.
-          They're useful for deep-analysis tasks that would block interactive use during the day.<br><br>
+          Batch jobs are low-priority generation requests that run whenever a GPU slot is available.
+          Interactive requests always take priority.<br><br>
           <strong style="color:var(--text)">Automatic retry</strong> — failed jobs are retried up to
           <code>BATCH_MAX_RETRIES</code> times (default 2, giving 3 total attempts) with exponential
           backoff (30s, 120s). On final failure, the error messages are stored on the job record.<br><br>
@@ -352,7 +341,7 @@ POST /api/batch/&lt;id&gt;/cancel
 POST /api/batch/&lt;id&gt;/requeue</pre>
         <p style="color:var(--muted);font-size:13px;margin-top:8px">
           Prompts exceeding <code>BATCH_MAX_PROMPT_LEN</code> (default 100,000 chars) are rejected with 422.
-          Jobs stay in <code>queued</code> status until night mode activates, then run sequentially.
+          Jobs run as soon as a GPU slot is available (at low priority).
           Failed jobs can be requeued; cancelled jobs can only be resubmitted.
         </p>
       </div>
@@ -382,9 +371,9 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           Supported endpoints:
         </p>
         <table style="margin-top:8px;font-size:12px">
-          <tr><td><code>POST /api/generate</code></td><td class="muted">Routed by model name</td></tr>
+          <tr><td><code>POST /api/generate</code></td><td class="muted">Round-robin, routed by model</td></tr>
           <tr><td><code>POST /api/chat</code></td><td class="muted">Same routing</td></tr>
-          <tr><td><code>POST /api/embeddings</code></td><td class="muted">Always GPU 0</td></tr>
+          <tr><td><code>POST /api/embeddings</code></td><td class="muted">Round-robin</td></tr>
           <tr><td><code>GET  /api/tags</code></td><td class="muted">Model list (GPU 0)</td></tr>
           <tr><td><code>POST /api/show</code></td><td class="muted">GPU 0</td></tr>
           <tr><td><code>POST /api/pull</code></td><td class="muted">GPU 0 (shared store)</td></tr>
@@ -405,14 +394,11 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
         </p>
         <table style="margin-top:8px;font-size:12px">
           <tr><td><code>ollama_0_url</code> / <code>ollama_1_url</code></td><td class="muted">Ollama instance URLs</td></tr>
-          <tr><td><code>day_model_gpu0</code> / <code>day_model_gpu1</code></td><td class="muted">Model routing in day mode</td></tr>
-          <tr><td><code>night_model</code></td><td class="muted">Model for batch jobs</td></tr>
-          <tr><td><code>night_num_ctx</code></td><td class="muted">Context size for batch jobs</td></tr>
-          <tr><td><code>inactivity_timeout_min</code></td><td class="muted">Idle time before night mode</td></tr>
-          <tr><td><code>base_day_end_local</code></td><td class="muted">Schedule hint (HH:MM local time)</td></tr>
-          <tr><td><code>geoip_offset_override</code></td><td class="muted">Force UTC offset (e.g. <code>-5</code>)</td></tr>
-          <tr><td><code>ollama_manage_via</code></td><td class="muted"><code>none</code> or <code>systemctl</code></td></tr>
-          <tr><td><code>drain_timeout_sec</code></td><td class="muted">Max wait before forced transition</td></tr>
+          <tr><td><code>default_model</code></td><td class="muted">Default model for both GPUs (change requires confirmation)</td></tr>
+          <tr><td><code>reclaim_timeout</code></td><td class="muted">Idle seconds before reloading default model (default 300)</td></tr>
+          <tr><td><code>health_backoff_base</code></td><td class="muted">Initial health probe interval (default 10s)</td></tr>
+          <tr><td><code>health_backoff_cap</code></td><td class="muted">Max health probe interval (default 300s)</td></tr>
+          <tr><td><code>health_fault_timeout</code></td><td class="muted">Seconds before declaring GPU faulted (default 1800)</td></tr>
         </table>
       </div>
 
@@ -442,19 +428,6 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
         </p>
       </div>
 
-      <div class="card">
-        <h2>GeoIP Scheduling</h2>
-        <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          When a MaxMind GeoLite2-City database is present at <code>GEOIP_DB_PATH</code>, merLLM uses
-          the client's IP address to determine their local timezone and adjusts the day-end schedule
-          hint accordingly.<br><br>
-          Without the database, <code>BASE_DAY_END_LOCAL</code> is used as-is with no adjustment.<br><br>
-          To override the timezone lookup entirely, set <code>GEOIP_OFFSET_OVERRIDE</code> to a UTC
-          offset (e.g. <code>-5</code> for EST, <code>5.5</code> for IST).<br><br>
-          The effective adjusted schedule is shown in the Overview tab status area and is also available
-          from <code>GET /api/merllm/geoip</code>.
-        </p>
-      </div>
 
       <div class="card">
         <h2>Metrics Charts</h2>
@@ -471,16 +444,15 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
         <h2>API Reference</h2>
         <table style="font-size:12px">
           <tr><th>Endpoint</th><th>Description</th></tr>
-          <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">Mode, GPUs, queue depth, health</td></tr>
-          <tr><td><code>POST /api/merllm/mode</code></td><td class="muted">Set day/night/auto; returns failure status</td></tr>
+          <tr><td><code>GET  /api/merllm/status</code></td><td class="muted">GPU state, queue depth, health</td></tr>
+          <tr><td><code>GET  /api/merllm/default-model</code></td><td class="muted">Current default model</td></tr>
+          <tr><td><code>POST /api/merllm/gpu/{gpu}/reset</code></td><td class="muted">Manual GPU health reset</td></tr>
           <tr><td><code>GET  /api/merllm/settings</code></td><td class="muted">View current config</td></tr>
           <tr><td><code>POST /api/merllm/settings</code></td><td class="muted">Update config live</td></tr>
           <tr><td><code>GET  /api/merllm/metrics/current</code></td><td class="muted">Latest system snapshot</td></tr>
           <tr><td><code>GET  /api/merllm/metrics/history</code></td><td class="muted">Time-series data for charts</td></tr>
           <tr><td><code>GET  /api/merllm/diagnostics</code></td><td class="muted">Connectivity + container health</td></tr>
           <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines (configurable containers)</td></tr>
-          <tr><td><code>GET  /api/merllm/transitions</code></td><td class="muted">Mode transition history</td></tr>
-          <tr><td><code>GET  /api/merllm/geoip</code></td><td class="muted">GeoIP schedule info</td></tr>
           <tr><td><code>GET  /api/merllm/myday</code></td><td class="muted">My Day cross-app attention summary</td></tr>
           <tr><td><code>POST /api/merllm/backup</code></td><td class="muted">Trigger SQLite online backup</td></tr>
           <tr><td><code>GET  /health</code></td><td class="muted">Docker health check / liveness</td></tr>

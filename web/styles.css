@@ -36,7 +36,7 @@ header h1 {
   letter-spacing: .5px;
 }
 
-#mode-badge {
+#routing-badge {
   padding: 2px 10px;
   border-radius: 12px;
   font-size: 12px;
@@ -44,9 +44,10 @@ header h1 {
   text-transform: uppercase;
   letter-spacing: .5px;
 }
-.badge-day          { background: #1e3a2f; color: var(--green); }
-.badge-night        { background: #2d1f5e; color: #a78bfa; }
-.badge-transitioning{ background: #2d2208; color: var(--yellow); }
+.badge-routing      { text-transform: none; }
+.badge-ok           { background: #1e3a2f; color: var(--green); }
+.badge-degraded     { background: #2d2208; color: var(--yellow); }
+.badge-fault        { background: #3d1f1f; color: var(--red); }
 
 #refresh-indicator {
   margin-left: auto;
@@ -175,6 +176,7 @@ main { padding: 20px; }
   width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
 }
 .dot-ok   { background: var(--green); }
+.dot-warn { background: var(--yellow); }
 .dot-fail { background: var(--red); }
 
 /* Instance activity cards */

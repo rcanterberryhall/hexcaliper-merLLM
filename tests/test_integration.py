@@ -55,7 +55,7 @@ class TestServiceHealth:
         r = api(MERLLM, "/api/merllm/status")
         assert r.status_code == 200
         d = r.json()
-        assert d["mode"] in ("day", "night")
+        assert d["routing"] == "round_robin"
         # GPUs can be transiently unavailable under heavy batch load
         gpus_ok = [d["ollama"][g]["ok"] for g in d["ollama"]]
         if not all(gpus_ok):
@@ -144,7 +144,7 @@ class TestMerllmProxy:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestMerllmFeatures:
-    """Test merLLM-specific features: metrics, settings, mode, batch."""
+    """Test merLLM-specific features: metrics, settings, routing, batch."""
 
     def test_metrics_current(self):
         r = api(MERLLM, "/api/merllm/metrics/current")
@@ -162,14 +162,10 @@ class TestMerllmFeatures:
         d = r.json()
         assert "ollama_0_url" in d
 
-    def test_transitions(self):
-        r = api(MERLLM, "/api/merllm/transitions")
+    def test_default_model(self):
+        r = api(MERLLM, "/api/merllm/default-model")
         assert r.status_code == 200
-        assert isinstance(r.json(), list)
-
-    def test_geoip(self):
-        r = api(MERLLM, "/api/merllm/geoip")
-        assert r.status_code == 200
+        assert "model" in r.json()
 
     def test_backup(self):
         r = post(MERLLM, "/api/merllm/backup")
@@ -264,11 +260,11 @@ class TestLancellmotMerllm:
         assert r.status_code == 200
 
     def test_lancellmot_merllm_status(self):
-        """LanceLLMot proxies merLLM status for its mode indicator."""
+        """LanceLLMot proxies merLLM status for its routing indicator."""
         r = api(LANCELLMOT, "/api/merllm/status")
         assert r.status_code == 200
         d = r.json()
-        assert "mode" in d
+        assert "routing" in d
 
 
 # ═══════════════════════════════════════════════════════════════════════════

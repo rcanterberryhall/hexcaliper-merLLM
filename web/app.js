@@ -177,7 +177,7 @@ async function refresh() {
   try {
     const status = await api("/api/merllm/status");
     renderOverview(status);
-    updateBadge(status.mode);
+    updateBadge(status);
     document.getElementById("refresh-indicator").textContent =
       "updated " + new Date().toLocaleTimeString();
   } catch (err) {
@@ -212,10 +212,19 @@ async function refresh() {
 
 // ── Overview ──────────────────────────────────────────────────────────────────
 
-function updateBadge(mode) {
-  const el = document.getElementById("mode-badge");
-  el.textContent = mode;
-  el.className = "badge-" + mode;
+function updateBadge(status) {
+  const el = document.getElementById("routing-badge");
+  if (!el) return;
+  const gpus = status.gpus || {};
+  const allHealthy = Object.values(gpus).every(g => g.health === "healthy");
+  if (allHealthy) {
+    el.textContent = "round robin";
+    el.className = "badge-routing badge-ok";
+  } else {
+    const faulted = Object.values(gpus).some(g => g.health === "faulted");
+    el.textContent = faulted ? "faulted" : "degraded";
+    el.className = faulted ? "badge-routing badge-fault" : "badge-routing badge-degraded";
+  }
 }
 
 function renderOverview(s) {
@@ -229,22 +238,58 @@ function renderOverview(s) {
     warn.style.display = "none";
   }
 
-  // Mode card
-  set("ov-mode", s.mode);
-  set("ov-override", s.override || "none");
-  const ago = s.last_interactive_at
-    ? relTime(s.last_interactive_at)
-    : "never";
-  set("ov-activity", ago);
-  set("ov-timeout", (s.inactivity_timeout_min || "—") + " min");
+  // GPU Router card
+  set("ov-routing", s.routing || "round_robin");
+  set("ov-default-model", s.default_model || "—");
   set("ov-queue", s.queue ? s.queue.total : "—");
+
+  // Pending model change
+  const pendingRow = document.getElementById("ov-pending-model-row");
+  if (s.pending_default_model) {
+    pendingRow.style.display = "";
+    set("ov-pending-model", s.pending_default_model);
+  } else {
+    pendingRow.style.display = "none";
+  }
+
+  // Per-GPU status cards inside router card
+  const routerCards = document.getElementById("gpu-router-cards");
+  if (s.gpus && typeof s.gpus === "object") {
+    routerCards.innerHTML = Object.entries(s.gpus).map(([label, g]) => {
+      const healthClass = g.health === "healthy" ? "dot-ok"
+        : g.health === "faulted" ? "dot-fail" : "dot-warn";
+      const idleFmt = g.idle_seconds >= 60
+        ? Math.floor(g.idle_seconds / 60) + "m " + Math.round(g.idle_seconds % 60) + "s"
+        : Math.round(g.idle_seconds) + "s";
+      const resetBtn = g.health !== "healthy"
+        ? `<button class="btn" style="padding:2px 8px;font-size:11px;margin-left:8px" onclick="resetGpu('${esc(label)}')">Reset</button>`
+        : "";
+      return `<div class="gpu-router-gpu" style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px">
+        <div class="stat-row">
+          <span class="stat-label"><span class="dot ${healthClass}"></span> ${esc(label.toUpperCase().replace("GPU", "GPU "))}</span>
+          <span class="stat-value">${esc(g.health)}${resetBtn}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Model</span>
+          <span class="stat-value">${esc(g.model)}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Idle</span>
+          <span class="stat-value">${idleFmt}</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">In flight</span>
+          <span class="stat-value">${g.in_flight ? "yes" : "no"}</span>
+        </div>
+      </div>`;
+    }).join("");
+  }
 
   // Ollama health dots (just up/down; detail comes from refreshActivity)
   if (s.ollama) {
     for (const [key, v] of Object.entries(s.ollama)) {
       const el = document.getElementById(`ollama-${key}`);
       if (el && el.dataset.activityReady !== "1") {
-        // Show minimal health dot until first activity poll arrives
         el.innerHTML =
           `<div class="instance-header">
              <span class="dot ${v.ok ? "dot-ok" : "dot-fail"}"></span>
@@ -263,26 +308,12 @@ function renderOverview(s) {
     ).join("");
   }
 
-  // GPU summary
+  // GPU hardware metrics
   const gpuEl = document.getElementById("gpu-status");
-  if (s.gpus && s.gpus.length) {
-    gpuEl.innerHTML = s.gpus.map((g, i) => gpuCard(i, g)).join("");
+  if (s.gpu_metrics && s.gpu_metrics.length) {
+    gpuEl.innerHTML = s.gpu_metrics.map((g, i) => gpuCard(i, g)).join("");
   } else {
     gpuEl.innerHTML = '<span class="muted">No GPU data</span>';
-  }
-
-  // Transitions
-  const trEl = document.getElementById("transitions-list");
-  if (s.last_transition && s.last_transition.length) {
-    trEl.innerHTML = s.last_transition.map(t =>
-      `<div class="transition-item">
-         <span class="ts">${fmtTs(t.ts)}</span>
-         <span>${esc(t.from_mode)} &rarr; ${esc(t.to_mode)}</span>
-         <span class="muted">${esc(t.trigger || "")}</span>
-       </div>`
-    ).join("");
-  } else {
-    trEl.innerHTML = '<span class="muted" style="font-size:12px">No transitions yet.</span>';
   }
 }
 
@@ -376,15 +407,15 @@ function renderInstanceCard(elId, label, inst) {
     ${activeHtml ? `<div class="instance-active-wrap">${activeHtml}</div>` : ""}`;
 }
 
-// ── Mode control ──────────────────────────────────────────────────────────────
+// ── GPU control ──────────────────────────────────────────────────────────────
 
-async function setMode(mode) {
+async function resetGpu(gpu) {
+  if (!confirm(`Reset ${gpu.toUpperCase().replace("GPU", "GPU ")} to healthy and reload default model?`)) return;
   try {
-    const r = await post("/api/merllm/mode", { mode });
-    updateBadge(r.mode);
-    setTimeout(refresh, 1000);
+    await post(`/api/merllm/gpu/${gpu}/reset`, {});
+    setTimeout(refresh, 500);
   } catch (err) {
-    alert("Mode change failed: " + err.message);
+    alert("GPU reset failed: " + err.message);
   }
 }
 
@@ -450,13 +481,6 @@ async function viewResult(id) {
     const r = await api(`/api/batch/results/${id}`);
     alert(r.result);
   } catch (err) { alert("Error: " + err.message); }
-}
-
-async function batchRunNow() {
-  try {
-    await post("/api/batch/run-now", {});
-    loadBatchJobs();
-  } catch (err) { alert("Run Now failed: " + err.message); }
 }
 
 async function batchRetryFailed() {
@@ -675,11 +699,12 @@ async function _hist(metric) {
 }
 
 async function loadMetricsCharts() {
-  const [cpu, ramUsed, diskPct, g0util, g0mem, g0temp, g1util, g1mem, g1temp, tx, rx] =
+  const [cpu, ramUsed, diskPct, diskArchivePct, g0util, g0mem, g0temp, g1util, g1mem, g1temp, tx, rx] =
     await Promise.all([
       _hist("cpu.total"),
       _hist("ram.used"),
       _hist("disk.root.pct"),
+      _hist("disk.archive.pct"),
       _hist("gpu0.util_pct"),
       _hist("gpu0.mem_used_mb"),
       _hist("gpu0.temp_c"),
@@ -704,10 +729,14 @@ async function loadMetricsCharts() {
     );
   }
 
-  if (diskPct.length) {
+  if (diskPct.length || diskArchivePct.length) {
+    const base = diskPct.length ? diskPct : diskArchivePct;
+    const datasets = [];
+    if (diskPct.length) datasets.push(_mkDs("OS Disk %", diskPct.map(p => p.value.toFixed(1)), "#d29922"));
+    if (diskArchivePct.length) datasets.push(_mkDs("Archive %", diskArchivePct.map(p => p.value.toFixed(1)), "#58a6ff"));
     _setChart("chart-disk",
-      diskPct.map(p => _fmtTs(p.ts)),
-      [_mkDs("Disk %", diskPct.map(p => p.value.toFixed(1)), "#d29922")]
+      base.map(p => _fmtTs(p.ts)),
+      datasets
     );
   }
 
@@ -840,26 +869,25 @@ function disconnectVNC() {
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 const SETTINGS_FIELDS = [
-  { key: "ollama_0_url",           label: "Ollama GPU 0 URL",         type: "text" },
-  { key: "ollama_1_url",           label: "Ollama GPU 1 URL",         type: "text" },
-  { key: "day_model_gpu0",         label: "Day model GPU 0",          type: "text" },
-  { key: "day_model_gpu1",         label: "Day model GPU 1",          type: "text" },
-  { key: "night_model",            label: "Night model",              type: "text" },
-  { key: "night_num_ctx",          label: "Night num_ctx",            type: "number" },
-  { key: "inactivity_timeout_min", label: "Inactivity timeout (min)", type: "number" },
-  { key: "base_day_end_local",     label: "Day end (HH:MM local)",    type: "text" },
-  { key: "geoip_offset_override",  label: "UTC offset override",      type: "text" },
-  { key: "ollama_manage_via",      label: "Manage Ollama via",        type: "select",
-    options: ["none", "systemctl"] },
-  { key: "drain_timeout_sec",         label: "Drain timeout (sec)",      type: "number" },
-  { key: "metrics_interval_sec",      label: "Metrics interval (sec)",   type: "number" },
-  { key: "notification_webhook_url",  label: "Notification webhook URL",  type: "text",
+  { key: "ollama_0_url",             label: "Ollama GPU 0 URL",           type: "text" },
+  { key: "ollama_1_url",             label: "Ollama GPU 1 URL",           type: "text" },
+  { key: "default_model",            label: "Default model",              type: "text",
+    hint: "Changing this will reload both GPUs when they go idle." },
+  { key: "reclaim_timeout",          label: "Reclaim timeout (sec)",      type: "number",
+    hint: "Idle seconds before a non-default model GPU is reclaimed." },
+  { key: "health_backoff_base",      label: "Health probe base (sec)",    type: "number" },
+  { key: "health_backoff_cap",       label: "Health probe cap (sec)",     type: "number" },
+  { key: "health_fault_timeout",     label: "Fault timeout (sec)",        type: "number",
+    hint: "Continuous failure seconds before declaring a GPU faulted." },
+  { key: "metrics_interval_sec",     label: "Metrics interval (sec)",     type: "number" },
+  { key: "notification_webhook_url", label: "Notification webhook URL",   type: "text",
     hint: "POST to this URL on job completion. Supports Slack, ntfy.sh, Gotify, etc." },
 ];
 
 async function loadSettings() {
   try {
     const s = await api("/api/merllm/settings");
+    _lastSavedDefaultModel = s.default_model || "";
     const form = document.getElementById("settings-form");
     form.innerHTML = SETTINGS_FIELDS.map(f => {
       const val = s[f.key] != null ? s[f.key] : "";
@@ -891,14 +919,26 @@ async function saveSettings() {
     if (!el) return;
     body[f.key] = f.type === "number" ? Number(el.value) : el.value;
   });
+
+  // If default_model changed, require confirmation
+  if (body.default_model && body.default_model !== _lastSavedDefaultModel) {
+    if (!confirm(`Change default model to "${body.default_model}"?\n\nBoth GPUs will reload when they go idle.`)) {
+      return;
+    }
+    body.confirm_model_change = true;
+  }
+
   try {
     await post("/api/merllm/settings", body);
+    _lastSavedDefaultModel = body.default_model || _lastSavedDefaultModel;
     document.getElementById("settings-msg").textContent = "Saved.";
     setTimeout(() => { document.getElementById("settings-msg").textContent = ""; }, 3000);
   } catch (err) {
     document.getElementById("settings-msg").textContent = "Save failed: " + err.message;
   }
 }
+
+let _lastSavedDefaultModel = "";
 
 // ── My Day Panel ──────────────────────────────────────────────────────────────
 
