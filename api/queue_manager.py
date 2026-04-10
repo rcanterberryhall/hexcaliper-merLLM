@@ -169,7 +169,8 @@ async def _forward(target: str, body: dict) -> tuple[int, bytes, dict]:
 
 
 def queue_depth() -> dict:
-    result: dict = {"total": _queue.qsize(), "gpus": {}}
+    total_in_flight = sum(_gpu_in_flight.values())
+    result: dict = {"total": _queue.qsize(), "in_flight": total_in_flight, "gpus": {}}
     for target, in_flight in _gpu_in_flight.items():
         result["gpus"][target] = {"in_flight": in_flight}
     return result

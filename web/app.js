@@ -241,7 +241,9 @@ function renderOverview(s) {
   // GPU Router card
   set("ov-routing", s.routing || "round_robin");
   set("ov-default-model", s.default_model || "—");
-  set("ov-queue", s.queue ? s.queue.total : "—");
+  const q = s.queue || {};
+  const qTotal = (q.total || 0) + (q.in_flight || 0);
+  set("ov-queue", s.queue ? qTotal : "—");
 
   // Pending model change
   const pendingRow = document.getElementById("ov-pending-model-row");
