@@ -340,7 +340,7 @@
         </p>
         <table style="margin-top:8px;font-size:12px">
           <tr><td><code>1. chat</code></td><td class="muted">Real-time chat tokens to the user. Only this.</td></tr>
-          <tr><td><code>2. reserved</code></td><td class="muted">Empty. Reserved for future use.</td></tr>
+          <tr><td><code>2. embeddings</code></td><td class="muted">Embedding requests. Auto-routed: every <code>/api/embeddings</code> call lands here regardless of <code>X-Priority</code>. Sub-second on <code>nomic-embed-text</code>, so they get out of the way of bulk traffic without starving <code>short</code>.</td></tr>
           <tr><td><code>3. short</code></td><td class="muted">Live scan analyze, situation synthesis during a scan, contacts parsing, on-demand "regenerate" clicks.</td></tr>
           <tr><td><code>4. feedback</code></td><td class="muted">LLM work spawned <em>because</em> a background job produced something that needs timely downstream processing.</td></tr>
           <tr><td><code>5. background</code></td><td class="muted">Bulk: reanalyze items, end-of-run briefings, lancellmot extractor, document upload/indexing.</td></tr>

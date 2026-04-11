@@ -524,15 +524,15 @@ class TestBackup:
 # The refactor introduced a cross-process contract: every LanceLLMot →
 # merLLM and Parsival → merLLM call carries ``X-Source`` and ``X-Priority``
 # headers, and merLLM routes each call into one of five buckets
-# (chat / reserved / short / feedback / background, strict top-down drain).
+# (chat / embeddings / short / feedback / background, strict top-down drain).
 # These tests pin that contract at the integration boundary — unit tests
 # cannot catch a bucket-routing regression because the invariant only
 # exists over the wire.
 #
-# Issues: merLLM#30, squire#34, hexcaliper#18.
+# Issues: merLLM#30, squire#34, hexcaliper#18, merLLM#38 (RESERVED→EMBEDDINGS).
 # ═══════════════════════════════════════════════════════════════════════════
 
-CANONICAL_BUCKETS = ("chat", "reserved", "short", "feedback", "background")
+CANONICAL_BUCKETS = ("chat", "embeddings", "short", "feedback", "background")
 
 
 def _find_queue_entry_by_source(source: str, after: float,
@@ -675,7 +675,7 @@ class TestPriorityBucketContract:
 
     @pytest.mark.parametrize("header_value,expected_bucket", [
         ("chat",        "chat"),
-        ("reserved",    "reserved"),
+        ("embeddings",  "embeddings"),
         ("short",       "short"),
         ("feedback",    "feedback"),
         ("background",  "background"),
@@ -729,6 +729,36 @@ class TestPriorityBucketContract:
             )
         finally:
             t.join(timeout=180)
+
+    def test_embeddings_auto_classify_to_embeddings_bucket(self):
+        """PIN TEST: every /api/embeddings call lands in the embeddings bucket
+        regardless of the X-Priority header the caller sends.
+
+        Embedding traffic is classified by endpoint, not by header — see
+        merLLM#38. We deliberately send ``X-Priority: background`` (the
+        wrong bucket, the one this whole change exists to escape) and
+        assert the proxy overrode it to ``embeddings``.
+        """
+        source = f"integration_embed_{uuid.uuid4().hex[:8]}"
+        t0 = time.time()
+        r = post(
+            MERLLM, "/api/embeddings",
+            json={"model": "nomic-embed-text", "prompt": "auto-classify pin test"},
+            headers={"X-Source": source, "X-Priority": "background"},
+        )
+        assert r.status_code == 200, (
+            f"/api/embeddings failed: {r.status_code} {r.text[:200]}"
+        )
+        entry = _find_queue_entry_by_source(source, after=t0, timeout=15.0)
+        assert entry is not None, (
+            f"no queue entry observed for embeddings source={source!r}"
+        )
+        assert entry["request_type"] == "embeddings"
+        assert entry["priority"] == "embeddings", (
+            f"embeddings call landed in {entry['priority']!r} despite the "
+            "endpoint forcing Priority.EMBEDDINGS — auto-classification "
+            "is broken (merLLM#38)"
+        )
 
     def test_missing_priority_default_is_chat(self):
         """PIN TEST: missing X-Priority currently back-compat-defaults to chat.

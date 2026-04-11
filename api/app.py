@@ -3,7 +3,7 @@ app.py — merLLM: centralized LLM traffic control for the Hexcaliper ecosystem.
 
 Exposes a drop-in Ollama API proxy on :11400. Both LanceLLMot and Parsival
 point their OLLAMA_BASE_URL here. Requests flow through a late-binding GPU
-dispatcher with a 5-bucket strict priority queue (chat > reserved > short >
+dispatcher with a 5-bucket strict priority queue (chat > embeddings > short >
 feedback > background) and per-GPU health tracking — the target GPU is
 chosen only when one actually becomes idle, then drained top-down with
 FIFO inside each bucket.
@@ -253,7 +253,7 @@ def _client_ip(request: Request) -> str:
 def _priority(request: Request) -> queue_manager.Priority:
     """Parse the X-Priority header into one of the five priority buckets.
 
-    Accepts canonical names (``chat`` / ``reserved`` / ``short`` /
+    Accepts canonical names (``chat`` / ``embeddings`` / ``short`` /
     ``feedback`` / ``background``) and the legacy ``interactive`` / ``batch``
     aliases.
 
@@ -261,6 +261,11 @@ def _priority(request: Request) -> queue_manager.Priority:
     clients that predate the header — the same behavior as the old
     two-tier system. Unknown (non-empty) values fall back to ``BACKGROUND``
     so typos cannot silently escalate work to a higher lane.
+
+    Note: ``proxy_embeddings`` ignores this parser entirely and forces
+    ``Priority.EMBEDDINGS`` — embedding traffic is classified by endpoint,
+    not by header, so a missing or wrong ``X-Priority`` from any client
+    cannot route an embed into the wrong bucket.
 
     TODO: once parsival and lancellmot are both sending explicit
     ``X-Priority`` on every call, tighten the missing-header default to
@@ -616,10 +621,17 @@ async def proxy_chat(request: Request):
 
 @app.post("/api/embeddings")
 async def proxy_embeddings(request: Request):
-    """Proxy POST /api/embeddings through the late-binding dispatcher."""
+    """Proxy POST /api/embeddings through the late-binding dispatcher.
+
+    Embedding traffic is auto-classified into ``Priority.EMBEDDINGS`` —
+    the incoming ``X-Priority`` header is intentionally ignored. Embedding
+    requests are sub-second on ``nomic-embed-text`` and have a dedicated
+    bucket so a burst of them never sits behind a 32b chat in the
+    ``background`` lane (see merLLM#38).
+    """
     body = await request.json()
     model = body.get("model", "")
-    priority = _priority(request)
+    priority = queue_manager.Priority.EMBEDDINGS
     source = _source(request)
 
     tid = queue_manager.track_request(source, "embeddings", model, priority)

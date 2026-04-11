@@ -11,7 +11,12 @@ a CPU only at dispatch time.
 Priority buckets
 ────────────────
 1. CHAT       — real-time chat tokens to the user. Only this.
-2. RESERVED   — empty. Reserved for future use.
+2. EMBEDDINGS — embedding requests (auto-routed by app.proxy_embeddings).
+                Sub-second on nomic-embed-text, so they cannot meaningfully
+                starve SHORT and they get out of the way of any interleaved
+                bulk traffic in BACKGROUND. Repurposed from the original
+                RESERVED slot on 2026-04-11 (merLLM#38) after observing
+                lancellmot ingest pile up 20+ embeds behind 32b chats.
 3. SHORT      — parsival short work: live scan analyze, situation synthesis
                 during a scan, contacts parsing, on-demand single-item clicks.
 4. FEEDBACK   — LLM work spawned because a background job produced something
@@ -83,7 +88,7 @@ class Priority(IntEnum):
     order and a bucket only gets a turn when every bucket above it is empty.
     """
     CHAT       = 0   # real-time chat from the user
-    RESERVED   = 1   # empty; reserved for future use
+    EMBEDDINGS = 1   # embedding requests (auto-routed at proxy_embeddings)
     SHORT      = 2   # parsival short foreground work
     FEEDBACK   = 3   # LLM work spawned by background jobs
     BACKGROUND = 4   # bulk: reanalyze, briefings, extractor
@@ -96,7 +101,7 @@ PRIORITY_BATCH       = Priority.BACKGROUND   # old "batch"       → BACKGROUND
 # Canonical name → Priority mapping used by the header parser.
 _PRIORITY_BY_NAME: dict[str, Priority] = {
     "chat":        Priority.CHAT,
-    "reserved":    Priority.RESERVED,
+    "embeddings":  Priority.EMBEDDINGS,
     "short":       Priority.SHORT,
     "feedback":    Priority.FEEDBACK,
     "background":  Priority.BACKGROUND,

@@ -463,11 +463,11 @@ function _fmtElapsed(sec) {
 // Priority bucket ordering — matches the Priority IntEnum in queue_manager.py.
 // The dispatcher drains these strictly top-down: a bucket only gets a turn
 // once every bucket above it is empty.
-const _BUCKET_ORDER = ["chat", "reserved", "short", "feedback", "background"];
+const _BUCKET_ORDER = ["chat", "embeddings", "short", "feedback", "background"];
 
 const _BUCKET_DESCRIPTIONS = {
   chat:       "Real-time chat tokens to the user",
-  reserved:   "Reserved for future use — always empty",
+  embeddings: "Embedding requests (auto-routed by /api/embeddings)",
   short:      "Live scan, situation synthesis, contacts parsing, on-demand clicks",
   feedback:   "LLM work spawned by background jobs",
   background: "Reanalyze items, briefings, extractor, document upload",

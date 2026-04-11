@@ -2,7 +2,7 @@
 
 Centralized LLM traffic control for the Hexcaliper ecosystem.
 
-merLLM sits between LanceLLMot (hexcaliper) and Parsival (hexcaliper-squire) and both GPU-pinned Ollama instances. It round-robins requests across the GPUs, drains a 5-bucket strict-priority queue (chat → reserved → short → feedback → background), persists batch jobs through restarts with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
+merLLM sits between LanceLLMot (hexcaliper) and Parsival (hexcaliper-squire) and both GPU-pinned Ollama instances. It round-robins requests across the GPUs, drains a 5-bucket strict-priority queue (chat → embeddings → short → feedback → background), persists batch jobs through restarts with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
 
 ```
 LanceLLMot  ──┐
@@ -72,12 +72,12 @@ Every request that lands on merLLM is placed in one of five priority buckets. Th
 | # | Bucket       | `X-Priority` value | Intended for |
 |---|--------------|--------------------|--------------|
 | 1 | **chat**       | `chat` (alias: `interactive`) | Real-time human chat. Anything a user is actively waiting on. |
-| 2 | **reserved**   | `reserved`         | Intentionally unused. Room to grow — don't route traffic here. |
+| 2 | **embeddings** | `embeddings` (auto)| Embedding requests. **Auto-classified at the endpoint** — every `/api/embeddings` call lands here regardless of any `X-Priority` header the caller sends. Sub-second on `nomic-embed-text`, so they get out of the way of bulk traffic without meaningfully delaying `short`. Repurposed from the original `reserved` slot in merLLM#38 after observing lancellmot ingest pile up 20+ embeds behind 32b chats in `background`. |
 | 3 | **short**      | `short`            | Short, bounded Parsival work: contacts parsing, extraction, situation summaries. |
 | 4 | **feedback**   | `feedback`         | LLM work *spawned by* background work — e.g. a reanalyze job that needs a follow-up summary. Higher than bucket 5 so long-running batch work can unblock itself without jumping ahead of user-facing work. |
 | 5 | **background** | `background` (alias: `batch`) | Batch analysis, bulk reanalyze, LanceLLMot document ingestion, overnight work. |
 
-**Call-site assignment rule** — each call site picks its bucket once and declares it on every request via the `X-Priority` header. Callers do not get to promote themselves at runtime. If a request has no `X-Priority` header, merLLM currently defaults it to `chat` for back-compat during the rollout; unknown string values fall back to `background` so typos cannot escalate.
+**Call-site assignment rule** — each call site picks its bucket once and declares it on every request via the `X-Priority` header. Callers do not get to promote themselves at runtime. If a request has no `X-Priority` header, merLLM currently defaults it to `chat` for back-compat during the rollout; unknown string values fall back to `background` so typos cannot escalate. The one exception is `/api/embeddings`, which ignores the header entirely and always lands in bucket 2 — embedding traffic is classified by endpoint, not by caller intent.
 
 The dispatcher state is visible on the dashboard's Queue tab (one lane per bucket, with live depth) and machine-readably at `GET /api/merllm/queue`, which includes a `buckets` map keyed by bucket name.
 
@@ -152,7 +152,7 @@ Each chunk resets the caller's between-chunk read-gap timer so a client using `r
 | `POST /api/pull` | GPU 0 (shared store) |
 | `GET /api/ps` | Aggregates loaded models from both instances |
 
-Set `X-Priority: <bucket>` on any proxied request to select a priority bucket (`chat`, `reserved`, `short`, `feedback`, `background`; the legacy values `interactive`/`batch` still work). See [Priority buckets](#priority-buckets) for the full semantics.
+Set `X-Priority: <bucket>` on any proxied request to select a priority bucket (`chat`, `embeddings`, `short`, `feedback`, `background`; the legacy values `interactive`/`batch` still work). The `/api/embeddings` endpoint ignores the header and always routes to the `embeddings` bucket. See [Priority buckets](#priority-buckets) for the full semantics.
 
 **Reasoning-model `num_ctx` normalization** — `proxy_chat` and `proxy_generate` call `_normalize_reasoning_body` on every request, which `setdefault`s `options.num_ctx = 8192` for any `qwen3:*` model whose body omits it. The dispatcher's `gpu_router._reload_model` does the same on every swap warm-load. Without this pin, Ollama auto-fits `num_ctx` to the model's training maximum (32 k for `qwen3:32b`) on a freshly empty 24 GB Tesla P40, forcing CPU offload of the output layer and a split KV cache (~7 GB GPU + ~896 MB CPU) — turning ~330 ms reloads into ~12 s reloads and slowing every subsequent inference. Callers may still pass an explicit `num_ctx` and the proxy will respect it; the normalizer only fills in missing keys. See `feedback_reasoning_model_caps` and merLLM#37 for the incident that motivated this.
 

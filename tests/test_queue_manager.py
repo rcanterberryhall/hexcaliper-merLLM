@@ -70,11 +70,11 @@ def patch_reload(monkeypatch):
 def test_priority_enum_values(qm):
     """Five buckets, CHAT highest, BACKGROUND lowest, strict int ordering."""
     assert qm.Priority.CHAT == 0
-    assert qm.Priority.RESERVED == 1
+    assert qm.Priority.EMBEDDINGS == 1
     assert qm.Priority.SHORT == 2
     assert qm.Priority.FEEDBACK == 3
     assert qm.Priority.BACKGROUND == 4
-    assert qm.Priority.CHAT < qm.Priority.RESERVED < qm.Priority.SHORT \
+    assert qm.Priority.CHAT < qm.Priority.EMBEDDINGS < qm.Priority.SHORT \
         < qm.Priority.FEEDBACK < qm.Priority.BACKGROUND
 
 
@@ -87,7 +87,7 @@ def test_back_compat_priority_aliases(qm):
 
 def test_priority_from_name_canonical(qm):
     assert qm.priority_from_name("chat") == qm.Priority.CHAT
-    assert qm.priority_from_name("reserved") == qm.Priority.RESERVED
+    assert qm.priority_from_name("embeddings") == qm.Priority.EMBEDDINGS
     assert qm.priority_from_name("short") == qm.Priority.SHORT
     assert qm.priority_from_name("feedback") == qm.Priority.FEEDBACK
     assert qm.priority_from_name("background") == qm.Priority.BACKGROUND
@@ -120,7 +120,7 @@ def test_pipe_depth_empty(qm):
     p = qm.pipe_depth()
     # All five buckets, plus back-compat aliases.
     assert p["chat"] == 0
-    assert p["reserved"] == 0
+    assert p["embeddings"] == 0
     assert p["short"] == 0
     assert p["feedback"] == 0
     assert p["background"] == 0
@@ -453,11 +453,12 @@ async def test_interactive_drains_before_batch(qm, patch_reload):
 async def test_strict_priority_drain_top_down(qm, patch_reload):
     """Every bucket drains before any lower bucket dispatches.
 
-    Submit one request in CHAT, SHORT, FEEDBACK, BACKGROUND (RESERVED stays
-    empty, as it does in production). Saturate both GPUs with dummy CHAT
-    requests first. Then release slots one at a time and assert the
-    dispatch order is CHAT → SHORT → FEEDBACK → BACKGROUND regardless of
-    the order the requests were submitted in.
+    Submit one request in CHAT, SHORT, FEEDBACK, BACKGROUND (EMBEDDINGS
+    stays empty for this test — it has dedicated coverage via the
+    proxy_embeddings auto-classification path). Saturate both GPUs with
+    dummy CHAT requests first. Then release slots one at a time and assert
+    the dispatch order is CHAT → SHORT → FEEDBACK → BACKGROUND regardless
+    of the order the requests were submitted in.
     """
     # Saturate both GPUs with holder requests.
     tid_hold_a = qm.track_request("hold_a", "chat", "m", qm.Priority.CHAT)
@@ -485,7 +486,7 @@ async def test_strict_priority_drain_top_down(qm, patch_reload):
 
     depths = qm.pipe_depth()
     assert depths["chat"] == 1
-    assert depths["reserved"] == 0
+    assert depths["embeddings"] == 0
     assert depths["short"] == 1
     assert depths["feedback"] == 1
     assert depths["background"] == 1
