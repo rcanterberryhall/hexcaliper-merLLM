@@ -78,6 +78,18 @@ SLOT_MAX_WALL_SECONDS = int(_get("SLOT_MAX_WALL_SECONDS", "1800"))
 # Watchdog poll interval. Cheap (linear scan over _tracked) so 30s is plenty.
 WATCHDOG_INTERVAL_SECONDS = int(_get("WATCHDOG_INTERVAL_SECONDS", "30"))
 
+# How often the streaming proxy emits a keepalive NDJSON chunk while a
+# request is waiting for a GPU slot. Each chunk resets the caller's
+# between-chunk read-gap timeout, so a client with a modest 60s timeout
+# can ride out a queue wait that exceeds 60s without disconnecting. Must
+# be strictly less than the tightest caller read-gap timeout on the
+# stack — parsival's llm._ollama_local uses 60-90s, so 20s gives a
+# comfortable 3x safety margin. Raising this risks client disconnects;
+# lowering it just wastes a few bytes of traffic per wait.
+QUEUE_HEARTBEAT_INTERVAL_SECONDS = int(
+    _get("QUEUE_HEARTBEAT_INTERVAL_SECONDS", "20")
+)
+
 # Upper-bound httpx read timeout for proxied Ollama requests. Must be >=
 # SLOT_MAX_WALL_SECONDS so the watchdog is the first to fire — the bound
 # httpx timeout is defence-in-depth, not the primary limit. Setting this

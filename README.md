@@ -112,6 +112,7 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 | `SLOT_MAX_WALL_SECONDS` | `1800` | Per-slot wall-clock budget before the watchdog reclaims it |
 | `WATCHDOG_INTERVAL_SECONDS` | `30` | How often the watchdog scans for wedged slots |
 | `PROXY_READ_TIMEOUT_SECONDS` | `1800` | httpx read timeout on every upstream Ollama call |
+| `QUEUE_HEARTBEAT_INTERVAL_SECONDS` | `20` | Interval between queue-wait keepalive NDJSON chunks (see [Transparent wait](#ollama-proxy-api)) |
 
 **Completion notifications** — when a batch job completes (success or final failure), merLLM can notify you via:
 - **Webhook** — set `NOTIFICATION_WEBHOOK_URL` to a Slack incoming webhook, ntfy.sh topic, Gotify URL, or any endpoint accepting JSON POST. Payload includes `job_id`, `source_app`, `status`, timestamps, and a prompt preview.
@@ -138,6 +139,12 @@ merLLM is a drop-in replacement for `OLLAMA_BASE_URL`. All standard endpoints ar
 {"type": "queue_status", "reason": "GPU slot occupied by another request", "estimated_wait_seconds": 30}
 ```
 LanceLLMot and Parsival recognise this event and display a waiting indicator with the reason.
+
+If the wait exceeds `QUEUE_HEARTBEAT_INTERVAL_SECONDS` (default `20`), the streaming proxy emits periodic keepalive chunks:
+```json
+{"type": "queue_status", "waiting": true, "elapsed_seconds": 20}
+```
+Each chunk resets the caller's between-chunk read-gap timer so a client using `requests.post(timeout=60, stream=True)` (parsival's `_ollama_local`) can ride out a multi-minute background-drain wait without disconnecting. Keep this interval strictly less than the tightest caller timeout on the stack — parsival uses 60–90 s, so the default 20 s gives a 3× safety margin. Ollama's stream consumer ignores unknown JSON fields, so these keepalive lines are transparent to downstream parsers.
 
 | Endpoint | Notes |
 |---|---|

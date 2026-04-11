@@ -167,6 +167,78 @@ def test_queue_status_emitted_when_slot_busy(tmp_path, monkeypatch):
     assert qs.get("estimated_wait_seconds") is not None
 
 
+# ── queue-wait heartbeat ──────────────────────────────────────────────────────
+
+
+def test_queue_wait_emits_heartbeats_during_long_wait(tmp_path, monkeypatch):
+    """During a queue wait longer than QUEUE_HEARTBEAT_INTERVAL_SECONDS, the
+    streaming proxy must emit periodic keepalive NDJSON chunks so a caller
+    with a between-chunk read-gap timeout shorter than the wait does not
+    disconnect.
+
+    Regression: 2026-04-11 feedback-slot wedge. parsival's
+    ``requests.post(timeout=60, stream=True)`` was tripping its read-gap
+    timer during BACKGROUND-drain queue waits because merllm emitted a
+    single ``queue_status`` line at t=0 and then nothing until the slot
+    was popped. The downstream consequence was a GeneratorExit at
+    ``await wait_for_dispatch`` that leaked the pending entry and wedged
+    the GPU slot via a dead waiter.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
+    monkeypatch.setenv("QUEUE_HEARTBEAT_INTERVAL_SECONDS", "1")
+    monkeypatch.setenv("INTERACTIVE_QUEUE_TIMEOUT", "30")
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
+            sys.modules.pop(mod, None)
+
+    import queue_manager as qm
+    import config
+    import app as app_mod
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(qm, "gpu_slot_busy", lambda t: True)
+
+    target = config.OLLAMA_0_URL
+
+    async def _slow_dispatch(tid):
+        # Sleep long enough that at least two heartbeat intervals elapse
+        # before the dispatcher resolves.
+        await asyncio.sleep(2.5)
+        entry = qm._tracked.get(tid)
+        if entry is not None:
+            entry.target = target
+            entry.status = "running"
+        return target
+
+    monkeypatch.setattr(qm, "wait_for_dispatch", _slow_dispatch)
+    monkeypatch.setattr(qm, "release", lambda tid=None: None)
+    monkeypatch.setattr(qm, "cancel_tracked", lambda tid, reason="": None)
+
+    done_chunk = json.dumps({"done": True, "prompt_eval_count": 5}).encode() + b"\n"
+    monkeypatch.setattr(app_mod.httpx, "AsyncClient",
+                        _make_stream_client(done_chunk))
+
+    client = TestClient(app_mod.app, raise_server_exceptions=True)
+    resp = client.post("/api/generate",
+                       json={"model": "test", "prompt": "hi", "stream": True})
+
+    assert resp.status_code == 200
+    lines = _ndjson_lines(resp.content)
+    heartbeats = [l for l in lines
+                  if l.get("type") == "queue_status" and l.get("waiting") is True]
+    assert len(heartbeats) >= 2, (
+        f"Expected ≥2 waiting heartbeats during a 2.5s wait with 1s "
+        f"interval, got {len(heartbeats)}: {lines}"
+    )
+    # Each heartbeat must expose elapsed_seconds so a debug UI can render
+    # a growing wait indicator.
+    assert all("elapsed_seconds" in h for h in heartbeats)
+    # Heartbeat elapsed_seconds must be monotonically non-decreasing.
+    elapsed = [h["elapsed_seconds"] for h in heartbeats]
+    assert elapsed == sorted(elapsed), f"heartbeats not monotonic: {elapsed}"
+
+
 # ── batch queue_position ──────────────────────────────────────────────────────
 
 

@@ -374,6 +374,7 @@ async def _queued_stream(path: str, body: dict,
     async def generate():
         released = False
         slot_already_terminal = False
+        dispatch_task: Optional[asyncio.Task] = None
         try:
             # If the system is saturated, tell the caller before we start waiting.
             if _any_gpu_busy():
@@ -383,8 +384,33 @@ async def _queued_stream(path: str, body: dict,
                     "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
                 }).encode() + b"\n"
 
+            # Run wait_for_dispatch as a task so we can emit keepalive chunks
+            # while it blocks. Each heartbeat resets the caller's between-chunk
+            # read-gap timeout: parsival's requests.post(timeout=60) would
+            # otherwise trip before the slot is popped when a BACKGROUND drain
+            # pushes the feedback wait past 60 s, and the 2026-04-11 wedge was
+            # the downstream consequence of that disconnect pattern. Keepalive
+            # NDJSON lines carry no ``response``/``thinking`` tokens so
+            # ``llm._collect_stream`` silently drops them — no caller change
+            # required.
+            dispatch_task = asyncio.create_task(
+                queue_manager.wait_for_dispatch(tracking_id)
+            )
+            waiting_since = time.time()
             try:
-                target = await queue_manager.wait_for_dispatch(tracking_id)
+                while True:
+                    done, _ = await asyncio.wait(
+                        {dispatch_task},
+                        timeout=config.QUEUE_HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    if dispatch_task in done:
+                        break
+                    yield json.dumps({
+                        "type":             "queue_status",
+                        "waiting":          True,
+                        "elapsed_seconds":  int(time.time() - waiting_since),
+                    }).encode() + b"\n"
+                target = dispatch_task.result()
             except queue_manager.DispatchTimeout:
                 # wait_for_dispatch already marked the entry failed and
                 # removed it from its bucket, so the outer finally must
@@ -408,6 +434,11 @@ async def _queued_stream(path: str, body: dict,
             async for chunk in _generate_stream(target, path, body, _on_done):
                 yield chunk
         finally:
+            # Cancel a still-pending dispatch task before touching the queue
+            # so wait_for_dispatch unwinds cleanly. cancel_tracked below
+            # handles whichever in-flight state the entry ended up in.
+            if dispatch_task is not None and not dispatch_task.done():
+                dispatch_task.cancel()
             # Guaranteed cleanup: if _on_done never fired (client disconnect,
             # exception between dispatch and streaming, GeneratorExit during
             # an await, etc.) the slot still needs to be released.
