@@ -184,10 +184,18 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("Ollama %s unreachable at startup: %s", name, exc)
 
-    # Recover any jobs that were running when the process was last killed
+    # Recover any jobs that were running when the process was last killed.
+    # ``requeue_orphaned_jobs`` only resets DB status; we also have to
+    # re-enqueue an async task for each one or they sit queued forever
+    # (the in-memory ``_run_batch_job_async`` future is process-local).
     recovered = db.requeue_orphaned_jobs()
     if recovered:
         log.info("recovered %d orphaned job(s) → queued", recovered)
+    pending = db.list_batch_jobs(status="queued")
+    for job in pending:
+        asyncio.ensure_future(queue_manager._run_batch_job_async(job["id"]))
+    if pending:
+        log.info("re-enqueued %d queued batch job(s) for processing", len(pending))
 
     # Wire queue-change notifications into the activity SSE stream
     queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
@@ -279,7 +287,12 @@ async def _generate_stream(target: str, path: str, body: dict, on_done=None):
     """
     buf = b""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+        # Bounded read timeout (defence-in-depth behind the queue watchdog)
+        # so a hung Ollama stream cannot pin a slot forever — see
+        # queue_manager._watchdog_loop for the primary deadlock guard.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
+        ) as client:
             async with client.stream("POST", f"{target}{path}", json=body) as resp:
                 async for chunk in resp.aiter_bytes():
                     buf += chunk
@@ -372,7 +385,9 @@ async def _proxy(target: str, path: str, body: dict) -> Response:
     model = body.get("model", "")
     _activity_set(target, model, path)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
+        ) as client:
             resp = await client.post(f"{target}{path}", json=body)
         return Response(content=resp.content,
                         media_type=resp.headers.get("content-type", "application/json"),
@@ -814,6 +829,9 @@ async def batch_requeue(job_id: str):
     ok = db.requeue_batch_job(job_id)
     if not ok:
         raise HTTPException(status_code=409, detail="Only failed jobs can be requeued")
+    # Re-enqueue the async task: ``requeue_batch_job`` only updates DB status,
+    # so without this the requeued job would sit in the queue forever.
+    asyncio.ensure_future(queue_manager._run_batch_job_async(job_id))
     return {"ok": True}
 
 

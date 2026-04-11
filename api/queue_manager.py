@@ -160,6 +160,7 @@ _buckets: list[deque["_PendingRequest"]] = [deque() for _ in Priority]
 _gpu_busy: dict[str, bool] = {}
 _state_changed: Optional[asyncio.Event] = None
 _dispatcher_task: Optional[asyncio.Task] = None
+_watchdog_task: Optional[asyncio.Task] = None
 
 # Callback notified on every track/start/complete/fail so the SSE layer can
 # push updates.  Set by app.py at startup.
@@ -179,12 +180,12 @@ def _ensure_gpu_state() -> None:
 
 def _ensure_dispatcher() -> None:
     """
-    Start the dispatcher loop lazily on first use.
+    Start the dispatcher and watchdog loops lazily on first use.
 
     Called from ``track_request`` so both the app lifespan and tests pick up
     the dispatcher without extra wiring.  Safe to call repeatedly.
     """
-    global _state_changed, _dispatcher_task
+    global _state_changed, _dispatcher_task, _watchdog_task
     _ensure_gpu_state()
     try:
         loop = asyncio.get_running_loop()
@@ -195,6 +196,8 @@ def _ensure_dispatcher() -> None:
         _state_changed = asyncio.Event()
     if _dispatcher_task is None or _dispatcher_task.done():
         _dispatcher_task = loop.create_task(_dispatcher_loop())
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = loop.create_task(_watchdog_loop())
 
 
 def gpu_slot_busy(target: str) -> bool:
@@ -527,6 +530,55 @@ async def _dispatch(req: _PendingRequest, target: str) -> None:
         _wake_dispatcher()
 
 
+async def _watchdog_loop() -> None:
+    """
+    Reclaim wedged slots whose dispatched request has exceeded its
+    wall-clock budget.
+
+    Background: a downstream Ollama call can hang in ways the proxy
+    layer cannot detect (half-open socket, model unloaded mid-stream,
+    upstream silently dropping the connection). When that happens
+    ``release()`` is never called and the slot stays "running" forever,
+    blocking strict-priority dispatch — the queue deadlocks even though
+    no actual GPU work is in flight. The 2026-04-10 parsival re-analysis
+    incident wedged both GPUs this way for ~13 minutes with 295 batch
+    jobs queued behind two zombie ``feedback`` entries.
+
+    The watchdog scans tracked entries on a fixed interval and force-fails
+    any that have been ``running`` longer than ``SLOT_MAX_WALL_SECONDS``.
+    ``fail_request()`` releases the GPU slot and wakes the dispatcher so
+    queued work can finally make progress. The slot is the unit reclaimed,
+    not the upstream request — if Ollama eventually responds, the proxy
+    coroutine will discover the entry is gone and quietly no-op.
+    """
+    while True:
+        try:
+            await asyncio.sleep(config.WATCHDOG_INTERVAL_SECONDS)
+            now = time.time()
+            wedged: list[tuple[str, float]] = []
+            for tid, entry in list(_tracked.items()):
+                if entry.status != "running" or entry.started_at is None:
+                    continue
+                age = now - entry.started_at
+                if age > config.SLOT_MAX_WALL_SECONDS:
+                    wedged.append((tid, age))
+            for tid, age in wedged:
+                log.warning(
+                    "watchdog: reclaiming wedged slot %s (age=%.0fs > budget=%ds)",
+                    tid[:8], age, config.SLOT_MAX_WALL_SECONDS,
+                )
+                fail_request(
+                    tid,
+                    f"Watchdog reclaimed slot after {age:.0f}s "
+                    f"exceeded {config.SLOT_MAX_WALL_SECONDS}s budget",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watchdog loop iteration failed — continuing")
+            await asyncio.sleep(1.0)
+
+
 async def _dispatcher_loop() -> None:
     """
     Central dispatch loop: wakes on every relevant state change (new
@@ -694,7 +746,13 @@ async def _run_batch_job_async(job_id: str) -> None:
         target = await wait_for_dispatch(tracking_id)
         _app._activity_set(target, job["model"], "/api/generate")
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+            # Bounded read timeout: defence-in-depth behind the watchdog.
+            # If the watchdog has already reclaimed the slot, this still
+            # eventually unblocks the coroutine instead of leaking the
+            # httpx connection forever.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
+            ) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
                 resp.raise_for_status()
                 result_text = resp.json().get("response", "")

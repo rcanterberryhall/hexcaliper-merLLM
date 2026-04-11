@@ -19,10 +19,15 @@ def reset_queue(tmp_path, monkeypatch):
                    "metrics", "notifications"):
             sys.modules.pop(mod, None)
     yield
-    # Cancel any background dispatcher task before tearing down the module.
+    # Cancel any background dispatcher and watchdog tasks before tearing
+    # down the module.
     qm = sys.modules.get("queue_manager")
-    if qm is not None and getattr(qm, "_dispatcher_task", None):
-        task = qm._dispatcher_task
+    for attr in ("_dispatcher_task", "_watchdog_task"):
+        if qm is None:
+            break
+        task = getattr(qm, attr, None)
+        if task is None:
+            continue
         try:
             if not task.done():
                 task.cancel()
@@ -211,6 +216,45 @@ async def test_fail_request_frees_gpu(qm, patch_reload):
     assert entry["status"] == "failed"
     assert entry["error"] == "Ollama OOM"
     assert qm.gpu_slot_busy(target) is False
+
+
+@pytest.mark.asyncio
+async def test_watchdog_reclaims_wedged_slot(qm, monkeypatch, patch_reload):
+    """A dispatched request that exceeds SLOT_MAX_WALL_SECONDS is force-failed
+    by the watchdog so the GPU slot returns to the idle pool.
+
+    Regression: 2026-04-10 incident where two parsival ``feedback`` entries
+    pinned both GPUs for ~13 minutes — Ollama showed no models loaded and
+    no actual work was running, but ``release()`` was never called and
+    the strict-priority dispatcher refused to dispatch the 295 background
+    batches queued behind them. The watchdog now reclaims such slots.
+    """
+    import config
+    monkeypatch.setattr(config, "SLOT_MAX_WALL_SECONDS", 1)
+    monkeypatch.setattr(config, "WATCHDOG_INTERVAL_SECONDS", 1)
+
+    tid = qm.track_request("parsival", "chat", "qwen3:32b",
+                           qm.Priority.FEEDBACK)
+    target = await qm.wait_for_dispatch(tid)
+    assert qm.gpu_slot_busy(target) is True
+
+    # Backdate started_at so the watchdog sees the slot as exceeding budget.
+    qm._tracked[tid].started_at = time.time() - 5
+
+    # Wait long enough for one watchdog tick.
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if not qm.gpu_slot_busy(target):
+            break
+
+    entry = qm._tracked.get(tid) or next(
+        (e for e in qm.active_queue() if e["id"] == tid), None
+    )
+    assert qm.gpu_slot_busy(target) is False, "watchdog must release the GPU"
+    if entry is not None:
+        # Entry may still be present briefly before _remove_tracked fires.
+        status = entry["status"] if isinstance(entry, dict) else entry.status
+        assert status == "failed"
 
 
 @pytest.mark.asyncio

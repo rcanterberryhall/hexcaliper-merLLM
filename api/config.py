@@ -67,6 +67,23 @@ GPU_MAX_CONCURRENT = int(_get("GPU_MAX_CONCURRENT", "1"))
 # Default 20s is calibrated for qwen3:32b (~19 GB Q4_K_M) on a Tesla P40.
 MODEL_SWAP_COST_SECONDS = int(_get("MODEL_SWAP_COST_SECONDS", "20"))
 
+# Maximum wall-clock seconds a single dispatched request may hold its GPU
+# slot. After this, the watchdog force-fails the entry and frees the slot
+# so the queue cannot deadlock on a hung downstream call. Sized for the
+# slowest legitimate batch on a P40 (qwen3:32b reasoning at ~3 tok/s with
+# the largest num_predict any caller currently sends — 1024 tokens — plus
+# headroom). Tune up only if a legitimate caller hits the wall.
+SLOT_MAX_WALL_SECONDS = int(_get("SLOT_MAX_WALL_SECONDS", "1800"))
+
+# Watchdog poll interval. Cheap (linear scan over _tracked) so 30s is plenty.
+WATCHDOG_INTERVAL_SECONDS = int(_get("WATCHDOG_INTERVAL_SECONDS", "30"))
+
+# Upper-bound httpx read timeout for proxied Ollama requests. Must be >=
+# SLOT_MAX_WALL_SECONDS so the watchdog is the first to fire — the bound
+# httpx timeout is defence-in-depth, not the primary limit. Setting this
+# to None reproduces the original deadlock; do not.
+PROXY_READ_TIMEOUT_SECONDS = int(_get("PROXY_READ_TIMEOUT_SECONDS", "1800"))
+
 # ── API server ────────────────────────────────────────────────────────────────
 
 PORT     = int(_get("PORT",     "11400"))
