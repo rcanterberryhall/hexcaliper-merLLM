@@ -258,6 +258,91 @@ async def test_watchdog_reclaims_wedged_slot(qm, monkeypatch, patch_reload):
 
 
 @pytest.mark.asyncio
+async def test_cancel_tracked_removes_pending_waiter(qm, patch_reload):
+    """A ``queued`` entry that has not yet been dispatched is pulled out
+    of its bucket, its future resolved with an exception, and the entry
+    is marked ``failed`` — so the dispatcher can never later pop a dead
+    waiter and wedge a GPU slot.
+
+    Regression: 2026-04-11 feedback-slot wedge.  A parsival ``feedback``
+    caller timed out at 60 s while its ``_PendingRequest`` was still in
+    the bucket. Starlette closed the proxy's async generator, which
+    threw ``GeneratorExit`` at ``await wait_for_dispatch`` — but the
+    generator had no ``finally`` so the pending entry stayed in the
+    bucket. The dispatcher eventually popped it, marked ``_gpu_busy``,
+    and no ``release`` ever fired.  This test enforces the contract
+    the new ``finally`` relies on.
+    """
+    # Saturate both GPUs so the feedback entry must wait.
+    busy_a = qm.track_request("a", "chat", "m", qm.Priority.CHAT)
+    busy_b = qm.track_request("b", "chat", "m", qm.Priority.CHAT)
+    await qm.wait_for_dispatch(busy_a)
+    await qm.wait_for_dispatch(busy_b)
+
+    tid = qm.track_request("parsival", "generate", "qwen3:32b",
+                           qm.Priority.FEEDBACK)
+    waiter = asyncio.create_task(qm.wait_for_dispatch(tid))
+    await asyncio.sleep(0.05)  # let the waiter register in its bucket
+    assert not waiter.done()
+    assert qm.pipe_depth()["feedback"] == 1
+
+    qm.cancel_tracked(tid, reason="client_disconnect")
+
+    # The waiter's future must raise, not just hang forever, so the
+    # handler's finally runs on both ends of the dispatcher.
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+    assert qm.pipe_depth()["feedback"] == 0
+    entry = next((e for e in qm.active_queue() if e["id"] == tid), None)
+    if entry is not None:
+        assert entry["status"] == "failed"
+        assert entry["error"] == "client_disconnect"
+
+    # Critical invariant: releasing one of the saturating slots must not
+    # hand it off to the cancelled (dead) waiter.
+    qm.release(busy_a)
+    await asyncio.sleep(0.05)
+    # The dispatcher has nothing feedback-priority to pick up now.
+    assert qm.pipe_depth()["feedback"] == 0
+
+    qm.release(busy_b)
+
+
+@pytest.mark.asyncio
+async def test_cancel_tracked_releases_running_slot(qm, patch_reload):
+    """A ``running`` entry routed through ``cancel_tracked`` releases its
+    GPU slot via ``fail_request``. Covers the ``_queued_stream`` finally's
+    handling of the race where ``_dispatch`` fires after the generator
+    is already being closed by the client."""
+    tid = qm.track_request("parsival", "generate", "qwen3:32b",
+                           qm.Priority.FEEDBACK)
+    target = await qm.wait_for_dispatch(tid)
+    assert qm.gpu_slot_busy(target) is True
+
+    qm.cancel_tracked(tid, reason="client_disconnect_or_error")
+
+    assert qm.gpu_slot_busy(target) is False
+    entry = next((e for e in qm.active_queue() if e["id"] == tid), None)
+    if entry is not None:
+        assert entry["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_tracked_is_idempotent_on_terminal(qm, patch_reload):
+    """Calling ``cancel_tracked`` on a completed or unknown tid is a
+    no-op — finally blocks must be able to call it unconditionally."""
+    tid = qm.track_request("parsival", "chat", "m", qm.Priority.CHAT)
+    target = await qm.wait_for_dispatch(tid)
+    qm.release(tid)
+    # Completed entries are scheduled for removal but may still be present.
+    qm.cancel_tracked(tid, reason="safe_noop")
+    qm.cancel_tracked("never-existed-uuid", reason="safe_noop")
+    # GPU must still be idle after these no-ops.
+    assert qm.gpu_slot_busy(target) is False
+
+
+@pytest.mark.asyncio
 async def test_two_gpus_dispatched_independently(qm, gpu_urls, patch_reload):
     """Two requests can run concurrently — one per GPU."""
     tid_a = qm.track_request("a", "chat", "m", qm.PRIORITY_INTERACTIVE)

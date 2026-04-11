@@ -348,34 +348,74 @@ async def _queued_stream(path: str, body: dict,
     Emits a ``queue_status`` NDJSON line if no GPU is immediately available,
     then awaits dispatch, then streams the Ollama response.  The assigned
     target URL is determined by the dispatcher at dispatch time.
+
+    Cleanup contract
+    ────────────────
+    The outer ``try/finally`` block guarantees the slot is always released
+    regardless of how the generator exits:
+
+      - normal completion: ``released`` is flipped True inside the stream's
+        ``_on_done`` callback and finally is a no-op.
+      - client disconnect (``GeneratorExit`` thrown into a pending ``await``
+        or ``yield``): finally runs ``queue_manager.cancel_tracked``, which
+        handles both the "still in pending bucket" and the "dispatch handoff
+        already happened" races safely.
+      - ``DispatchTimeout``: finally is a no-op because
+        ``wait_for_dispatch`` already cleaned the pending entry itself.
+      - any other exception: finally runs ``cancel_tracked`` and re-raises.
+
+    Before this wrapper existed, a client disconnect during the wait would
+    leave the ``_PendingRequest`` in its bucket; the dispatcher would later
+    pop a dead waiter, flip ``_gpu_busy[target] = True`` and mark the entry
+    ``running`` — but no httpx call was ever issued and no ``release`` fired,
+    wedging the GPU slot until the 1800 s watchdog reclaimed it.  See
+    queue_manager.cancel_tracked() for the idempotent cleanup helper.
     """
     async def generate():
-        # If the system is saturated, tell the caller before we start waiting.
-        if _any_gpu_busy():
-            yield json.dumps({
-                "type":                    "queue_status",
-                "reason":                  "all GPU slots occupied — queued for dispatch",
-                "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
-            }).encode() + b"\n"
-
+        released = False
+        slot_already_terminal = False
         try:
-            target = await queue_manager.wait_for_dispatch(tracking_id)
-        except queue_manager.DispatchTimeout:
-            yield json.dumps({
-                "error": "GPU busy — timed out waiting for slot",
-                "done":  True,
-            }).encode() + b"\n"
-            return
+            # If the system is saturated, tell the caller before we start waiting.
+            if _any_gpu_busy():
+                yield json.dumps({
+                    "type":                    "queue_status",
+                    "reason":                  "all GPU slots occupied — queued for dispatch",
+                    "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
+                }).encode() + b"\n"
 
-        _activity_set(target, body.get("model", ""), path)
+            try:
+                target = await queue_manager.wait_for_dispatch(tracking_id)
+            except queue_manager.DispatchTimeout:
+                # wait_for_dispatch already marked the entry failed and
+                # removed it from its bucket, so the outer finally must
+                # not try to cancel it again.
+                slot_already_terminal = True
+                yield json.dumps({
+                    "error": "GPU busy — timed out waiting for slot",
+                    "done":  True,
+                }).encode() + b"\n"
+                return
 
-        _tid = tracking_id
-        def _on_done():
-            _activity_clear(target)
-            queue_manager.release(_tid)
+            _activity_set(target, body.get("model", ""), path)
 
-        async for chunk in _generate_stream(target, path, body, _on_done):
-            yield chunk
+            _tid = tracking_id
+            def _on_done():
+                nonlocal released
+                _activity_clear(target)
+                queue_manager.release(_tid)
+                released = True
+
+            async for chunk in _generate_stream(target, path, body, _on_done):
+                yield chunk
+        finally:
+            # Guaranteed cleanup: if _on_done never fired (client disconnect,
+            # exception between dispatch and streaming, GeneratorExit during
+            # an await, etc.) the slot still needs to be released.
+            # cancel_tracked is idempotent and handles every in-flight state.
+            if not released and not slot_already_terminal:
+                queue_manager.cancel_tracked(
+                    tracking_id, reason="client_disconnect_or_error"
+                )
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -418,6 +458,50 @@ def _dispatch_timeout_response() -> JSONResponse:
     )
 
 
+async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
+    """
+    Shared non-streaming proxy with leak-safe cleanup for every exit path.
+
+    The outer ``try/finally`` flips ``released`` only on the happy path
+    (release already called), so the finally falls through to
+    ``cancel_tracked`` for *any* other exit: a ``CancelledError`` thrown
+    into ``wait_for_dispatch`` when the client hangs up, an httpx error,
+    a ``DispatchTimeout``, or a plain unexpected exception.
+
+    Without this guard, a client disconnect during the pre-dispatch wait
+    left the ``_PendingRequest`` in its bucket; the dispatcher would then
+    pop a dead waiter and wedge the GPU slot until the watchdog fired
+    1800 s later. See ``queue_manager.cancel_tracked`` for the idempotent
+    helper that handles every in-flight state.
+    """
+    released = False
+    try:
+        try:
+            target = await queue_manager.wait_for_dispatch(tid)
+        except queue_manager.DispatchTimeout:
+            # wait_for_dispatch already marked the tracked entry failed
+            # and removed it from its bucket — suppress the outer cancel.
+            released = True
+            return _dispatch_timeout_response()
+        try:
+            resp = await _proxy(target, path, body)
+            gpu_router.record_activity(target)
+            return resp
+        except Exception as exc:
+            queue_manager.fail_request(tid, str(exc))
+            released = True
+            raise
+        finally:
+            if not released:
+                queue_manager.release(tid)
+                released = True
+    finally:
+        if not released:
+            queue_manager.cancel_tracked(
+                tid, reason="client_disconnect_or_error"
+            )
+
+
 @app.post("/api/generate")
 async def proxy_generate(request: Request):
     """Proxy POST /api/generate through the late-binding dispatcher."""
@@ -431,20 +515,7 @@ async def proxy_generate(request: Request):
 
     if stream:
         return await _queued_stream("/api/generate", body, tid)
-
-    try:
-        target = await queue_manager.wait_for_dispatch(tid)
-    except queue_manager.DispatchTimeout:
-        return _dispatch_timeout_response()
-    try:
-        resp = await _proxy(target, "/api/generate", body)
-        gpu_router.record_activity(target)
-        return resp
-    except Exception as exc:
-        queue_manager.fail_request(tid, str(exc))
-        raise
-    finally:
-        queue_manager.release(tid)
+    return await _proxy_nonstream("/api/generate", body, tid)
 
 
 @app.post("/api/chat")
@@ -460,20 +531,7 @@ async def proxy_chat(request: Request):
 
     if stream:
         return await _queued_stream("/api/chat", body, tid)
-
-    try:
-        target = await queue_manager.wait_for_dispatch(tid)
-    except queue_manager.DispatchTimeout:
-        return _dispatch_timeout_response()
-    try:
-        resp = await _proxy(target, "/api/chat", body)
-        gpu_router.record_activity(target)
-        return resp
-    except Exception as exc:
-        queue_manager.fail_request(tid, str(exc))
-        raise
-    finally:
-        queue_manager.release(tid)
+    return await _proxy_nonstream("/api/chat", body, tid)
 
 
 @app.post("/api/embeddings")
@@ -485,20 +543,7 @@ async def proxy_embeddings(request: Request):
     source = _source(request)
 
     tid = queue_manager.track_request(source, "embeddings", model, priority)
-
-    try:
-        target = await queue_manager.wait_for_dispatch(tid)
-    except queue_manager.DispatchTimeout:
-        return _dispatch_timeout_response()
-    try:
-        resp = await _proxy(target, "/api/embeddings", body)
-        gpu_router.record_activity(target)
-        return resp
-    except Exception as exc:
-        queue_manager.fail_request(tid, str(exc))
-        raise
-    finally:
-        queue_manager.release(tid)
+    return await _proxy_nonstream("/api/embeddings", body, tid)
 
 
 @app.get("/api/tags")

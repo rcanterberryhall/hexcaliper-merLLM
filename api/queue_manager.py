@@ -406,6 +406,75 @@ def _remove_tracked(tracking_id: str) -> None:
     _notify_change()
 
 
+def cancel_tracked(tracking_id: str, reason: str = "cancelled") -> None:
+    """
+    Idempotent cleanup for a tracked request that exited abnormally.
+
+    Handles three cases safely, so a proxy-handler ``finally`` block can call
+    this without knowing which state the request is in:
+
+    1. **Still in a priority bucket** (``status == "queued"``): removes the
+       ``_PendingRequest`` from the bucket, resolves its future with an
+       exception so any concurrent waiter unblocks, and marks the tracked
+       entry ``failed``. Prevents the dispatcher from later popping a dead
+       waiter and wasting a GPU slot — the original bug behind the
+       2026-04-11 feedback-slot wedge.
+    2. **Already running** (``status == "running"``): delegates to
+       ``fail_request`` which releases ``_gpu_busy[target]`` and wakes the
+       dispatcher. The same path is safe against a normal ``release`` that
+       happens to race.
+    3. **Already terminal / already removed**: no-op.
+
+    Call this from every proxy-handler ``finally`` block so that whether the
+    exit path is a normal completion, an upstream error, a client disconnect
+    (``GeneratorExit`` into a pending ``await``), or an unexpected exception,
+    the slot always returns to the idle pool.
+    """
+    entry = _tracked.get(tracking_id)
+    if entry is None:
+        return
+
+    if entry.status == "queued":
+        # Still waiting in a bucket — pull the pending entry out and
+        # resolve its future so any concurrent awaiter unwinds cleanly.
+        for bucket in _buckets:
+            for i, p in enumerate(bucket):
+                if p.tid == tracking_id:
+                    del bucket[i]
+                    if not p.future.done():
+                        p.future.set_exception(
+                            RuntimeError(f"request cancelled: {reason}")
+                        )
+                    break
+        entry.status = "failed"
+        entry.error = reason
+        entry.completed_at = time.time()
+        dispatch_log.info(
+            "[dispatch] cancel tid=%s state=queued reason=%s",
+            tracking_id[:8], reason,
+        )
+        _notify_change()
+        _wake_dispatcher(reason="cancel")
+        if entry.batch_job_id is None:
+            try:
+                asyncio.get_running_loop().call_later(10, _remove_tracked, tracking_id)
+            except RuntimeError:
+                _remove_tracked(tracking_id)
+        return
+
+    if entry.status == "running":
+        # Slot is already assigned — route through fail_request so the
+        # GPU is released and the dispatcher wakes.
+        dispatch_log.info(
+            "[dispatch] cancel tid=%s state=running reason=%s",
+            tracking_id[:8], reason,
+        )
+        fail_request(tracking_id, reason)
+        return
+
+    # terminal (completed/failed) — nothing to do.
+
+
 def clear_tracker(force: bool = False) -> dict:
     """
     Drop entries from the in-memory tracker to restore a known baseline.
