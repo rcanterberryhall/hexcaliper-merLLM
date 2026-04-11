@@ -361,6 +361,76 @@ def _remove_tracked(tracking_id: str) -> None:
     _notify_change()
 
 
+def clear_tracker(force: bool = False) -> dict:
+    """
+    Drop entries from the in-memory tracker to restore a known baseline.
+
+    Default behaviour (safe):
+        Only entries with status in {"completed", "failed"} are removed.
+        In-flight work (``queued`` / ``running``) is left untouched.
+        Batch-job-backed entries that would normally stay visible forever
+        (see ``release`` line 327) are cleared.
+
+    ``force=True`` (unsafe — breaks in-flight requests):
+        Also cancels every queued waiter (their ``_PendingRequest.future``
+        is resolved with an exception so ``wait_for_dispatch`` raises and
+        the client gets an error), and marks every running entry as
+        ``failed``, releasing its GPU back to the idle pool. Any outbound
+        HTTP request currently held by the dispatcher is *not* cancelled
+        at the socket level — the httpx client keeps running until the
+        upstream Ollama responds — but the tracker will no longer reflect
+        it, so a subsequent ``release`` or ``fail_request`` becomes a
+        no-op. Use only for admin reset or integration-test setup; a
+        misfire during normal traffic will leak GPU accounting until the
+        orphaned request completes.
+
+    Returns a dict with per-status removal counts, e.g.::
+
+        {"completed": 12, "failed": 0, "queued": 0, "running": 0}
+    """
+    removed = {"completed": 0, "failed": 0, "queued": 0, "running": 0}
+
+    # Step 1: always drop terminal entries.
+    for tid in [tid for tid, e in _tracked.items()
+                if e.status in ("completed", "failed")]:
+        removed[_tracked[tid].status] += 1
+        _tracked.pop(tid, None)
+
+    if not force:
+        _notify_change()
+        return removed
+
+    # Step 2: force-clear queued entries. Resolve their pending futures
+    # with a RuntimeError so wait_for_dispatch raises and the client path
+    # unwinds cleanly.
+    for bucket in _buckets:
+        while bucket:
+            pending = bucket.popleft()
+            if not pending.future.done():
+                pending.future.set_exception(
+                    RuntimeError("queue cleared by admin force-reset")
+                )
+            entry = _tracked.pop(pending.tid, None)
+            if entry is not None:
+                removed["queued"] += 1
+
+    # Step 3: force-clear running entries. Mark them failed, release
+    # their GPU so the dispatcher can reuse it, drop from _tracked.
+    # The in-flight httpx request still runs to completion upstream;
+    # release()/fail_request() called by that path will no-op because
+    # the entry is gone.
+    for tid in [tid for tid, e in _tracked.items() if e.status == "running"]:
+        entry = _tracked[tid]
+        if entry.target is not None:
+            _gpu_busy[entry.target] = False
+        removed["running"] += 1
+        _tracked.pop(tid, None)
+
+    _notify_change()
+    _wake_dispatcher()
+    return removed
+
+
 # ── Dispatcher core ──────────────────────────────────────────────────────────
 
 

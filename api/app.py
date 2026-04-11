@@ -586,6 +586,29 @@ async def merllm_queue():
     }
 
 
+@app.post("/api/merllm/queue/clear")
+async def merllm_queue_clear(force: bool = False):
+    """
+    Admin/test-only: drop entries from the in-memory queue tracker so the
+    next observation starts from a known baseline.
+
+    Not linked from any UI. Intended for integration-test setup and manual
+    operator reset. There is no auth on this endpoint — merllm-api is only
+    reachable from the host network and from sibling containers.
+
+    :param force: If false (default), only ``completed`` and ``failed``
+        entries are removed — safe, does not disturb in-flight work. If
+        true, queued waiters are cancelled with a RuntimeError and running
+        entries are marked failed; any in-flight upstream HTTP request
+        continues running but the tracker no longer reflects it. See
+        ``queue_manager.clear_tracker`` for the full safety contract.
+    :return: ``{"ok": True, "removed": {"completed": N, "failed": N,
+        "queued": N, "running": N}, "force": bool}``.
+    """
+    removed = queue_manager.clear_tracker(force=force)
+    return {"ok": True, "removed": removed, "force": force}
+
+
 @app.get("/api/merllm/activity")
 async def merllm_activity():
     """
