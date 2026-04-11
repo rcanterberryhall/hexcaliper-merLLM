@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -141,3 +142,66 @@ def test_set_pending_default_model():
     assert router._pending_default_model == "new-model:7b"
     s = router.status()
     assert s["pending_default_model"] == "new-model:7b"
+
+
+# ── Reload model num_ctx pinning ─────────────────────────────────────────────
+
+
+def _make_post_capturing_client():
+    """Build a mock httpx.AsyncClient that records POST kwargs."""
+    captured = {}
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def _post(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return mock_resp
+
+    mock_client.post = _post
+    return mock_client, captured
+
+
+@pytest.mark.asyncio
+async def test_reload_model_pins_num_ctx_for_qwen3():
+    """qwen3:* reloads must pin num_ctx so Ollama does not auto-fit to 32k.
+
+    Regression: 2026-04-11 GPU 11435 wedge. Ollama auto-picks num_ctx based
+    on free VRAM at load time. On a freshly empty 24 GB Tesla P40, qwen3:32b
+    loaded at 32768 ctx, forcing CPU offload of the output layer and split
+    KV cache, turning 330 ms reloads into 12 s reloads and slowing every
+    inference. Pinning to 8192 inside _reload_model fixes the entire class.
+    """
+    router, config = _get_router()
+    gpu = router._gpus[config.OLLAMA_0_URL]
+
+    mock_client, captured = _make_post_capturing_client()
+    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
+        await router._reload_model(gpu, "qwen3:32b")
+
+    body = captured["kwargs"]["json"]
+    assert body["model"] == "qwen3:32b"
+    assert body.get("options", {}).get("num_ctx") == 8192
+    assert gpu.model == "qwen3:32b"
+
+
+@pytest.mark.asyncio
+async def test_reload_model_omits_options_for_non_qwen3():
+    """Non-qwen3 reloads must not inject num_ctx — only the known-large
+    reasoning models need pinning."""
+    router, config = _get_router()
+    gpu = router._gpus[config.OLLAMA_0_URL]
+
+    mock_client, captured = _make_post_capturing_client()
+    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
+        await router._reload_model(gpu, "nomic-embed-text")
+
+    body = captured["kwargs"]["json"]
+    assert body["model"] == "nomic-embed-text"
+    assert "options" not in body
+    assert gpu.model == "nomic-embed-text"

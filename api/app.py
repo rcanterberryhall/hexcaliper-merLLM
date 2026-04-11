@@ -276,6 +276,39 @@ def _source(request: Request) -> str:
     return request.headers.get("x-source", "direct")
 
 
+def _normalize_reasoning_body(body: dict) -> None:
+    """Pin ``num_ctx`` for known large reasoning models on the proxy path.
+
+    Without this, a user-facing chat/generate request that omits ``num_ctx``
+    reaches Ollama with no context size, and Ollama auto-fits the KV cache
+    to whatever VRAM is free at load time. On a 24 GB Tesla P40 with no
+    co-resident model, qwen3:32b auto-fits to its 32 k training maximum,
+    forces CPU offload of the output layer, and the load takes ~12 s
+    instead of ~330 ms — every subsequent token is also slower because
+    the KV cache straddles the PCIe bus.
+
+    The dispatcher's ``_reload_model`` already pins ``num_ctx`` for the
+    warm-load it sends on a swap, but if the dispatcher's ``GpuState``
+    already thinks the right model is loaded the warm-load is skipped and
+    the user request hits Ollama unmodified — at which point Ollama may
+    have evicted the model on its own ``keep_alive`` timer and reload it
+    from scratch with the user's (empty) options. Pinning here closes that
+    gap so every entry point converges on the same KV-cache size.
+
+    Mirrors the same defaults the batch path applies in
+    ``queue_manager._run_batch_job_async``. Only fills in MISSING keys —
+    explicit caller values are respected.
+    """
+    model = body.get("model", "")
+    if not model.startswith("qwen3:"):
+        return
+    options = body.get("options")
+    if not isinstance(options, dict):
+        options = {}
+        body["options"] = options
+    options.setdefault("num_ctx", 8192)
+
+
 async def _generate_stream(target: str, path: str, body: dict, on_done=None):
     """
     Async generator that streams NDJSON from Ollama, line by line.
@@ -537,6 +570,7 @@ async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
 async def proxy_generate(request: Request):
     """Proxy POST /api/generate through the late-binding dispatcher."""
     body = await request.json()
+    _normalize_reasoning_body(body)
     model = body.get("model", "")
     priority = _priority(request)
     source = _source(request)
@@ -553,6 +587,7 @@ async def proxy_generate(request: Request):
 async def proxy_chat(request: Request):
     """Proxy POST /api/chat through the late-binding dispatcher."""
     body = await request.json()
+    _normalize_reasoning_body(body)
     model = body.get("model", "")
     priority = _priority(request)
     source = _source(request)

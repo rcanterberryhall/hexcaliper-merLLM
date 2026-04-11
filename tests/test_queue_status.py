@@ -264,6 +264,59 @@ def test_batch_queue_position_in_status(tmp_path, monkeypatch):
     assert "estimated_start" in s1
 
 
+# ── Reasoning-model num_ctx pinning on the proxy path ────────────────────────
+
+
+def test_normalize_reasoning_body_pins_num_ctx_for_qwen3(tmp_path, monkeypatch):
+    """qwen3:* proxy requests must get num_ctx pinned if the caller omitted it.
+
+    Regression: 2026-04-11. The dispatcher's _reload_model already pinned
+    num_ctx, but if the dispatcher's GpuState already thought the right
+    model was loaded the warm-load was skipped and the user request hit
+    Ollama unmodified — at which point Ollama's auto-fit picked the
+    model's training maximum (32k), forcing CPU offload of the output
+    layer and turning sub-second loads into 12 s loads.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
+            sys.modules.pop(mod, None)
+    import app as app_mod
+
+    body = {"model": "qwen3:32b", "prompt": "hi"}
+    app_mod._normalize_reasoning_body(body)
+    assert body["options"]["num_ctx"] == 8192
+
+
+def test_normalize_reasoning_body_respects_explicit_num_ctx(tmp_path, monkeypatch):
+    """If the caller already pinned num_ctx, the proxy must not overwrite it."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
+            sys.modules.pop(mod, None)
+    import app as app_mod
+
+    body = {"model": "qwen3:32b", "prompt": "hi", "options": {"num_ctx": 16384}}
+    app_mod._normalize_reasoning_body(body)
+    assert body["options"]["num_ctx"] == 16384
+
+
+def test_normalize_reasoning_body_skips_non_qwen3(tmp_path, monkeypatch):
+    """Models outside the qwen3:* family must not have options injected."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                   "metrics"):
+            sys.modules.pop(mod, None)
+    import app as app_mod
+
+    body = {"model": "llama3:8b", "prompt": "hi"}
+    app_mod._normalize_reasoning_body(body)
+    assert "options" not in body
+
+
 def test_completed_job_has_no_queue_position(tmp_path, monkeypatch):
     """Completed jobs must not include queue_position in their status."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "merllm.db"))

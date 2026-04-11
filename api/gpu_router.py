@@ -175,12 +175,24 @@ async def reclaim_loop() -> None:
 
 
 async def _reload_model(gpu: GpuState, model: str) -> None:
-    """Send a warmup request to load a model on a GPU."""
+    """Send a warmup request to load a model on a GPU.
+
+    For large reasoning models we pin ``num_ctx`` so Ollama does not
+    auto-fit the context window to the model's training maximum on a
+    freshly empty GPU. On a 24 GB Tesla P40 the qwen3:32b model at the
+    default 32 k training context forces CPU offload of the output
+    layer and a split KV cache (~7 GB GPU + ~900 MB CPU), which makes
+    every reload take ~12 s instead of ~330 ms and slows every
+    inference. Pinning to 8192 here matches the batch-path defaults in
+    ``queue_manager._run_batch_job_async`` and the
+    ``feedback_reasoning_model_caps`` rule.
+    """
+    body: dict = {"model": model, "prompt": "", "keep_alive": "10m"}
+    if model.startswith("qwen3:"):
+        body["options"] = {"num_ctx": 8192}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            await client.post(f"{gpu.url}/api/generate",
-                              json={"model": model, "prompt": "",
-                                    "keep_alive": "10m"})
+            await client.post(f"{gpu.url}/api/generate", json=body)
         gpu.model = model
         log.info("GPU %s reloaded with %r", gpu.url, model)
     except Exception as exc:
