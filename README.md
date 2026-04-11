@@ -93,6 +93,26 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
 **Automatic retry** — failed jobs are retried up to `BATCH_MAX_RETRIES` times (default 2, giving 3 total attempts) with exponential backoff (30s, 120s). On final failure, the accumulated error messages are stored on the job record.
 
+**Options forwarding** — the `options` dict in the submission body is forwarded verbatim to Ollama. Callers submitting reasoning-model work (qwen3:*) **must** populate `options` with `think: false` and a bounded `num_predict`, otherwise the model will reason unbounded and wedge the queue. Example:
+```json
+{
+  "source_app": "parsival",
+  "prompt": "...",
+  "model": "qwen3:32b",
+  "options": {"think": false, "num_predict": 768, "num_ctx": 8192, "temperature": 0.1}
+}
+```
+
+**Startup recovery** — when merllm-api restarts, any batch jobs left in `running` status are requeued, and all `queued` rows are re-launched via `asyncio.ensure_future(_run_batch_job_async(...))`. Prior to this fix, restarts would leave SQLite rows in `queued` status with no in-process task driving them.
+
+**Slot watchdog** — a background `_watchdog_loop` task scans `_tracked` every `WATCHDOG_INTERVAL_SECONDS` (default 30s) and force-fails any slot whose `started_at` exceeds `SLOT_MAX_WALL_SECONDS` (default 1800s). This is the last line of defence against hung upstream Ollama calls deadlocking the strict-priority dispatcher — a reclaim log line (`watchdog: reclaiming wedged slot ...`) indicates a bug in either the caller (missing `num_predict`) or the proxy layer, **not** a knob to tune. Bounded `PROXY_READ_TIMEOUT_SECONDS` (default 1800s) on every httpx call to Ollama is the defence-in-depth layer behind it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SLOT_MAX_WALL_SECONDS` | `1800` | Per-slot wall-clock budget before the watchdog reclaims it |
+| `WATCHDOG_INTERVAL_SECONDS` | `30` | How often the watchdog scans for wedged slots |
+| `PROXY_READ_TIMEOUT_SECONDS` | `1800` | httpx read timeout on every upstream Ollama call |
+
 **Completion notifications** — when a batch job completes (success or final failure), merLLM can notify you via:
 - **Webhook** — set `NOTIFICATION_WEBHOOK_URL` to a Slack incoming webhook, ntfy.sh topic, Gotify URL, or any endpoint accepting JSON POST. Payload includes `job_id`, `source_app`, `status`, timestamps, and a prompt preview.
 - **SSE** — the dashboard's activity stream receives a completion event in real time.

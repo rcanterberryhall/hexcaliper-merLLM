@@ -63,6 +63,14 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Dedicated dispatcher-trace logger. INFO-level so it shows up in docker logs
+# without having to bump the root logger. All dispatcher-trace lines start
+# with "[dispatch]" so they're easy to grep out of the activity stream, or
+# silenced via:
+#   logging.getLogger("queue_manager.dispatch").setLevel(logging.WARNING)
+dispatch_log = logging.getLogger("queue_manager.dispatch")
+dispatch_log.setLevel(logging.INFO)
+
 import config
 import db
 import notifications
@@ -138,6 +146,8 @@ class TrackedRequest:
     completed_at: Optional[float] = None
     error: Optional[str] = None
     batch_job_id: Optional[str] = None
+    # Dispatcher instrumentation: set when the waiter enters its bucket.
+    queued_for_dispatch_at: Optional[float] = None
 
 
 _tracked: dict[str, TrackedRequest] = {}
@@ -165,6 +175,14 @@ _watchdog_task: Optional[asyncio.Task] = None
 # Callback notified on every track/start/complete/fail so the SSE layer can
 # push updates.  Set by app.py at startup.
 _on_queue_change: Optional[callable] = None
+
+# ── Dispatcher-trace state (for observability only) ──────────────────────────
+# Monotonic counter and timestamps used to correlate wake events with dispatch
+# outcomes. None of this is load-bearing: it exists purely so the logs can
+# reveal where the dispatcher stalls and why.
+_wake_counter: int = 0
+_last_wake_ts: Optional[float] = None
+_last_dispatch_ts: Optional[float] = None   # last time a head was actually popped
 
 
 def _gpu_targets() -> list[str]:
@@ -219,8 +237,10 @@ def _notify_change() -> None:
             pass
 
 
-def _wake_dispatcher() -> None:
+def _wake_dispatcher(reason: str = "unspecified") -> None:
     if _state_changed is not None:
+        if not _state_changed.is_set():
+            dispatch_log.info("[dispatch] wake requested reason=%s", reason)
         _state_changed.set()
 
 
@@ -277,8 +297,14 @@ async def wait_for_dispatch(tracking_id: str) -> str:
         future=future,
     )
     _buckets[entry.priority].append(pending)
+    entry.queued_for_dispatch_at = time.time()
+    dispatch_log.info(
+        "[dispatch] enqueue tid=%s src=%s type=%s model=%s bucket=%s depth=%d",
+        tracking_id[:8], entry.source, entry.request_type, entry.model,
+        priority_name(entry.priority), len(_buckets[entry.priority]),
+    )
 
-    _wake_dispatcher()
+    _wake_dispatcher(reason=f"enqueue:{priority_name(entry.priority)}")
 
     try:
         if entry.priority == Priority.CHAT:
@@ -322,8 +348,16 @@ def release(tracking_id: str) -> None:
 
     entry.status = "completed"
     entry.completed_at = time.time()
+    ran_for = (entry.completed_at - entry.started_at) if entry.started_at else None
+    dispatch_log.info(
+        "[dispatch] release tid=%s gpu=%s ran=%.1fs src=%s bucket=%s",
+        tracking_id[:8],
+        entry.target[-5:] if entry.target else "?",
+        ran_for if ran_for is not None else -1.0,
+        entry.source, priority_name(entry.priority),
+    )
     _notify_change()
-    _wake_dispatcher()
+    _wake_dispatcher(reason="release")
 
     # Non-batch requests drop from the tracker shortly after completion.
     # Jobs backed by a batch_job_id stay visible (persisted in SQLite anyway).
@@ -349,8 +383,16 @@ def fail_request(tracking_id: str, error: str = "") -> None:
     entry.status = "failed"
     entry.error = error
     entry.completed_at = time.time()
+    ran_for = (entry.completed_at - entry.started_at) if entry.started_at else None
+    dispatch_log.info(
+        "[dispatch] fail tid=%s gpu=%s ran=%.1fs err=%s",
+        tracking_id[:8],
+        entry.target[-5:] if entry.target else "?",
+        ran_for if ran_for is not None else -1.0,
+        (error or "")[:120],
+    )
     _notify_change()
-    _wake_dispatcher()
+    _wake_dispatcher(reason="fail")
 
     if entry.batch_job_id is None:
         try:
@@ -480,7 +522,32 @@ def _try_dispatch_heads() -> None:
     never skip a head.  A lower-priority bucket only gets a turn when every
     higher-priority bucket is empty.
     """
-    for bucket in _buckets:
+    global _last_dispatch_ts
+
+    # Snapshot of dispatch-time state so the log has enough context to
+    # explain any stall we observe.
+    import gpu_router
+    depths = {priority_name(p): len(_buckets[p]) for p in Priority}
+    busy_snapshot = {u[-5:]: _gpu_busy.get(u, False) for u in _gpu_targets()}
+    try:
+        healthy = {g.url for g in gpu_router._healthy_gpus()}
+    except Exception:
+        healthy = set()
+    idle_count = sum(
+        1 for u in _gpu_targets()
+        if u in healthy and not _gpu_busy.get(u, False)
+    )
+    dispatch_log.info(
+        "[dispatch] walk start depths=%s gpus_busy=%s idle_gpus=%d",
+        depths, busy_snapshot, idle_count,
+    )
+
+    dispatched = 0
+    stopped_reason = "buckets_drained"
+    stopped_bucket: Optional[str] = None
+    for prio_idx, bucket in enumerate(_buckets):
+        if not bucket:
+            continue
         while bucket:
             req = bucket[0]
             target = _best_candidate_for(req.model)
@@ -490,12 +557,36 @@ def _try_dispatch_heads() -> None:
                 # bucket still has pending work — strict priority forbids
                 # any inversion, even when the lower bucket's head happens
                 # to be a better model fit.
+                stopped_reason = "no_candidate"
+                stopped_bucket = priority_name(Priority(prio_idx))
+                dispatch_log.info(
+                    "[dispatch] walk stop dispatched=%d reason=%s bucket=%s "
+                    "head_tid=%s head_model=%s remaining_in_bucket=%d",
+                    dispatched, stopped_reason, stopped_bucket,
+                    req.tid[:8], req.model, len(bucket),
+                )
                 return
             bucket.popleft()
             _gpu_busy[target] = True
             if req.tid in _tracked:
                 _tracked[req.tid].target = target
+            entry = _tracked.get(req.tid)
+            wait_ms = -1.0
+            if entry and entry.queued_for_dispatch_at:
+                wait_ms = (time.time() - entry.queued_for_dispatch_at) * 1000
+            dispatch_log.info(
+                "[dispatch] pop tid=%s bucket=%s gpu=%s model=%s wait_ms=%.0f",
+                req.tid[:8], priority_name(Priority(prio_idx)),
+                target[-5:], req.model, wait_ms,
+            )
             asyncio.create_task(_dispatch(req, target))
+            dispatched += 1
+            _last_dispatch_ts = time.time()
+
+    dispatch_log.info(
+        "[dispatch] walk end dispatched=%d reason=%s bucket=%s",
+        dispatched, stopped_reason, stopped_bucket,
+    )
 
 
 async def _dispatch(req: _PendingRequest, target: str) -> None:
@@ -505,13 +596,25 @@ async def _dispatch(req: _PendingRequest, target: str) -> None:
     the dispatcher loop itself never blocks on the swap.
     """
     import gpu_router
+    t0 = time.time()
     try:
         gpu_state = gpu_router._gpus.get(target)
+        swap_ms: float = 0.0
         if gpu_state is not None and gpu_state.model != req.model:
             # Swap cost is bounded by MODEL_SWAP_COST_SECONDS in practice.
             # The dispatcher has already marked the GPU busy so no other
             # request can land here until the swap completes.
+            dispatch_log.info(
+                "[dispatch] swap start tid=%s gpu=%s %s -> %s",
+                req.tid[:8], target[-5:], gpu_state.model, req.model,
+            )
+            swap_start = time.time()
             await gpu_router._reload_model(gpu_state, req.model)
+            swap_ms = (time.time() - swap_start) * 1000
+            dispatch_log.info(
+                "[dispatch] swap done tid=%s gpu=%s ms=%.0f",
+                req.tid[:8], target[-5:], swap_ms,
+            )
 
         entry = _tracked.get(req.tid)
         if entry is not None:
@@ -522,12 +625,20 @@ async def _dispatch(req: _PendingRequest, target: str) -> None:
 
         if not req.future.done():
             req.future.set_result(target)
+        dispatch_log.info(
+            "[dispatch] handoff tid=%s gpu=%s total_ms=%.0f swap_ms=%.0f",
+            req.tid[:8], target[-5:], (time.time() - t0) * 1000, swap_ms,
+        )
     except Exception as exc:
         log.exception("dispatch failed for %s on %s", req.tid, target)
+        dispatch_log.warning(
+            "[dispatch] handoff_fail tid=%s gpu=%s err=%s",
+            req.tid[:8], target[-5:], exc,
+        )
         _gpu_busy[target] = False
         if not req.future.done():
             req.future.set_exception(exc)
-        _wake_dispatcher()
+        _wake_dispatcher(reason="handoff_fail")
 
 
 async def _watchdog_loop() -> None:
@@ -585,7 +696,7 @@ async def _dispatcher_loop() -> None:
     arrival, release, swap completion, health transition) and tries to
     assign work to any idle GPU.
     """
-    global _state_changed
+    global _state_changed, _wake_counter, _last_wake_ts
     if _state_changed is None:
         _state_changed = asyncio.Event()
 
@@ -593,6 +704,17 @@ async def _dispatcher_loop() -> None:
         try:
             await _state_changed.wait()
             _state_changed.clear()
+            _wake_counter += 1
+            now = time.time()
+            gap_s = (now - _last_wake_ts) if _last_wake_ts is not None else 0.0
+            gap_since_dispatch = (
+                (now - _last_dispatch_ts) if _last_dispatch_ts is not None else -1.0
+            )
+            dispatch_log.info(
+                "[dispatch] wake #%d gap_since_last_wake=%.2fs gap_since_last_pop=%.2fs",
+                _wake_counter, gap_s, gap_since_dispatch,
+            )
+            _last_wake_ts = now
             _try_dispatch_heads()
         except asyncio.CancelledError:
             raise
@@ -727,6 +849,28 @@ async def _run_batch_job_async(job_id: str) -> None:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # ── Defensive option defaults ────────────────────────────────────────
+    # Belt-and-suspenders for the "unbounded reasoning" failure mode:
+    # if a caller submitted a batch job without the three keys that keep
+    # qwen3:* from wedging a slot (think:false, num_predict, num_ctx),
+    # fill them in here so old jobs, buggy callers, and third-party clients
+    # still run with safe bounds. We only fill in MISSING keys — if the
+    # caller specified a value we respect it.
+    #
+    # num_ctx also serves a second purpose: it forces every Ollama instance
+    # to converge on the same KV-cache size. Without it the two GPUs can
+    # end up loaded with different context lengths (one from an earlier
+    # request, one from a later one) and the larger-ctx GPU becomes
+    # ~2× slower on identical workloads because of the bigger KV cache.
+    _defaults = {
+        "think":       False,     # disable qwen3 reasoning emission
+        "num_predict": 768,       # bounded decode cap
+        "num_ctx":     8192,      # fixed KV cache so both GPUs match
+        "temperature": 0.1,       # deterministic-ish for extraction tasks
+    }
+    for k, v in _defaults.items():
+        options.setdefault(k, v)
+
     body = {
         "model":   job["model"],
         "prompt":  job["prompt"],
@@ -743,19 +887,33 @@ async def _run_batch_job_async(job_id: str) -> None:
     )
 
     try:
+        dispatch_wait_start = time.time()
         target = await wait_for_dispatch(tracking_id)
+        dispatch_wait_s = time.time() - dispatch_wait_start
+        dispatch_log.info(
+            "[dispatch] batch wait_done job=%s tid=%s gpu=%s wait=%.2fs",
+            job_id[:8], tracking_id[:8], target[-5:], dispatch_wait_s,
+        )
         _app._activity_set(target, job["model"], "/api/generate")
         try:
             # Bounded read timeout: defence-in-depth behind the watchdog.
             # If the watchdog has already reclaimed the slot, this still
             # eventually unblocks the coroutine instead of leaking the
             # httpx connection forever.
+            http_start = time.time()
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
             ) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
                 resp.raise_for_status()
                 result_text = resp.json().get("response", "")
+            http_s = time.time() - http_start
+            dispatch_log.info(
+                "[dispatch] batch http_done job=%s tid=%s gpu=%s http=%.2fs "
+                "resp_chars=%d",
+                job_id[:8], tracking_id[:8], target[-5:], http_s,
+                len(result_text),
+            )
             gpu_router.record_activity(target)
             db.update_batch_job(job_id, status="completed",
                                 completed_at=time.time(), result=result_text)
@@ -767,8 +925,16 @@ async def _run_batch_job_async(job_id: str) -> None:
                     webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
                 ))
         finally:
-            _app._activity_clear(target)
+            # Order matters: release() first so the dispatcher can hand the
+            # GPU to the next waiter in the same event-loop tick. If we
+            # clear activity before releasing, the UI briefly sees the GPU
+            # as idle even though a new job is about to start on it — the
+            # visible "stop/start" flicker the user reported during large
+            # batches. The new request's _activity_set() will overwrite
+            # ours, so the clear is only there to cover the "no work left"
+            # case.
             release(tracking_id)
+            _app._activity_clear(target)
     except Exception as exc:
         fail_request(tracking_id, str(exc))
         prev_error = (job.get("error") or "").strip()
