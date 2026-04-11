@@ -3,8 +3,10 @@ app.py — merLLM: centralized LLM traffic control for the Hexcaliper ecosystem.
 
 Exposes a drop-in Ollama API proxy on :11400. Both LanceLLMot and Parsival
 point their OLLAMA_BASE_URL here. Requests flow through a late-binding GPU
-dispatcher with strict priority pipes (interactive / batch) and health
-tracking — the target GPU is chosen only when one actually becomes idle.
+dispatcher with a 5-bucket strict priority queue (chat > reserved > short >
+feedback > background) and per-GPU health tracking — the target GPU is
+chosen only when one actually becomes idle, then drained top-down with
+FIFO inside each bucket.
 
 Additional endpoints:
   GET/POST  /api/merllm/status    — GPU state, queue depth, health
@@ -568,7 +570,13 @@ async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
 
 @app.post("/api/generate")
 async def proxy_generate(request: Request):
-    """Proxy POST /api/generate through the late-binding dispatcher."""
+    """Proxy POST /api/generate through the late-binding dispatcher.
+
+    Reasoning-model defaults (e.g. ``num_ctx`` for ``qwen3:*``) are pinned
+    here via :func:`_normalize_reasoning_body` before the body is tracked
+    or dispatched, so callers that omit the option still hit the same KV
+    cache footprint as the dispatcher's warm-load swap path.
+    """
     body = await request.json()
     _normalize_reasoning_body(body)
     model = body.get("model", "")
@@ -585,7 +593,13 @@ async def proxy_generate(request: Request):
 
 @app.post("/api/chat")
 async def proxy_chat(request: Request):
-    """Proxy POST /api/chat through the late-binding dispatcher."""
+    """Proxy POST /api/chat through the late-binding dispatcher.
+
+    Reasoning-model defaults (e.g. ``num_ctx`` for ``qwen3:*``) are pinned
+    here via :func:`_normalize_reasoning_body` before the body is tracked
+    or dispatched, so callers that omit the option still hit the same KV
+    cache footprint as the dispatcher's warm-load swap path.
+    """
     body = await request.json()
     _normalize_reasoning_body(body)
     model = body.get("model", "")

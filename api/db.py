@@ -1,10 +1,14 @@
 """
 db.py — SQLite WAL persistence for merLLM.
 
-Three tables:
-  batch_jobs  — work items queued for night-mode processing
+Tables:
+  batch_jobs  — work items dispatched at the background priority bucket
   metrics     — time-series system and GPU metrics (auto-pruned)
   settings    — key/value configuration overrides
+  transitions — vestigial day/night transition log (kept for forensic
+                history; no code path writes to it after the round-robin
+                refactor on 2026-04-09)
+  fan_faults  — fan-controller fault events
 """
 import json
 import logging

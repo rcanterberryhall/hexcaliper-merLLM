@@ -2,7 +2,7 @@
 
 Centralized LLM traffic control for the Hexcaliper ecosystem.
 
-merLLM sits between LanceLLMot (hexcaliper) and Parsival (hexcaliper-squire) and both GPU-pinned Ollama instances. It routes requests to the right GPU via a priority queue, manages day/night mode transitions, queues batch jobs for overnight extended-context processing with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
+merLLM sits between LanceLLMot (hexcaliper) and Parsival (hexcaliper-squire) and both GPU-pinned Ollama instances. It round-robins requests across the GPUs, drains a 5-bucket strict-priority queue (chat → reserved → short → feedback → background), persists batch jobs through restarts with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
 
 ```
 LanceLLMot  ──┐
@@ -35,26 +35,22 @@ All settings are environment variables in `docker-compose.yml`. They can also be
 |---|---|---|
 | `OLLAMA_0_URL` | `http://host.docker.internal:11434` | GPU 0 Ollama instance |
 | `OLLAMA_1_URL` | `http://host.docker.internal:11435` | GPU 1 Ollama instance |
-| `DAY_MODEL_GPU0` | `qwen3:32b` | Model routed to GPU 0 in day mode |
-| `DAY_MODEL_GPU1` | `qwen3:30b-a3b` | Model routed to GPU 1 in day mode |
-| `NIGHT_MODEL` | `qwen3:32b` | Model used for batch jobs (night mode) |
-| `NIGHT_NUM_CTX` | `32768` | Context window for night-mode batch jobs |
-| `INACTIVITY_TIMEOUT_MIN` | `90` | Minutes with no requests before night mode activates |
-| `BASE_DAY_END_LOCAL` | `22:00` | Local time after which night mode may activate |
-| `GEOIP_DB_PATH` | `/data/GeoLite2-City.mmdb` | Path to MaxMind DB (inside container) |
-| `GEOIP_OFFSET_OVERRIDE` | *(empty)* | Force a UTC offset (e.g. `-5`) instead of GeoIP lookup |
-| `OLLAMA_MANAGE_VIA` | `none` | `systemctl` to let merLLM start/stop Ollama services |
-| `GPU0_SERVICE` | `ollama-gpu0` | systemd unit name for GPU 0 Ollama |
-| `GPU1_SERVICE` | `ollama-gpu1` | systemd unit name for GPU 1 Ollama |
-| `NIGHT_SERVICE` | `ollama-night` | systemd unit name for dual-GPU night instance |
-| `DRAIN_TIMEOUT_SEC` | `300` | Max seconds to wait for in-flight requests before transitioning |
+| `DEFAULT_MODEL` | `qwen3:32b` | Model both GPUs idle on; reclaimed-to after `RECLAIM_TIMEOUT` of idle |
+| `RECLAIM_TIMEOUT` | `300` | Seconds a GPU can sit idle on a non-default model before reloading the default |
+| `HEALTH_BACKOFF_BASE` | `10` | Initial health-probe interval for a degraded GPU (seconds) |
+| `HEALTH_BACKOFF_CAP` | `300` | Maximum health-probe interval after exponential backoff (seconds) |
+| `HEALTH_FAULT_TIMEOUT` | `1800` | Seconds of continuous failure before a GPU is marked *faulted* (manual reset required) |
+| `MODEL_SWAP_COST_SECONDS` | `20` | Static cost the dispatcher uses for the "swap vs wait" decision |
 | `BATCH_MAX_RETRIES` | `2` | Max automatic retries for a failed batch job (2 = 3 total attempts) |
 | `BATCH_MAX_PROMPT_LEN` | `100000` | Max prompt length in characters accepted by `POST /api/batch/submit` (422 if exceeded) |
-| `INTERACTIVE_QUEUE_TIMEOUT` | `30` | Seconds a `chat`-bucket request waits for a GPU slot before returning 503 (other buckets wait indefinitely) |
+| `INTERACTIVE_QUEUE_TIMEOUT` | `40` | Seconds a `chat`-bucket request waits for a GPU slot before returning 503 (other buckets wait indefinitely) |
 | `GPU_MAX_CONCURRENT` | `1` | Max concurrent generation requests per GPU (1 = fully serialised) |
 | `DB_PATH` | `/data/merllm.db` | SQLite database path (inside container) |
 | `METRICS_INTERVAL_SEC` | `10` | How often system metrics are collected |
+| `METRICS_RETAIN_DAYS` | `7` | How long historical metrics rows are kept |
+| `EXTRA_DISK_PATHS` | *(empty)* | Extra mountpoints to report in disk metrics, e.g. `archive=/mnt/archive,data=/mnt/data` |
 | `NOTIFICATION_WEBHOOK_URL` | *(empty)* | Webhook URL for batch job completion notifications (Slack, ntfy.sh, Gotify, or any JSON POST endpoint) |
+| `FAN_CONTROLLER_URL` | `http://host.docker.internal:8080` | URL of the iDRAC fan controller REST API |
 | `PARSIVAL_URL` | `http://host.docker.internal:8082` | Parsival nginx URL (for My Day panel) |
 | `LANCELLMOT_URL` | `http://host.docker.internal:8080` | LanceLLMot nginx URL (for My Day panel) |
 | `LOG_CONTAINER_*` | *(see below)* | Docker container name mapping for the logs endpoint |
@@ -158,6 +154,8 @@ Each chunk resets the caller's between-chunk read-gap timer so a client using `r
 
 Set `X-Priority: <bucket>` on any proxied request to select a priority bucket (`chat`, `reserved`, `short`, `feedback`, `background`; the legacy values `interactive`/`batch` still work). See [Priority buckets](#priority-buckets) for the full semantics.
 
+**Reasoning-model `num_ctx` normalization** — `proxy_chat` and `proxy_generate` call `_normalize_reasoning_body` on every request, which `setdefault`s `options.num_ctx = 8192` for any `qwen3:*` model whose body omits it. The dispatcher's `gpu_router._reload_model` does the same on every swap warm-load. Without this pin, Ollama auto-fits `num_ctx` to the model's training maximum (32 k for `qwen3:32b`) on a freshly empty 24 GB Tesla P40, forcing CPU offload of the output layer and a split KV cache (~7 GB GPU + ~896 MB CPU) — turning ~330 ms reloads into ~12 s reloads and slowing every subsequent inference. Callers may still pass an explicit `num_ctx` and the proxy will respect it; the normalizer only fills in missing keys. See `feedback_reasoning_model_caps` and merLLM#37 for the incident that motivated this.
+
 ## Activity SSE stream
 
 The overview dashboard subscribes to `GET /api/merllm/activity/stream` (Server-Sent Events) for real-time per-GPU activity. Each event carries a JSON snapshot:
@@ -185,19 +183,13 @@ The `/api/merllm/logs/{service}` endpoint maps logical service names to Docker c
 | `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-squire-parsival-nginx-1` |
 | `LOG_CONTAINER_MERLLM_API` | `merllm-api` |
 
-## Ollama service management
-
-To allow merLLM to start and stop Ollama services on mode transitions, set `OLLAMA_MANAGE_VIA=systemctl` and ensure the container has access to the host's systemd socket. Without this, transitions are logged but services are not actually started/stopped — useful if you manage them separately.
-
-The `ollama-night` service should be a systemd unit that starts Ollama with `CUDA_VISIBLE_DEVICES=0,1` for dual-GPU operation.
-
 ## My Day panel
 
 The dashboard landing page includes a "My Day" panel that aggregates attention items from across the ecosystem:
 
 - **From Parsival** — count of new/investigating situations, overdue follow-ups, unread high-attention items (via `GET {PARSIVAL_URL}/page/api/attention/summary`)
 - **From LanceLLMot** — conversations with pending deep analysis results, escalation results awaiting review (via `GET {LANCELLMOT_URL}/api/status/pending`)
-- **From merLLM** — completed batch jobs not yet retrieved, active warnings (GPU temp, Ollama down, transition failures)
+- **From merLLM** — completed batch jobs not yet retrieved, active warnings (GPU temp, Ollama down, faulted GPUs)
 
 Each card links directly to the relevant item in the relevant app (opens in a new tab). If a companion app is unreachable, the panel shows "offline" instead of failing entirely.
 
@@ -215,7 +207,7 @@ Interval: 30s, timeout: 5s, retries: 3.
 
 | Tab | Contents |
 |---|---|
-| Overview | My Day panel, mode status, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), batch counts, recent transitions |
+| Overview | My Day panel, GPU state, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), batch counts |
 | Batch Jobs | Submit jobs, view queue, cancel/requeue; failed jobs show retry count |
 | Metrics | Time-series charts (Chart.js) for CPU, RAM, disk, GPU utilization, GPU VRAM, GPU temperature, network throughput; range selector: 1h / 6h / 24h / 7d |
 | Logs | Live log tail from any Docker container (configurable via `LOG_CONTAINER_*` env vars) |
@@ -271,13 +263,12 @@ pytest tests/ -v
 
 ```
 api/
-  app.py            — FastAPI application, all HTTP + WebSocket endpoints
+  app.py            — FastAPI application, all HTTP + WebSocket endpoints, proxy normalizer
   config.py         — Environment variable loading and hot-reload
-  db.py             — SQLite WAL: batch jobs, metrics, settings, transitions
-  geoip.py          — MaxMind GeoLite2 timezone lookup
+  db.py             — SQLite WAL: batch jobs, metrics, settings
+  gpu_router.py     — Per-GPU state, health probes, reclaim loop, model swap warm-load
   metrics.py        — psutil + pynvml collection loop
-  mode_manager.py   — Day/Night state machine and scheduler
-  queue_manager.py  — asyncio priority queue, batch runner with retry
+  queue_manager.py  — Late-binding 5-bucket priority dispatcher, batch runner with retry, slot watchdog
   notifications.py  — Batch job completion dispatch (webhook, SSE)
   Dockerfile
   requirements.txt
@@ -290,7 +281,10 @@ web/
 tests/
   test_config.py
   test_db.py
-  test_queue_manager.py
+  test_gpu_router.py     — GPU health, reclaim conditions, _reload_model num_ctx pin
+  test_queue_manager.py  — Dispatcher, priority drain, slot watchdog
+  test_queue_status.py   — queue_status NDJSON, heartbeats, reasoning-body normalization
   test_activity_sse.py   — SSE push rate limiting, queue fan-out, activity helpers
+  test_integration.py    — End-to-end ecosystem flows
 docker-compose.yml
 ```

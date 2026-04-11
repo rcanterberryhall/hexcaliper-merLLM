@@ -357,8 +357,12 @@
           read this table, pick the bucket, and cite it in a code comment. Keeping the bucket assignment explicit at
           every call site is what prevents the tiers from drifting back into an accidental mix.<br><br>
           <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
-          <code>queue_status</code> event is emitted before generation starts, showing queue position
-          and estimated wait time. LanceLLMot and Parsival display this as a waiting indicator.
+          <code>queue_status</code> event is emitted before generation starts with the reason and an
+          <code>estimated_wait_seconds</code> hint. LanceLLMot and Parsival display this as a waiting indicator.
+          If the wait exceeds <code>QUEUE_HEARTBEAT_INTERVAL_SECONDS</code> (default 20), the streaming
+          proxy then emits periodic <code>{"type":"queue_status","waiting":true,"elapsed_seconds":N}</code>
+          keepalive lines so a caller using <code>requests.post(timeout=60, stream=True)</code> does not
+          trip its read-gap timer during a long background-bucket drain.
         </p>
       </div>
 
@@ -432,6 +436,15 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           on any request to place it in the corresponding bucket without submitting a formal batch job.
           See the <strong style="color:var(--text)">GPU Queue</strong> card above for the call-site rule and
           bucket definitions.
+        </p>
+        <p style="color:var(--muted);font-size:13px;margin-top:8px">
+          <strong style="color:var(--text)">Reasoning-model <code>num_ctx</code> pin</strong> —
+          <code>/api/chat</code> and <code>/api/generate</code> auto-fill <code>options.num_ctx = 8192</code>
+          for any <code>qwen3:*</code> request whose body omits it (callers can override by passing an
+          explicit value). Without this pin, Ollama auto-fits the context window to the model's training
+          maximum (32 k for qwen3:32b) on a freshly empty 24 GB Tesla P40, forces CPU offload of the output
+          layer, and turns ~330 ms reloads into ~12 s reloads. The dispatcher's swap warm-load applies
+          the same pin so both code paths converge on the same KV-cache size.
         </p>
       </div>
 
