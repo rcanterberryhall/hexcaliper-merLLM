@@ -35,10 +35,29 @@ def _init_nvml() -> None:
         _nvml_ok = False
 
 
+def _gpu_index_to_url(i: int) -> Optional[str]:
+    """
+    Map an NVML GPU index to the Ollama URL serving that GPU.
+
+    Assumes the convention that OLLAMA_0_URL is pinned to GPU 0 and
+    OLLAMA_1_URL to GPU 1 (set via CUDA_VISIBLE_DEVICES in docker-compose).
+    Returns None for any index outside the configured pair.
+    """
+    if i == 0:
+        return config.OLLAMA_0_URL
+    if i == 1:
+        return config.OLLAMA_1_URL
+    return None
+
+
 def _collect_gpu_points() -> list[tuple[str, float]]:
     if not _nvml_ok:
         return []
     points = []
+    # Deferred import — metrics is imported early in app startup and we
+    # want to avoid any import-time cycle with queue_manager/gpu_router.
+    import gpu_router
+
     try:
         import pynvml
         for i in range(_gpu_count):
@@ -54,6 +73,13 @@ def _collect_gpu_points() -> list[tuple[str, float]]:
                 (f"gpu{i}.temp_c",      float(temp)),
                 (f"gpu{i}.power_w",     float(pwr)),
             ]
+            # Feed the temperature into the dispatcher's thermal gate.
+            url = _gpu_index_to_url(i)
+            if url:
+                try:
+                    gpu_router.update_thermal_state(url, float(temp))
+                except Exception as exc:
+                    log.warning("thermal state update for gpu%d failed: %s", i, exc)
     except Exception as exc:
         log.warning("GPU metric collection failed: %s", exc)
     return points

@@ -715,9 +715,14 @@ def _build_warnings(ollama_health: dict, latest: dict) -> list[str]:
     if ram_total and ram_avail / ram_total < 0.10:
         warnings.append("RAM available < 10%")
     for i in range(4):
-        temp = latest.get(f"gpu{i}.temp", {}).get("value")
-        if temp and temp > 85:
-            warnings.append(f"GPU {i} temperature {temp:.0f}°C — thermal throttle risk")
+        temp = latest.get(f"gpu{i}.temp_c", {}).get("value")
+        if temp and temp >= config.GPU_TEMP_PAUSE_C:
+            warnings.append(
+                f"GPU {i} temperature {temp:.0f}°C — dispatch paused "
+                f"(resume below {config.GPU_TEMP_RESUME_C}°C)"
+            )
+        elif temp and temp > 80:
+            warnings.append(f"GPU {i} temperature {temp:.0f}°C — approaching thermal pause")
     return warnings
 
 

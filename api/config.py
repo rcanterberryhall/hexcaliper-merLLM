@@ -32,6 +32,13 @@ HEALTH_BACKOFF_BASE = int(_get("HEALTH_BACKOFF_BASE", "10"))     # initial probe
 HEALTH_BACKOFF_CAP  = int(_get("HEALTH_BACKOFF_CAP",  "300"))    # max probe interval
 HEALTH_FAULT_TIMEOUT = int(_get("HEALTH_FAULT_TIMEOUT", "1800")) # seconds until faulted
 
+# Thermal throttling. A GPU that reaches GPU_TEMP_PAUSE_C is marked thermally
+# paused — the dispatcher will not route new work to it until it cools back
+# below GPU_TEMP_RESUME_C. In-flight work on a paused GPU is not interrupted;
+# only new dispatches are blocked. The 25°C hysteresis prevents flapping.
+GPU_TEMP_PAUSE_C  = int(_get("GPU_TEMP_PAUSE_C",  "85"))
+GPU_TEMP_RESUME_C = int(_get("GPU_TEMP_RESUME_C", "60"))
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 EXTRA_DISK_PATHS    = _get("EXTRA_DISK_PATHS",    "")   # e.g. "archive=/mnt/archive,data=/mnt/data"
@@ -162,6 +169,8 @@ def apply_overrides(d: dict) -> None:
         "health_backoff_cap":      "HEALTH_BACKOFF_CAP",
         "health_fault_timeout":    "HEALTH_FAULT_TIMEOUT",
         "metrics_interval_sec":    "METRICS_INTERVAL_SEC",
+        "gpu_temp_pause_c":        "GPU_TEMP_PAUSE_C",
+        "gpu_temp_resume_c":       "GPU_TEMP_RESUME_C",
     }
     for key, attr in str_fields.items():
         if key in d and d[key] is not None:

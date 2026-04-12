@@ -37,7 +37,8 @@ class GpuHealth(str, Enum):
 
 class GpuState:
     __slots__ = ("url", "model", "health", "last_active", "fail_since",
-                 "next_probe", "probe_interval")
+                 "next_probe", "probe_interval",
+                 "thermal_paused", "last_temp_c", "thermal_paused_since")
 
     def __init__(self, url: str):
         self.url: str = url
@@ -47,6 +48,12 @@ class GpuState:
         self.fail_since: Optional[float] = None
         self.next_probe: float = 0.0
         self.probe_interval: float = config.HEALTH_BACKOFF_BASE
+        # Thermal state is orthogonal to health: a GPU can be healthy but
+        # thermally paused. In-flight work is not interrupted; only new
+        # dispatch is blocked.
+        self.thermal_paused: bool = False
+        self.last_temp_c: Optional[float] = None
+        self.thermal_paused_since: Optional[float] = None
 
 
 # ── Module state ─────────────────────────────────────────────────────────────
@@ -77,6 +84,63 @@ def record_activity(target: str) -> None:
     _init_gpus()
     if target in _gpus:
         _gpus[target].last_active = time.time()
+
+
+# ── Thermal management ───────────────────────────────────────────────────────
+
+
+def update_thermal_state(target: str, temp_c: float) -> None:
+    """
+    Update a GPU's thermal state from a fresh temperature reading.
+
+    Called from the metrics collection loop. Applies hysteresis:
+      * temp >= GPU_TEMP_PAUSE_C  → mark thermally paused
+      * temp <= GPU_TEMP_RESUME_C → clear thermal pause
+      * in between → no transition (preserves current state)
+
+    Wakes the dispatcher on resume so any queued work starts moving again.
+    """
+    _init_gpus()
+    gpu = _gpus.get(target)
+    if not gpu:
+        return
+
+    gpu.last_temp_c = temp_c
+    was_paused = gpu.thermal_paused
+
+    if temp_c >= config.GPU_TEMP_PAUSE_C and not was_paused:
+        gpu.thermal_paused = True
+        gpu.thermal_paused_since = time.time()
+        log.warning(
+            "GPU %s thermally paused at %.1f°C (threshold %d°C) — "
+            "blocking new dispatch until it cools below %d°C",
+            target, temp_c, config.GPU_TEMP_PAUSE_C, config.GPU_TEMP_RESUME_C,
+        )
+    elif temp_c <= config.GPU_TEMP_RESUME_C and was_paused:
+        gpu.thermal_paused = False
+        paused_for = (time.time() - gpu.thermal_paused_since) if gpu.thermal_paused_since else 0
+        gpu.thermal_paused_since = None
+        log.info(
+            "GPU %s thermal pause cleared at %.1f°C after %.0fs — resuming dispatch",
+            target, temp_c, paused_for,
+        )
+        # Wake the dispatcher so queued work can start flowing again.
+        queue_manager._wake_dispatcher(reason="thermal_resume")
+
+
+def is_dispatchable(target: str) -> bool:
+    """
+    True if the GPU is eligible to receive new dispatched work.
+
+    A GPU is dispatchable only if it is both healthy and not thermally
+    paused. In-flight work on a thermally paused GPU is not affected —
+    only new dispatches are blocked.
+    """
+    _init_gpus()
+    gpu = _gpus.get(target)
+    if not gpu:
+        return False
+    return gpu.health == GpuHealth.HEALTHY and not gpu.thermal_paused
 
 
 # ── Health management ────────────────────────────────────────────────────────
@@ -245,11 +309,16 @@ def status() -> dict:
                 "idle_seconds":   round(now - gpu.last_active, 1),
                 "fail_since":     gpu.fail_since,
                 "in_flight":      queue_manager.gpu_slot_busy(gpu.url),
+                "thermal_paused": gpu.thermal_paused,
+                "last_temp_c":    gpu.last_temp_c,
+                "thermal_paused_since": gpu.thermal_paused_since,
             }
     return {
         "routing":        "round_robin",
         "default_model":  config.DEFAULT_MODEL,
         "reclaim_timeout": config.RECLAIM_TIMEOUT,
         "pending_default_model": _pending_default_model,
+        "gpu_temp_pause_c":  config.GPU_TEMP_PAUSE_C,
+        "gpu_temp_resume_c": config.GPU_TEMP_RESUME_C,
         "gpus":           gpus,
     }

@@ -799,3 +799,54 @@ def test_queue_change_callback_fires(qm):
     qm.set_queue_change_callback(lambda: calls.append(1))
     qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
     assert len(calls) >= 1
+
+
+# ── Thermal pause integration ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_thermally_paused_gpu_excluded_from_dispatch(
+        qm, gpu_urls, patch_reload, monkeypatch):
+    """A GPU marked thermally paused is not chosen by _best_candidate_for,
+    so work routes to the other GPU even if the paused one is idle."""
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    import gpu_router
+    gpu0, gpu1 = gpu_urls
+
+    # Pause GPU 0 thermally.
+    gpu_router.update_thermal_state(gpu0, 90.0)
+    assert gpu_router.is_dispatchable(gpu0) is False
+    assert gpu_router.is_dispatchable(gpu1) is True
+
+    # A dispatched request must land on GPU 1.
+    tid = qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert target == gpu1
+    qm.release(tid)
+
+
+@pytest.mark.asyncio
+async def test_thermal_resume_wakes_dispatcher(
+        qm, gpu_urls, patch_reload, monkeypatch):
+    """When all GPUs are thermally paused, work queues. Clearing the pause
+    on one GPU wakes the dispatcher and that request moves."""
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    import gpu_router
+    gpu0, gpu1 = gpu_urls
+
+    gpu_router.update_thermal_state(gpu0, 90.0)
+    gpu_router.update_thermal_state(gpu1, 92.0)
+
+    tid = qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    # Request is queued, not dispatched.
+    waiter = asyncio.create_task(qm.wait_for_dispatch(tid))
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    # Clear one GPU's thermal pause → dispatcher should wake and assign it.
+    gpu_router.update_thermal_state(gpu0, 55.0)
+    target = await asyncio.wait_for(waiter, timeout=2.0)
+    assert target == gpu0
+    qm.release(tid)

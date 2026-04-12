@@ -264,18 +264,33 @@ function renderOverview(s) {
   const routerCards = document.getElementById("gpu-router-cards");
   if (s.gpus && typeof s.gpus === "object") {
     routerCards.innerHTML = Object.entries(s.gpus).map(([label, g]) => {
-      const healthClass = g.health === "healthy" ? "dot-ok"
+      // Thermal pause takes visual precedence over healthy status because
+      // a thermally paused GPU is not eligible for dispatch.
+      const healthClass = g.thermal_paused ? "dot-warn"
+        : g.health === "healthy" ? "dot-ok"
         : g.health === "faulted" ? "dot-fail" : "dot-warn";
+      const stateLabel = g.thermal_paused ? "cooling" : g.health;
       const idleFmt = g.idle_seconds >= 60
         ? Math.floor(g.idle_seconds / 60) + "m " + Math.round(g.idle_seconds % 60) + "s"
         : Math.round(g.idle_seconds) + "s";
       const resetBtn = g.health !== "healthy"
         ? `<button class="btn" style="padding:2px 8px;font-size:11px;margin-left:8px" onclick="resetGpu('${esc(label)}')">Reset</button>`
         : "";
+      let thermalRow = "";
+      if (typeof g.last_temp_c === "number") {
+        const resumeC = (s.gpu_temp_resume_c != null) ? s.gpu_temp_resume_c : 60;
+        const tempNote = g.thermal_paused
+          ? ` <span style="color:var(--warn,#e6a700)">cooling → ${resumeC}°C</span>`
+          : "";
+        thermalRow = `<div class="stat-row">
+          <span class="stat-label">Temp</span>
+          <span class="stat-value">${g.last_temp_c.toFixed(0)}°C${tempNote}</span>
+        </div>`;
+      }
       return `<div class="gpu-router-gpu" style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px">
         <div class="stat-row">
           <span class="stat-label"><span class="dot ${healthClass}"></span> ${esc(label.toUpperCase().replace("GPU", "GPU "))}</span>
-          <span class="stat-value">${esc(g.health)}${resetBtn}</span>
+          <span class="stat-value">${esc(stateLabel)}${resetBtn}</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">Model</span>
@@ -289,6 +304,7 @@ function renderOverview(s) {
           <span class="stat-label">In flight</span>
           <span class="stat-value">${g.in_flight ? "yes" : "no"}</span>
         </div>
+        ${thermalRow}
       </div>`;
     }).join("");
   }

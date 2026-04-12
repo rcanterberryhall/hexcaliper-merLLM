@@ -562,17 +562,20 @@ def _best_candidate_for(model: str) -> Optional[str]:
       1. Prefer an idle GPU that already holds the requested model (affinity).
       2. Otherwise, any idle GPU is a candidate (will be swapped).
       3. Exclude unhealthy GPUs.
+      4. Exclude thermally paused GPUs — their in-flight work is preserved
+         but no new work is dispatched until they cool down.
     """
     # Deferred import to avoid module-load cycle.
     import gpu_router
 
     _ensure_gpu_state()
-    healthy = {g.url for g in gpu_router._healthy_gpus()}
-    if not healthy:
+    dispatchable = {url for url in _gpu_targets()
+                    if gpu_router.is_dispatchable(url)}
+    if not dispatchable:
         return None
 
     idle = [url for url in _gpu_targets()
-            if url in healthy and not _gpu_busy.get(url, False)]
+            if url in dispatchable and not _gpu_busy.get(url, False)]
     if not idle:
         return None
 
@@ -604,12 +607,12 @@ def _try_dispatch_heads() -> None:
     depths = {priority_name(p): len(_buckets[p]) for p in Priority}
     busy_snapshot = {u[-5:]: _gpu_busy.get(u, False) for u in _gpu_targets()}
     try:
-        healthy = {g.url for g in gpu_router._healthy_gpus()}
+        dispatchable = {u for u in _gpu_targets() if gpu_router.is_dispatchable(u)}
     except Exception:
-        healthy = set()
+        dispatchable = set()
     idle_count = sum(
         1 for u in _gpu_targets()
-        if u in healthy and not _gpu_busy.get(u, False)
+        if u in dispatchable and not _gpu_busy.get(u, False)
     )
     dispatch_log.info(
         "[dispatch] walk start depths=%s gpus_busy=%s idle_gpus=%d",

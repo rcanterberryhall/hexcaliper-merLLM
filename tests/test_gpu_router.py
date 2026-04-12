@@ -205,3 +205,82 @@ async def test_reload_model_omits_options_for_non_qwen3():
     assert body["model"] == "nomic-embed-text"
     assert "options" not in body
     assert gpu.model == "nomic-embed-text"
+
+
+# ── Thermal pause tests ──────────────────────────────────────────────────────
+
+
+def test_thermal_pause_engages_at_threshold(monkeypatch):
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    router, config = _get_router()
+    url = config.OLLAMA_0_URL
+
+    router.update_thermal_state(url, 70.0)
+    assert router._gpus[url].thermal_paused is False
+
+    router.update_thermal_state(url, 85.0)
+    assert router._gpus[url].thermal_paused is True
+    assert router._gpus[url].thermal_paused_since is not None
+    assert router.is_dispatchable(url) is False
+
+
+def test_thermal_pause_hysteresis_holds_until_resume_threshold(monkeypatch):
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    router, config = _get_router()
+    url = config.OLLAMA_0_URL
+
+    router.update_thermal_state(url, 90.0)
+    assert router._gpus[url].thermal_paused is True
+
+    # Temps between resume and pause thresholds preserve the paused state.
+    for t in (84.0, 75.0, 65.0, 61.0):
+        router.update_thermal_state(url, t)
+        assert router._gpus[url].thermal_paused is True, f"flipped at {t}"
+
+    # Crossing the resume threshold clears the pause.
+    router.update_thermal_state(url, 60.0)
+    assert router._gpus[url].thermal_paused is False
+    assert router._gpus[url].thermal_paused_since is None
+    assert router.is_dispatchable(url) is True
+
+
+def test_is_dispatchable_requires_healthy_and_not_paused(monkeypatch):
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    router, config = _get_router()
+    url = config.OLLAMA_0_URL
+
+    assert router.is_dispatchable(url) is True
+
+    # Thermally paused but healthy → not dispatchable.
+    router.update_thermal_state(url, 90.0)
+    assert router.is_dispatchable(url) is False
+
+    # Cool down → dispatchable again.
+    router.update_thermal_state(url, 55.0)
+    assert router.is_dispatchable(url) is True
+
+    # Mark failed → not dispatchable even when cool.
+    router.mark_failed(url)
+    assert router.is_dispatchable(url) is False
+
+
+def test_status_exposes_thermal_state(monkeypatch):
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
+    router, config = _get_router()
+    url = config.OLLAMA_0_URL
+
+    router.update_thermal_state(url, 72.5)
+    s = router.status()
+    assert s["gpu_temp_pause_c"] == 85
+    assert s["gpu_temp_resume_c"] == 60
+    assert s["gpus"]["gpu0"]["last_temp_c"] == 72.5
+    assert s["gpus"]["gpu0"]["thermal_paused"] is False
+
+    router.update_thermal_state(url, 88.0)
+    s = router.status()
+    assert s["gpus"]["gpu0"]["thermal_paused"] is True
+    assert s["gpus"]["gpu0"]["thermal_paused_since"] is not None
