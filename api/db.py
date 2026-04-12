@@ -218,11 +218,25 @@ def requeue_orphaned_jobs() -> int:
     Called at startup to recover jobs that were mid-flight when the
     process was killed or the container was restarted.  Returns the
     number of jobs recovered.
+
+    Preserves prior ``error`` text (retry history, failure attempts) by
+    appending a ``[recovered after restart]`` marker rather than clobbering
+    the field. A retry-heavy job that gets restarted repeatedly will show
+    its full lineage in the UI instead of only the last recovery note.
     """
+    marker = "[recovered after restart]"
     with lock:
         cur = conn().execute(
-            "UPDATE batch_jobs SET status = 'queued', started_at = NULL, error = 'Recovered after restart' "
-            "WHERE status = 'running'"
+            "UPDATE batch_jobs "
+            "SET status = 'queued', "
+            "    started_at = NULL, "
+            "    error = CASE "
+            "        WHEN error IS NULL OR TRIM(error) = '' THEN ? "
+            "        WHEN INSTR(error, ?) > 0 THEN error "
+            "        ELSE error || ' ' || ? "
+            "    END "
+            "WHERE status = 'running'",
+            (marker, marker, marker),
         )
     return cur.rowcount
 

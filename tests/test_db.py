@@ -198,6 +198,41 @@ def test_requeue_orphaned_jobs_none_running(tmp_db):
     assert db.requeue_orphaned_jobs() == 0
 
 
+def test_requeue_orphaned_jobs_preserves_error_history(tmp_db):
+    """Prior retry/failure history must not be clobbered on restart recovery.
+
+    Before the fix, ``requeue_orphaned_jobs`` unconditionally set
+    ``error = 'Recovered after restart'``. A job that restarted twice
+    during its retry loop lost every earlier failure trace, making
+    post-mortems on flaky upstream calls impossible.
+    """
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    # j1 had a retry failure before the restart happened.
+    db.update_batch_job(
+        "j1", status="running", started_at=time.time(),
+        error="[attempt 1 failed: upstream timeout]",
+    )
+    # j2 never errored.
+    db.update_batch_job("j2", status="running", started_at=time.time())
+
+    db.requeue_orphaned_jobs()
+
+    j1 = db.get_batch_job("j1")
+    assert "attempt 1 failed: upstream timeout" in j1["error"]
+    assert "[recovered after restart]" in j1["error"]
+
+    j2 = db.get_batch_job("j2")
+    assert j2["error"] == "[recovered after restart]"
+
+    # Second restart must not duplicate the marker.
+    db.update_batch_job("j1", status="running")
+    db.requeue_orphaned_jobs()
+    j1 = db.get_batch_job("j1")
+    assert j1["error"].count("[recovered after restart]") == 1
+
+
 def test_insert_and_list_fan_faults(tmp_db):
     db = tmp_db
     db.insert_fan_fault("gpu_fault_onset", "NVML failure detected", fan_speed_applied=80)

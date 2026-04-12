@@ -850,3 +850,90 @@ async def test_thermal_resume_wakes_dispatcher(
     target = await asyncio.wait_for(waiter, timeout=2.0)
     assert target == gpu0
     qm.release(tid)
+
+
+# ── Operator pause / resume ──────────────────────────────────────────────────
+
+
+def test_set_paused_toggles_and_reports(qm):
+    """is_paused / paused_since reflect the operator switch."""
+    assert qm.is_paused() is False
+    assert qm.paused_since() is None
+
+    changed = qm.set_paused(True, persist=False)
+    assert changed is True
+    assert qm.is_paused() is True
+    assert isinstance(qm.paused_since(), float)
+
+    changed = qm.set_paused(True, persist=False)
+    assert changed is False  # idempotent — second call is a no-op
+
+    qm.set_paused(False, persist=False)
+    assert qm.is_paused() is False
+    assert qm.paused_since() is None
+
+
+def test_set_paused_persists_to_settings(qm, tmp_path, monkeypatch):
+    """Persisting the flag means a restart re-reads it from SQLite."""
+    import db
+    qm.set_paused(True, persist=True)
+    assert db.get_settings().get("queue_paused") is True
+    qm.set_paused(False, persist=True)
+    assert db.get_settings().get("queue_paused") is False
+
+
+@pytest.mark.asyncio
+async def test_paused_queue_blocks_new_dispatch(qm, gpu_urls, patch_reload):
+    """While paused, tracked requests queue but never dispatch until resumed."""
+    gpu0, _ = gpu_urls
+    qm.set_paused(True, persist=False)
+    try:
+        tid = qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
+        waiter = asyncio.create_task(qm.wait_for_dispatch(tid))
+        # Give the dispatcher plenty of chances to run — it should no-op.
+        await asyncio.sleep(0.1)
+        assert not waiter.done()
+        assert qm._tracked[tid].status == "queued"
+        # Cancel the waiter so the test doesn't hang on teardown.
+        qm.cancel_tracked(tid, reason="test_cleanup")
+        with pytest.raises(RuntimeError):
+            await waiter
+    finally:
+        qm.set_paused(False, persist=False)
+
+
+@pytest.mark.asyncio
+async def test_resume_wakes_dispatcher_and_clears_backlog(
+        qm, gpu_urls, patch_reload):
+    """Unpausing wakes the dispatcher so queued heads dispatch immediately."""
+    qm.set_paused(True, persist=False)
+    tid = qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    waiter = asyncio.create_task(qm.wait_for_dispatch(tid))
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    qm.set_paused(False, persist=False)
+    target = await asyncio.wait_for(waiter, timeout=2.0)
+    assert target in gpu_urls
+    qm.release(tid)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_request_unaffected_by_pause(
+        qm, gpu_urls, patch_reload):
+    """Pausing after dispatch does not abort the running slot — pause is
+    between-call, per the operator contract. Release still frees the GPU."""
+    tid = qm.track_request("t", "chat", "m", qm.PRIORITY_INTERACTIVE)
+    target = await qm.wait_for_dispatch(tid)
+    assert target in gpu_urls
+    assert qm._tracked[tid].status == "running"
+
+    qm.set_paused(True, persist=False)
+    # The already-dispatched slot is still busy and tracked as running.
+    assert qm._gpu_busy[target] is True
+    assert qm._tracked[tid].status == "running"
+
+    # Normal release path still works while paused.
+    qm.release(tid)
+    assert qm._gpu_busy[target] is False
+    qm.set_paused(False, persist=False)

@@ -203,6 +203,10 @@ async function refresh() {
   // Fault history is always refreshed — it lives on Overview
   loadFaultHistory().catch(() => {});
 
+  // GPU Queue sections now live on Overview — refresh with the poll cycle
+  loadQueue().catch(() => {});
+  loadBatchJobs().catch(() => {});
+
   // Refresh loaded models periodically (SSE only carries active state)
   try {
     const a = await api("/api/merllm/activity");
@@ -221,6 +225,14 @@ async function refresh() {
 function updateBadge(status) {
   const el = document.getElementById("routing-badge");
   if (!el) return;
+  // Operator pause takes visual precedence over health state because the
+  // whole system is intentionally not dispatching — the GPU health badges
+  // are still accurate but subordinate.
+  if (status.queue_paused) {
+    el.textContent = "paused";
+    el.className = "badge-routing badge-degraded";
+    return;
+  }
   const gpus = status.gpus || {};
   const allHealthy = Object.values(gpus).every(g => g.health === "healthy");
   if (allHealthy) {
@@ -458,8 +470,48 @@ async function loadQueue() {
     const data = await api("/api/merllm/queue");
     renderQueueTable(data.queue || []);
     renderBucketLanes(data.buckets || {});
+    renderQueuePauseState(!!data.paused, data.paused_since || null);
   } catch (err) {
     console.error("Queue load error:", err);
+  }
+}
+
+// Pause/resume UI state. Persisted server-side in the settings table, so a
+// restart mid-pause (power outage, rebuild) comes back still paused — this
+// function just mirrors that state into the DOM on every queue refresh.
+function renderQueuePauseState(paused, pausedSince) {
+  const btn    = document.getElementById("queue-pause-btn");
+  const banner = document.getElementById("queue-pause-banner");
+  const since  = document.getElementById("queue-paused-since");
+  if (btn) {
+    btn.textContent = paused ? "Resume Queue" : "Pause Queue";
+    btn.dataset.paused = paused ? "1" : "0";
+    btn.classList.toggle("primary", paused);
+  }
+  if (banner) banner.style.display = paused ? "block" : "none";
+  if (since && paused && pausedSince) {
+    const ago = Math.max(0, Math.round(Date.now() / 1000 - pausedSince));
+    const fmt = ago >= 60
+      ? Math.floor(ago / 60) + "m " + (ago % 60) + "s"
+      : ago + "s";
+    since.textContent = `(paused ${fmt} ago)`;
+  } else if (since) {
+    since.textContent = "";
+  }
+}
+
+async function toggleQueuePause() {
+  const btn = document.getElementById("queue-pause-btn");
+  const isPaused = btn && btn.dataset.paused === "1";
+  const path = isPaused ? "/api/merllm/queue/resume" : "/api/merllm/queue/pause";
+  try {
+    await post(path, {});
+    // Reflect the change immediately; the next status tick will confirm.
+    renderQueuePauseState(!isPaused, !isPaused ? Date.now() / 1000 : null);
+    setTimeout(loadQueue, 200);
+    setTimeout(refresh, 200);
+  } catch (err) {
+    alert("Queue " + (isPaused ? "resume" : "pause") + " failed: " + err.message);
   }
 }
 
@@ -1370,6 +1422,13 @@ async function resetFanSettings() {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+
+function toggleCollapsible(headerEl) {
+  const body = headerEl.nextElementSibling;
+  if (!body) return;
+  headerEl.classList.toggle("is-collapsed");
+  body.classList.toggle("collapsed");
+}
 
 function esc(s) {
   return String(s ?? "")

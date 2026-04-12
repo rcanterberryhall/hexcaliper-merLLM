@@ -18,7 +18,7 @@
 
 <nav>
   <button class="active" data-tab="overview">Overview</button>
-  <button data-tab="queue">GPU Queue</button>
+  <!-- GPU Queue merged into Overview -->
   <button data-tab="metrics">Metrics</button>
   <button data-tab="logs">Logs</button>
   <button data-tab="terminal">SSH</button>
@@ -99,13 +99,9 @@
       </div>
 
     </div>
-  </div>
 
-  <!-- ── GPU Queue ── -->
-  <div id="tab-queue" class="tab">
-
-    <!-- Priority bucket lanes -->
-    <div class="card" style="margin-bottom:16px">
+    <!-- Priority bucket lanes (merged from GPU Queue tab) -->
+    <div class="card" style="margin-top:16px">
       <h2>Priority Buckets</h2>
       <p class="muted" style="font-size:12px;margin-bottom:8px">
         Five buckets, drained strictly top-down. A lower bucket only dispatches when every bucket above it is empty.
@@ -114,10 +110,17 @@
     </div>
 
     <!-- Live queue -->
-    <div class="card" style="margin-bottom:16px">
+    <div class="card" style="margin-top:16px">
       <h2>Active Requests
-        <button class="btn" style="float:right;padding:2px 10px;font-size:11px" onclick="loadQueue()">Refresh</button>
+        <span id="queue-pause-controls" style="float:right;display:flex;gap:6px;align-items:center">
+          <button id="queue-pause-btn" class="btn" style="padding:2px 10px;font-size:11px" onclick="toggleQueuePause()">Pause Queue</button>
+          <button class="btn" style="padding:2px 10px;font-size:11px" onclick="loadQueue()">Refresh</button>
+        </span>
       </h2>
+      <div id="queue-pause-banner" style="display:none;padding:8px 10px;margin-bottom:8px;border-radius:4px;background:rgba(230,167,0,0.12);border:1px solid var(--warn,#e6a700);color:var(--warn,#e6a700);font-size:12px">
+        Queue paused by operator. In-flight work continues; new requests wait until resumed.
+        <span id="queue-paused-since" class="muted" style="margin-left:8px"></span>
+      </div>
       <p class="muted" style="font-size:12px;margin-bottom:8px">
         Every GPU request (chat, short, feedback, background) is shown here while in-flight.
       </p>
@@ -134,7 +137,7 @@
     </div>
 
     <!-- Batch jobs management -->
-    <div class="grid-2">
+    <div class="grid-2" style="margin-top:16px">
       <div class="card">
         <h2>Submit Batch Job</h2>
         <div class="batch-form">
@@ -148,25 +151,31 @@
         </div>
       </div>
       <div class="card">
-        <h2>Batch History</h2>
-        <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn" onclick="loadBatchJobs()">Refresh</button>
-          <button class="btn" onclick="batchRetryFailed()">Retry Failed</button>
-          <button class="btn" style="color:var(--warning,#f0a030)" onclick="batchDrain()">Drain Queue</button>
-          <button class="btn" onclick="batchClearCompleted()">Clear Completed</button>
-        </div>
-        <div id="batch-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th><th>Source</th><th>Model</th><th>Status</th><th>Submitted</th><th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="batch-tbody"></tbody>
-          </table>
+        <h2 class="collapsible-toggle" onclick="toggleCollapsible(this)">
+          Batch History
+          <span class="collapse-icon" style="float:right;font-size:11px;cursor:pointer">&#9660;</span>
+        </h2>
+        <div class="collapsible-body">
+          <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" onclick="loadBatchJobs()">Refresh</button>
+            <button class="btn" onclick="batchRetryFailed()">Retry Failed</button>
+            <button class="btn" style="color:var(--warning,#f0a030)" onclick="batchDrain()">Drain Queue</button>
+            <button class="btn" onclick="batchClearCompleted()">Clear Completed</button>
+          </div>
+          <div id="batch-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th><th>Source</th><th>Model</th><th>Status</th><th>Submitted</th><th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="batch-tbody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
+
   </div>
 
   <!-- ── Metrics ── -->
@@ -356,6 +365,19 @@
           <strong style="color:var(--text)">Call-site rule</strong> — when a new LLM call site is added in any repo,
           read this table, pick the bucket, and cite it in a code comment. Keeping the bucket assignment explicit at
           every call site is what prevents the tiers from drifting back into an accidental mix.<br><br>
+          <strong style="color:var(--text)">Pause / resume</strong> — the Active Requests card on Overview
+          has a Pause Queue button that stops the dispatcher from handing out new GPU slots. In-flight work
+          finishes normally; new requests wait in their buckets until you press Resume. The pause flag is
+          stored in the <code>settings</code> table so a power outage mid-pause does not silently resume bulk
+          work on reboot. <code>CHAT</code> requests still time out after <code>INTERACTIVE_QUEUE_TIMEOUT</code>
+          while paused — they return 503 to the user rather than hanging forever.<br><br>
+          <strong style="color:var(--text)">Restart resilience</strong> — batch jobs submitted via
+          <code>/api/batch/submit</code> are persisted in SQLite and re-enqueued at startup. Jobs left in
+          <code>running</code> when the process was killed are reset to <code>queued</code> with a
+          <code>[recovered after restart]</code> marker appended to the existing error history. Deferred
+          retries (jobs with a future <code>retry_after</code>) keep their backoff across the restart
+          instead of firing immediately. Synchronous proxy calls (<code>/api/chat</code>,
+          <code>/api/generate</code>) are not persisted — the caller owns retry for those.<br><br>
           <strong style="color:var(--text)">Transparent wait</strong> — when a request is queued, a
           <code>queue_status</code> event is emitted before generation starts with the reason and an
           <code>estimated_wait_seconds</code> hint. LanceLLMot and Parsival display this as a waiting indicator.

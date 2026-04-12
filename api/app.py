@@ -186,18 +186,54 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log.warning("Ollama %s unreachable at startup: %s", name, exc)
 
+    # Restore operator pause state before recovery kicks in so re-enqueued
+    # jobs respect it immediately. A power outage during a pause must not
+    # silently resume bulk work — the setting lives in SQLite so it travels
+    # with the DB through a restart.
+    if saved.get("queue_paused"):
+        queue_manager.set_paused(True, persist=False)
+        log.info("queue resumed in PAUSED state from persisted setting")
+
     # Recover any jobs that were running when the process was last killed.
     # ``requeue_orphaned_jobs`` only resets DB status; we also have to
     # re-enqueue an async task for each one or they sit queued forever
     # (the in-memory ``_run_batch_job_async`` future is process-local).
+    #
+    # Deferred retries (``retry_after`` in the future) get a delayed
+    # schedule rather than an immediate run, so a job that was backing off
+    # for 10 minutes resumes its backoff instead of firing instantly on
+    # restart. Each re-enqueued job also gets a shadow entry in the
+    # tracked queue so the Overview UI shows the backlog from the first
+    # frame instead of looking empty while async tasks spin up.
     recovered = db.requeue_orphaned_jobs()
     if recovered:
         log.info("recovered %d orphaned job(s) → queued", recovered)
     pending = db.list_batch_jobs(status="queued")
+    now = time.time()
+    immediate = 0
+    deferred  = 0
     for job in pending:
-        asyncio.ensure_future(queue_manager._run_batch_job_async(job["id"]))
+        retry_after = job.get("retry_after")
+        if retry_after and retry_after > now:
+            delay = retry_after - now
+            deferred += 1
+            # ``call_later`` with a bound lambda to capture ``job_id`` by
+            # value. The sleep runs in the event loop, not a thread, so
+            # hundreds of deferred jobs cost effectively nothing.
+            asyncio.get_event_loop().call_later(
+                delay,
+                lambda jid=job["id"]: asyncio.ensure_future(
+                    queue_manager._run_batch_job_async(jid)
+                ),
+            )
+        else:
+            immediate += 1
+            asyncio.ensure_future(queue_manager._run_batch_job_async(job["id"]))
     if pending:
-        log.info("re-enqueued %d queued batch job(s) for processing", len(pending))
+        log.info(
+            "re-enqueued %d queued batch job(s): %d immediate, %d deferred by retry_after",
+            len(pending), immediate, deferred,
+        )
 
     # Wire queue-change notifications into the activity SSE stream
     queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
@@ -698,6 +734,8 @@ async def merllm_status():
     return {
         **gpu_router.status(),
         "queue":         queue_manager.queue_depth(),
+        "queue_paused":  queue_manager.is_paused(),
+        "queue_paused_since": queue_manager.paused_since(),
         "ollama":        ollama_health,
         "gpu_metrics":   metrics.gpu_snapshot(),
         "batch_counts":  db.count_batch_jobs_by_status(),
@@ -737,10 +775,34 @@ async def merllm_queue():
     drain lanes.
     """
     return {
-        "queue":   queue_manager.active_queue(),
-        "summary": queue_manager.queue_depth(),
-        "buckets": queue_manager.pipe_depth(),
+        "queue":        queue_manager.active_queue(),
+        "summary":      queue_manager.queue_depth(),
+        "buckets":      queue_manager.pipe_depth(),
+        "paused":       queue_manager.is_paused(),
+        "paused_since": queue_manager.paused_since(),
     }
+
+
+@app.post("/api/merllm/queue/pause")
+async def merllm_queue_pause():
+    """Operator pause: stop dispatching new GPU work (in-flight continues).
+
+    Persisted across restarts via the ``settings`` table.
+    """
+    changed = queue_manager.set_paused(True)
+    return {
+        "ok":           True,
+        "paused":       True,
+        "changed":      changed,
+        "paused_since": queue_manager.paused_since(),
+    }
+
+
+@app.post("/api/merllm/queue/resume")
+async def merllm_queue_resume():
+    """Resume dispatching. Wakes the dispatcher so queued heads run now."""
+    changed = queue_manager.set_paused(False)
+    return {"ok": True, "paused": False, "changed": changed}
 
 
 @app.post("/api/merllm/queue/clear")

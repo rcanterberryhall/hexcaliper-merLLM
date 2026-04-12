@@ -99,7 +99,9 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 }
 ```
 
-**Startup recovery** — when merllm-api restarts, any batch jobs left in `running` status are requeued, and all `queued` rows are re-launched via `asyncio.ensure_future(_run_batch_job_async(...))`. Prior to this fix, restarts would leave SQLite rows in `queued` status with no in-process task driving them.
+**Startup recovery** — when merllm-api restarts, any batch jobs left in `running` status are requeued (`error` field keeps its prior retry history with `[recovered after restart]` appended), and all `queued` rows are re-launched via `asyncio.ensure_future(_run_batch_job_async(...))`. Jobs with a future `retry_after` timestamp keep their backoff across the restart — they schedule a delayed re-enqueue instead of firing immediately.
+
+**Operator pause / resume** — `POST /api/merllm/queue/pause` and `POST /api/merllm/queue/resume` stop the dispatcher from handing out new GPU slots. In-flight work keeps running to completion; queued waiters wait until the pause is lifted. The pause flag is stored in the `settings` table so a power outage mid-pause does not silently resume bulk work on reboot. The Overview's **Active Requests** card has a toggle button; the routing badge at the top shows `paused` while it is on.
 
 **Slot watchdog** — a background `_watchdog_loop` task scans `_tracked` every `WATCHDOG_INTERVAL_SECONDS` (default 30s) and force-fails any slot whose `started_at` exceeds `SLOT_MAX_WALL_SECONDS` (default 1800s). This is the last line of defence against hung upstream Ollama calls deadlocking the strict-priority dispatcher — a reclaim log line (`watchdog: reclaiming wedged slot ...`) indicates a bug in either the caller (missing `num_predict`) or the proxy layer, **not** a knob to tune. Bounded `PROXY_READ_TIMEOUT_SECONDS` (default 1800s) on every httpx call to Ollama is the defence-in-depth layer behind it.
 

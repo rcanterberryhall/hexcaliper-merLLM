@@ -555,3 +555,24 @@ tr:hover td { background: #1c2330; }
   font-size: 11px;
   padding-left: 28px;
 }
+
+/* Collapsible sections */
+.collapsible-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+.collapsible-body {
+  overflow: hidden;
+  transition: max-height .25s ease;
+}
+.collapsible-body.collapsed {
+  max-height: 0 !important;
+  overflow: hidden;
+}
+.collapse-icon {
+  transition: transform .2s;
+  display: inline-block;
+}
+.collapsible-toggle.is-collapsed .collapse-icon {
+  transform: rotate(-90deg);
+}

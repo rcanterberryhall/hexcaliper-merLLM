@@ -177,6 +177,15 @@ _state_changed: Optional[asyncio.Event] = None
 _dispatcher_task: Optional[asyncio.Task] = None
 _watchdog_task: Optional[asyncio.Task] = None
 
+# ── Pause state ──────────────────────────────────────────────────────────────
+# Operator-controlled pause switch. When paused, the dispatcher stops handing
+# out new GPU slots; in-flight work continues to completion, the reclaim loop
+# still runs, and new requests pile up in their priority buckets. The paused
+# flag is persisted to the ``settings`` table at set time so a power-outage
+# mid-pause doesn't silently resume bulk work on reboot.
+_paused: bool = False
+_paused_since: Optional[float] = None
+
 # Callback notified on every track/start/complete/fail so the SSE layer can
 # push updates.  Set by app.py at startup.
 _on_queue_change: Optional[callable] = None
@@ -247,6 +256,49 @@ def _wake_dispatcher(reason: str = "unspecified") -> None:
         if not _state_changed.is_set():
             dispatch_log.info("[dispatch] wake requested reason=%s", reason)
         _state_changed.set()
+
+
+def is_paused() -> bool:
+    return _paused
+
+
+def paused_since() -> Optional[float]:
+    return _paused_since
+
+
+def set_paused(paused: bool, persist: bool = True) -> bool:
+    """Flip the operator pause switch.
+
+    While paused the dispatcher refuses to hand out new GPU slots. In-flight
+    work keeps running, the reclaim loop still reloads idle GPUs, and queued
+    waiters simply wait longer. Unpausing wakes the dispatcher so the queued
+    heads get another chance immediately.
+
+    The flag is persisted to the ``settings`` table (``queue_paused``) so
+    restarts remember the paused state — a power outage mid-pause must not
+    silently resume bulk work on reboot. Tests that don't want the side
+    effect pass ``persist=False``.
+
+    Returns True if the flag changed, False if the call was a no-op.
+    """
+    global _paused, _paused_since
+    if _paused == paused:
+        return False
+    _paused = paused
+    _paused_since = time.time() if paused else None
+    if persist:
+        try:
+            # Local import: db imports config, and test harnesses frequently
+            # stub or reset db between cases — keep the coupling lazy.
+            import db
+            db.save_settings({"queue_paused": bool(paused)})
+        except Exception:
+            log.exception("failed to persist queue_paused=%s to settings", paused)
+    log.info("queue %s by operator", "paused" if paused else "resumed")
+    _notify_change()
+    if not paused:
+        _wake_dispatcher(reason="resume")
+    return True
 
 
 def track_request(source: str, request_type: str, model: str,
@@ -600,6 +652,15 @@ def _try_dispatch_heads() -> None:
     higher-priority bucket is empty.
     """
     global _last_dispatch_ts
+
+    # Paused by operator: do not hand out any new slots. In-flight work is
+    # untouched; the walk simply no-ops until set_paused(False) wakes us.
+    if _paused:
+        dispatch_log.info(
+            "[dispatch] walk skipped reason=paused paused_since=%s",
+            _paused_since,
+        )
+        return
 
     # Snapshot of dispatch-time state so the log has enough context to
     # explain any stall we observe.
