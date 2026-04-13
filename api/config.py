@@ -134,19 +134,19 @@ NOTIFICATION_WEBHOOK_URL = _get("NOTIFICATION_WEBHOOK_URL", "")
 
 # ── Companion service URLs (for My Day panel) ────────────────────────────────
 
-# URL of the Parsival (hexcaliper-squire) nginx, reachable from merLLM container.
+# URL of the Parsival nginx, reachable from merLLM container.
 PARSIVAL_URL = _get("PARSIVAL_URL", "http://host.docker.internal:8082")
 
-# URL of the LanceLLMot (hexcaliper) nginx, reachable from merLLM container.
+# URL of the LanceLLMot nginx, reachable from merLLM container.
 LANCELLMOT_URL = _get("LANCELLMOT_URL", "http://host.docker.internal:8080")
 
 # ── Log container name mapping ────────────────────────────────────────────────
 # Maps logical service names to Docker container names for the /api/merllm/logs
 # endpoint. Override if your compose project name or container names differ.
-LOG_CONTAINER_LANCELLMOT_API   = _get("LOG_CONTAINER_LANCELLMOT_API",   "hexcaliper-lancellmot-api-1")
-LOG_CONTAINER_LANCELLMOT_NGINX = _get("LOG_CONTAINER_LANCELLMOT_NGINX", "hexcaliper-lancellmot-nginx-1")
-LOG_CONTAINER_PARSIVAL_API     = _get("LOG_CONTAINER_PARSIVAL_API",     "hexcaliper-squire-parsival-api-1")
-LOG_CONTAINER_PARSIVAL_NGINX   = _get("LOG_CONTAINER_PARSIVAL_NGINX",   "hexcaliper-squire-parsival-nginx-1")
+LOG_CONTAINER_LANCELLMOT_API   = _get("LOG_CONTAINER_LANCELLMOT_API",   "hexcaliper-lancellmot-lancellmot-api-1")
+LOG_CONTAINER_LANCELLMOT_NGINX = _get("LOG_CONTAINER_LANCELLMOT_NGINX", "hexcaliper-lancellmot-lancellmot-nginx-1")
+LOG_CONTAINER_PARSIVAL_API     = _get("LOG_CONTAINER_PARSIVAL_API",     "hexcaliper-parsival-parsival-api-1")
+LOG_CONTAINER_PARSIVAL_NGINX   = _get("LOG_CONTAINER_PARSIVAL_NGINX",   "hexcaliper-parsival-parsival-nginx-1")
 LOG_CONTAINER_MERLLM_API       = _get("LOG_CONTAINER_MERLLM_API",       "merllm-api")
 
 

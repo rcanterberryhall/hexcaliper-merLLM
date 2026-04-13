@@ -2,7 +2,7 @@
 
 Centralized LLM traffic control for the Hexcaliper ecosystem.
 
-merLLM sits between LanceLLMot (hexcaliper) and Parsival (hexcaliper-squire) and both GPU-pinned Ollama instances. It round-robins requests across the GPUs, drains a 5-bucket strict-priority queue (chat → embeddings → short → feedback → background), persists batch jobs through restarts with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
+merLLM sits between LanceLLMot and Parsival and both GPU-pinned Ollama instances. It round-robins requests across the GPUs, drains a 5-bucket strict-priority queue (chat → embeddings → short → feedback → background), persists batch jobs through restarts with automatic retry, sends completion notifications, and exposes a browser dashboard with a unified "My Day" attention panel, system metrics charts, logs, SSH terminal, and VNC viewer.
 
 ```
 LanceLLMot  ──┐
@@ -179,10 +179,10 @@ The `/api/merllm/logs/{service}` endpoint maps logical service names to Docker c
 
 | Variable | Default |
 |---|---|
-| `LOG_CONTAINER_LANCELLMOT_API` | `hexcaliper-lancellmot-api-1` |
-| `LOG_CONTAINER_LANCELLMOT_NGINX` | `hexcaliper-lancellmot-nginx-1` |
-| `LOG_CONTAINER_PARSIVAL_API` | `hexcaliper-squire-parsival-api-1` |
-| `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-squire-parsival-nginx-1` |
+| `LOG_CONTAINER_LANCELLMOT_API` | `hexcaliper-lancellmot-lancellmot-api-1` |
+| `LOG_CONTAINER_LANCELLMOT_NGINX` | `hexcaliper-lancellmot-lancellmot-nginx-1` |
+| `LOG_CONTAINER_PARSIVAL_API` | `hexcaliper-parsival-parsival-api-1` |
+| `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-parsival-parsival-nginx-1` |
 | `LOG_CONTAINER_MERLLM_API` | `merllm-api` |
 
 ## My Day panel
