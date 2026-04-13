@@ -20,8 +20,8 @@ Parsival    ──┘                 └──► ollama-gpu1 :11435  (qwen3:30
 ## Quick start
 
 ```bash
-git clone https://github.com/rcanterberryhall/hexcaliper-merllm
-cd hexcaliper-merllm
+git clone https://github.com/rcanterberryhall/hexcaliper-merLLM
+cd hexcaliper-merLLM
 docker compose up -d
 ```
 
