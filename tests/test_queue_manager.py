@@ -748,6 +748,70 @@ async def test_run_batch_job_marks_activity_during_dispatch(tmp_path, monkeypatc
         "_activity should be cleared after batch job completes"
 
 
+@pytest.mark.asyncio
+async def test_empty_response_fails_job_without_retry(tmp_path, monkeypatch):
+    """A blank ``response`` from Ollama must mark the job ``failed``
+    immediately — no retries, since the prompt is deterministic.
+
+    Before the fix, an empty response string was stored as a successful
+    result, leaving callers (hexcaliper extractor) unable to tell whether
+    the model had nothing to say or the prompt was truncated past
+    ``num_ctx``.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "queue_manager", "db", "config", "gpu_router",
+                   "metrics", "notifications"):
+            sys.modules.pop(mod, None)
+
+    import app as _  # noqa: F401 — imported for side effects
+    import queue_manager as qm
+    import db
+    import gpu_router
+
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {
+                "response": "",
+                "done_reason": "stop",
+                "prompt_eval_count": 17000,
+            }
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, json=None):
+            return _FakeResp()
+
+    monkeypatch.setattr(qm.httpx, "AsyncClient", _FakeClient)
+
+    job_id = qm.submit_batch_job("test", "qwen3:32b", "hello")
+
+    for _ in range(200):
+        job = db.get_batch_job(job_id)
+        if job and job["status"] in ("failed", "completed"):
+            break
+        await asyncio.sleep(0.02)
+
+    job = db.get_batch_job(job_id)
+    assert job["status"] == "failed", \
+        f"expected failed, got {job['status']} with result={job.get('result')!r}"
+    assert job["retries"] == 0, "empty-response must not retry"
+    assert "empty response" in (job["error"] or "").lower()
+    assert "num_ctx" in (job["error"] or "")
+
+
 def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
     """POST /api/batch/submit returns 422 when prompt exceeds BATCH_MAX_PROMPT_LEN."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))

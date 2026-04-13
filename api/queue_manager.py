@@ -134,6 +134,15 @@ class DispatchTimeout(Exception):
     """Raised when a CHAT request exceeds INTERACTIVE_QUEUE_TIMEOUT."""
 
 
+class EmptyResponseError(Exception):
+    """Raised when Ollama returns a blank ``response`` field on /api/generate.
+
+    Not retried: the usual cause is the submitted prompt exceeding ``num_ctx``
+    so Ollama silently left-truncates it — a retry with the same inputs would
+    burn another full decode for the same empty result.
+    """
+
+
 # ── Request tracking ─────────────────────────────────────────────────────────
 
 
@@ -1044,7 +1053,8 @@ async def _run_batch_job_async(job_id: str) -> None:
             ) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
                 resp.raise_for_status()
-                result_text = resp.json().get("response", "")
+                payload = resp.json()
+                result_text = payload.get("response", "")
             http_s = time.time() - http_start
             dispatch_log.info(
                 "[dispatch] batch http_done job=%s tid=%s gpu=%s http=%.2fs "
@@ -1053,6 +1063,16 @@ async def _run_batch_job_async(job_id: str) -> None:
                 len(result_text),
             )
             gpu_router.record_activity(target)
+            if not result_text.strip():
+                prompt_tokens = payload.get("prompt_eval_count")
+                done_reason   = payload.get("done_reason")
+                num_ctx       = options.get("num_ctx")
+                raise EmptyResponseError(
+                    f"Ollama returned empty response "
+                    f"(done_reason={done_reason!r}, "
+                    f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); "
+                    f"likely prompt exceeds num_ctx and was truncated"
+                )
             db.update_batch_job(job_id, status="completed",
                                 completed_at=time.time(), result=result_text)
             log.info("batch job %s completed", job_id[:8])
@@ -1076,7 +1096,10 @@ async def _run_batch_job_async(job_id: str) -> None:
     except Exception as exc:
         fail_request(tracking_id, str(exc))
         prev_error = (job.get("error") or "").strip()
-        if retries < config.BATCH_MAX_RETRIES:
+        # Empty responses are deterministic given the same prompt — retrying
+        # would just burn another full decode for the same blank result.
+        is_retryable = not isinstance(exc, EmptyResponseError)
+        if is_retryable and retries < config.BATCH_MAX_RETRIES:
             backoff    = 30 * (4 ** retries)
             retry_after = time.time() + backoff
             new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
