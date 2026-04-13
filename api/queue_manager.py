@@ -1018,10 +1018,20 @@ async def _run_batch_job_async(job_id: str) -> None:
     for k, v in _defaults.items():
         options.setdefault(k, v)
 
+    # ``think`` is a top-level Ollama request parameter, not an entry in
+    # ``options``. Callers (and our own defaults block above) routinely
+    # tuck it into options because it sits alongside num_predict/num_ctx
+    # conceptually — but Ollama silently ignores it there, so qwen3:* keeps
+    # reasoning and burns the entire num_predict budget before emitting any
+    # content, producing done_reason='length' with an empty response.
+    # Lift it out so it actually takes effect.
+    think_flag = options.pop("think", False)
+
     body = {
         "model":   job["model"],
         "prompt":  job["prompt"],
         "stream":  False,
+        "think":   think_flag,
         "options": options,
     }
 
@@ -1067,11 +1077,26 @@ async def _run_batch_job_async(job_id: str) -> None:
                 prompt_tokens = payload.get("prompt_eval_count")
                 done_reason   = payload.get("done_reason")
                 num_ctx       = options.get("num_ctx")
+                num_predict   = options.get("num_predict")
+                # Distinguish the two empty-response failure modes so the
+                # extractor logs point at the right knob. ``length`` with
+                # the prompt fitting inside num_ctx means num_predict was
+                # exhausted (almost always qwen3:* reasoning emission not
+                # being suppressed); otherwise the prompt really did get
+                # left-truncated past num_ctx.
+                if (done_reason == "length"
+                        and prompt_tokens is not None
+                        and num_ctx is not None
+                        and prompt_tokens < num_ctx):
+                    hint = (f"decode hit num_predict={num_predict} before any "
+                            f"content was emitted (check think=False for qwen3:*)")
+                else:
+                    hint = "likely prompt exceeds num_ctx and was truncated"
                 raise EmptyResponseError(
                     f"Ollama returned empty response "
                     f"(done_reason={done_reason!r}, "
                     f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); "
-                    f"likely prompt exceeds num_ctx and was truncated"
+                    f"{hint}"
                 )
             db.update_batch_job(job_id, status="completed",
                                 completed_at=time.time(), result=result_text)

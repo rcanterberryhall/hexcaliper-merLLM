@@ -812,6 +812,73 @@ async def test_empty_response_fails_job_without_retry(tmp_path, monkeypatch):
     assert "num_ctx" in (job["error"] or "")
 
 
+@pytest.mark.asyncio
+async def test_batch_runner_lifts_think_flag_to_top_level(tmp_path, monkeypatch):
+    """``think`` must be sent as a top-level Ollama request field, not nested
+    inside ``options``. Before the fix it was buried in options where Ollama
+    silently ignored it, so qwen3:* kept reasoning, burned num_predict, and
+    returned ``done_reason='length'`` with an empty response — the failure
+    mode that killed the first 122 extractor jobs of the April re-ingest."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in list(sys.modules.keys()):
+        if mod in ("app", "queue_manager", "db", "config", "gpu_router",
+                   "metrics", "notifications"):
+            sys.modules.pop(mod, None)
+
+    import app as _  # noqa: F401
+    import queue_manager as qm
+    import db
+    import gpu_router
+
+    async def _noop_reload(gpu, model):
+        gpu.model = model
+    monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
+
+    captured: list[dict] = []
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"response": "ok"}
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, json=None):
+            captured.append(json)
+            return _FakeResp()
+
+    monkeypatch.setattr(qm.httpx, "AsyncClient", _FakeClient)
+
+    # Caller nests ``think`` inside options — mimics lancellmot extractor.
+    job_id = qm.submit_batch_job(
+        "lancellmot", "qwen3:32b", "extract prompt",
+        options={"think": False, "num_predict": 384, "num_ctx": 8192},
+    )
+
+    for _ in range(200):
+        job = db.get_batch_job(job_id)
+        if job and job["status"] in ("failed", "completed"):
+            break
+        await asyncio.sleep(0.02)
+
+    assert captured, "no Ollama request was dispatched"
+    body = captured[0]
+    assert body.get("think") is False, \
+        f"think must be top-level, got body={body!r}"
+    assert "think" not in body["options"], \
+        f"think must not be nested inside options, got {body['options']!r}"
+    # Other option keys still survive.
+    assert body["options"]["num_predict"] == 384
+    assert body["options"]["num_ctx"]     == 8192
+
+
 def test_batch_submit_rejects_oversized_prompt(tmp_path, monkeypatch):
     """POST /api/batch/submit returns 422 when prompt exceeds BATCH_MAX_PROMPT_LEN."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))

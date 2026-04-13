@@ -89,7 +89,7 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
 **Automatic retry** — failed jobs are retried up to `BATCH_MAX_RETRIES` times (default 2, giving 3 total attempts) with exponential backoff (30s, 120s). On final failure, the accumulated error messages are stored on the job record.
 
-**Options forwarding** — the `options` dict in the submission body is forwarded verbatim to Ollama. Callers submitting reasoning-model work (qwen3:*) **must** populate `options` with `think: false` and a bounded `num_predict`, otherwise the model will reason unbounded and wedge the queue. Example:
+**Options forwarding** — the `options` dict in the submission body is forwarded verbatim to Ollama. Callers submitting reasoning-model work (qwen3:*) **must** supply `think: false`, a bounded `num_predict`, and `num_ctx`, otherwise the model will reason unbounded and wedge the queue. Note that `think` is a *top-level* Ollama request field, not an options entry — but the batch runner tolerates either location and lifts a nested `think` out of `options` before dispatch, so callers that historically buried it in `options` still run correctly. Example:
 ```json
 {
   "source_app": "parsival",
@@ -98,6 +98,8 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
   "options": {"think": false, "num_predict": 768, "num_ctx": 8192, "temperature": 0.1}
 }
 ```
+
+**Clearing terminal rows** — `DELETE /api/batch/completed` removes `completed` and `cancelled` jobs (optionally `?older_than_days=N`). By default `failed` rows are preserved as evidence for post-mortem; pass `?include_failed=true` to drop them too (useful before re-running an ingest that you'd rather start with a clean slate).
 
 **Startup recovery** — when merllm-api restarts, any batch jobs left in `running` status are requeued (`error` field keeps its prior retry history with `[recovered after restart]` appended), and all `queued` rows are re-launched via `asyncio.ensure_future(_run_batch_job_async(...))`. Jobs with a future `retry_after` timestamp keep their backoff across the restart — they schedule a delayed re-enqueue instead of firing immediately.
 
