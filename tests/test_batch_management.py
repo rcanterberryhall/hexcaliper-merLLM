@@ -93,3 +93,22 @@ def test_delete_completed_with_no_terminal_jobs(client):
     r = client.delete("/api/batch/completed")
     assert r.status_code == 200
     assert r.json()["deleted"] == 0
+
+
+def test_delete_completed_preserves_failed_by_default(client_with_jobs):
+    r = client_with_jobs.delete("/api/batch/completed")
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 2  # failed row survives
+
+    import db
+    assert db.get_batch_job("f1") is not None
+
+
+def test_delete_completed_include_failed_drops_everything_terminal(client_with_jobs):
+    r = client_with_jobs.delete("/api/batch/completed?include_failed=true")
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 3  # completed + cancelled + failed
+
+    import db
+    assert db.get_batch_job("f1") is None
+    assert db.get_batch_job("q1") is not None  # queued untouched

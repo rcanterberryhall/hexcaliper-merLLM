@@ -331,6 +331,38 @@ def test_delete_terminal_jobs_age_filter(tmp_db):
     assert db.get_batch_job("j1") is not None
 
 
+def test_delete_terminal_jobs_preserves_failed_by_default(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.insert_batch_job("j3", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="completed")
+    db.update_batch_job("j2", status="failed", error="boom")
+    db.update_batch_job("j3", status="cancelled")
+
+    count = db.delete_terminal_jobs()
+    assert count == 2
+    assert db.get_batch_job("j1") is None
+    assert db.get_batch_job("j2") is not None  # failed stays as evidence
+    assert db.get_batch_job("j3") is None
+
+
+def test_delete_terminal_jobs_include_failed_opts_in(tmp_db):
+    db = tmp_db
+    db.insert_batch_job("j1", "app", "model", "prompt", {})
+    db.insert_batch_job("j2", "app", "model", "prompt", {})
+    db.insert_batch_job("j3", "app", "model", "prompt", {})
+    db.update_batch_job("j1", status="completed")
+    db.update_batch_job("j2", status="failed", error="boom")
+    db.update_batch_job("j3", status="queued")
+
+    count = db.delete_terminal_jobs(include_failed=True)
+    assert count == 2
+    assert db.get_batch_job("j1") is None
+    assert db.get_batch_job("j2") is None
+    assert db.get_batch_job("j3") is not None  # queued untouched
+
+
 # ── Retry columns ─────────────────────────────────────────────────────────────
 
 

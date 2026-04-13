@@ -190,24 +190,29 @@ def requeue_all_failed_jobs() -> int:
     return cur.rowcount
 
 
-def delete_terminal_jobs(older_than_days: Optional[int] = None) -> int:
+def delete_terminal_jobs(
+    older_than_days: Optional[int] = None,
+    include_failed: bool = False,
+) -> int:
     """
-    Delete completed and cancelled jobs.
-    If older_than_days is set, only delete jobs completed/cancelled more than
-    that many days ago. Returns count deleted.
+    Delete terminal-state jobs. By default drops ``completed`` and ``cancelled``
+    rows only — ``failed`` jobs are preserved because they're usually worth
+    investigating (stuck model, bad prompt, unreachable host). Callers that
+    want a hard wipe can opt in with ``include_failed=True``.
+
+    If ``older_than_days`` is set, only rows whose ``submitted_at`` is older
+    than that are deleted. Returns the count deleted.
     """
+    statuses = ("completed", "cancelled", "failed") if include_failed \
+        else ("completed", "cancelled")
+    placeholders = ",".join("?" * len(statuses))
+    params: list = list(statuses)
+    sql = f"DELETE FROM batch_jobs WHERE status IN ({placeholders})"
+    if older_than_days is not None:
+        sql += " AND submitted_at < ?"
+        params.append(time.time() - older_than_days * 86400)
     with lock:
-        if older_than_days is not None:
-            cutoff = time.time() - older_than_days * 86400
-            cur = conn().execute(
-                "DELETE FROM batch_jobs WHERE status IN ('completed', 'cancelled') "
-                "AND submitted_at < ?",
-                (cutoff,)
-            )
-        else:
-            cur = conn().execute(
-                "DELETE FROM batch_jobs WHERE status IN ('completed', 'cancelled')"
-            )
+        cur = conn().execute(sql, params)
     return cur.rowcount
 
 

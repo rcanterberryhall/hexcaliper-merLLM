@@ -1057,9 +1057,18 @@ async def batch_retry_failed():
 
 
 @app.delete("/api/batch/completed")
-async def batch_delete_completed(older_than_days: Optional[int] = None):
-    """Delete completed and cancelled jobs, optionally filtered by age."""
-    n = db.delete_terminal_jobs(older_than_days)
+async def batch_delete_completed(
+    older_than_days: Optional[int] = None,
+    include_failed: bool = False,
+):
+    """Delete terminal-state jobs.
+
+    By default removes ``completed`` and ``cancelled`` only. Pass
+    ``include_failed=true`` to also drop ``failed`` rows — useful when the
+    caller is intentionally draining the queue (e.g. before a fresh ingest
+    run) and doesn't need the failure history preserved.
+    """
+    n = db.delete_terminal_jobs(older_than_days, include_failed=include_failed)
     return {"ok": True, "deleted": n}
 
 
