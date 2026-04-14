@@ -508,3 +508,45 @@ def test_status_idle_when_no_slots_at_all():
     assert project_status(paused=False, recovered=True,
                           slots=[], buckets_nonempty=False) \
         is SchedulerStatus.IDLE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helpers (for Phase 3 wiring — must not break purity or raise)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_log_transition_emits_on_state_change(caplog):
+    from scheduler import log_transition
+    import logging as _logging
+    before = Slot(url=GPU, state=SlotState.READY, model_loaded="m")
+    after, effects = transition(before, Event.WORK_BEGIN, job=job("m"))
+    with caplog.at_level(_logging.INFO, logger="merllm.scheduler.fsm"):
+        log_transition(before, Event.WORK_BEGIN, after, effects)
+    assert any("[fsm]" in rec.message and "ready→busy" in rec.message
+               for rec in caplog.records)
+
+
+def test_log_transition_skips_noop(caplog):
+    from scheduler import log_transition
+    import logging as _logging
+    s = Slot(url=GPU, state=SlotState.READY, model_loaded="m")
+    after, effects = transition(s, Event.PROBE_OK)
+    with caplog.at_level(_logging.INFO, logger="merllm.scheduler.fsm"):
+        log_transition(s, Event.PROBE_OK, after, effects)
+    assert not any("[fsm]" in rec.message for rec in caplog.records)
+
+
+def test_log_tick_summary_emits_structured_line(caplog):
+    from scheduler import log_tick_summary
+    import logging as _logging
+    with caplog.at_level(_logging.INFO, logger="merllm.scheduler.tick"):
+        log_tick_summary(
+            status=SchedulerStatus.DISPATCHING,
+            dispatched=2, staged=1,
+            bucket_depths=[0, 0, 1, 0, 3],
+            slot_summary=[
+                ("http://gpu0:11434", "busy", "qwen3:32b"),
+                ("http://gpu1:11435", "loading", "qwen3:30b"),
+            ],
+        )
+    assert any("[tick]" in rec.message and "dispatched=2" in rec.message
+               and "staged=1" in rec.message for rec in caplog.records)

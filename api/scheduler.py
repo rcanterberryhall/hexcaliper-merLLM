@@ -16,6 +16,7 @@ Design reference: the consolidated comment on merLLM#52.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
@@ -25,6 +26,18 @@ from typing import Any, Optional
 # and transition to UNREACHABLE. Empirical: three attempts is enough to
 # ride out a transient ollama hiccup without pinning a dead GPU forever.
 MAX_LOAD_ATTEMPTS = 3
+
+
+# Dedicated loggers with short, greppable prefixes. Callers can silence
+# either independently, e.g.
+#     logging.getLogger("merllm.scheduler.fsm").setLevel(logging.WARNING)
+# The transition function itself stays pure; only ``log_transition`` and
+# ``log_tick_summary`` emit records. Phase 3's tick loop calls these after
+# applying each effect list.
+fsm_log  = logging.getLogger("merllm.scheduler.fsm")
+tick_log = logging.getLogger("merllm.scheduler.tick")
+fsm_log.setLevel(logging.INFO)
+tick_log.setLevel(logging.INFO)
 
 
 class SlotState(Enum):
@@ -368,3 +381,49 @@ def project_status(
     if buckets_nonempty and any(s.state is SlotState.READY for s in slots):
         return SchedulerStatus.DISPATCHING
     return SchedulerStatus.IDLE
+
+
+# ── Logging helpers (impure — call AFTER applying effects) ──────────────────
+
+def log_transition(
+    before: Slot, event: Event, after: Slot, effects: list[Effect]
+) -> None:
+    """Emit a single INFO line describing one slot transition.
+
+    Greppable prefix ``[fsm]``. No-op if the state did not change and no
+    effects were produced (pure kwargs-only updates like latched flags
+    still log because they change the slot object).
+    """
+    if before == after and not effects:
+        return
+    kinds = ",".join(e.kind for e in effects) or "-"
+    fsm_log.info(
+        "[fsm] %s %s→%s event=%s model=%s→%s effects=%s",
+        before.url,
+        before.state.value, after.state.value,
+        event.value,
+        before.model_loaded, after.model_loaded,
+        kinds,
+    )
+
+
+def log_tick_summary(
+    *, status: SchedulerStatus,
+    dispatched: int, staged: int,
+    bucket_depths: list[int],
+    slot_summary: list[tuple[str, str, Optional[str]]],
+) -> None:
+    """Emit one INFO line per tick that produced work.
+
+    Greppable prefix ``[tick]``. Skip emission when the tick was a no-op
+    so logs stay readable at rest; the tick loop should call this only
+    when ``dispatched + staged > 0`` or status changed.
+    """
+    slots_fmt = " ".join(
+        f"{url.rsplit(':', 1)[-1]}={state}/{model or '-'}"
+        for url, state, model in slot_summary
+    )
+    tick_log.info(
+        "[tick] status=%s dispatched=%d staged=%d buckets=%s slots=%s",
+        status.value, dispatched, staged, bucket_depths, slots_fmt,
+    )

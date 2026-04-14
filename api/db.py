@@ -2,13 +2,18 @@
 db.py — SQLite WAL persistence for merLLM.
 
 Tables:
-  batch_jobs  — work items dispatched at the background priority bucket
-  metrics     — time-series system and GPU metrics (auto-pruned)
-  settings    — key/value configuration overrides
-  transitions — vestigial day/night transition log (kept for forensic
-                history; no code path writes to it after the round-robin
-                refactor on 2026-04-09)
-  fan_faults  — fan-controller fault events
+  batch_jobs   — work items dispatched at the background priority bucket
+  pending_work — in-flight submitted requests awaiting GPU dispatch; rebuilds
+                 the five priority buckets after a restart (FSM refactor
+                 Phase 2, merLLM#54)
+  slot_state   — last-known state of each GPU slot FSM; reconciled against
+                 live probes on boot (FSM refactor Phase 2, merLLM#54)
+  metrics      — time-series system and GPU metrics (auto-pruned)
+  settings     — key/value configuration overrides
+  transitions  — vestigial day/night transition log (kept for forensic
+                 history; no code path writes to it after the round-robin
+                 refactor on 2026-04-09)
+  fan_faults   — fan-controller fault events
 """
 import json
 import logging
@@ -87,6 +92,26 @@ def _create_tables(c: sqlite3.Connection) -> None:
             fan_speed_applied INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_fan_faults_ts ON fan_faults(ts);
+
+        CREATE TABLE IF NOT EXISTS pending_work (
+            id            TEXT PRIMARY KEY,
+            source        TEXT NOT NULL,
+            request_type  TEXT NOT NULL,
+            model         TEXT NOT NULL,
+            priority      INTEGER NOT NULL,
+            submitted_at  REAL NOT NULL,
+            payload_json  TEXT NOT NULL DEFAULT '{}',
+            batch_job_id  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_priority_submitted
+            ON pending_work(priority, submitted_at);
+
+        CREATE TABLE IF NOT EXISTS slot_state (
+            gpu_url            TEXT PRIMARY KEY,
+            state              TEXT NOT NULL,
+            model_loaded       TEXT,
+            last_transition_at REAL NOT NULL
+        );
     """)
     # Schema migration: add columns that may be absent in older databases.
     existing = {row[1] for row in c.execute("PRAGMA table_info(batch_jobs)").fetchall()}
@@ -374,3 +399,112 @@ def list_fan_faults(limit: int = 100) -> list[dict]:
             "SELECT * FROM fan_faults ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Pending work (FSM refactor: durable submit queue, merLLM#54) ─────────────
+
+def insert_pending(
+    req_id: str,
+    source: str,
+    request_type: str,
+    model: str,
+    priority: int,
+    payload: Optional[dict] = None,
+    batch_job_id: Optional[str] = None,
+) -> None:
+    """Record a submitted request before acknowledging the caller.
+
+    Called on every submit so buckets rebuild exactly after a crash
+    ("Option A" persistence per merLLM#52 design).
+    """
+    with lock:
+        conn().execute(
+            "INSERT INTO pending_work "
+            "(id, source, request_type, model, priority, submitted_at, "
+            " payload_json, batch_job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (req_id, source, request_type, model, int(priority), time.time(),
+             json.dumps(payload or {}), batch_job_id),
+        )
+    log.info("[pending] +%s src=%s type=%s model=%s prio=%d",
+             req_id, source, request_type, model, priority)
+
+
+def delete_pending(req_id: str) -> bool:
+    """Remove a pending row after dispatch commits. Returns True if a row
+    was deleted (i.e. the id was still pending), False otherwise."""
+    with lock:
+        cur = conn().execute(
+            "DELETE FROM pending_work WHERE id = ?", (req_id,)
+        )
+    deleted = cur.rowcount > 0
+    if deleted:
+        log.info("[pending] -%s", req_id)
+    return deleted
+
+
+def list_pending_by_priority() -> list[dict]:
+    """Return all pending rows in dispatch order: priority ASC, then FIFO.
+
+    Matches the five-bucket strict-priority walk: CHAT (0) first, within a
+    priority the oldest submission first. Used on boot to rebuild the
+    in-memory buckets.
+    """
+    with lock:
+        rows = conn().execute(
+            "SELECT * FROM pending_work "
+            "ORDER BY priority ASC, submitted_at ASC"
+        ).fetchall()
+    out = [dict(r) for r in rows]
+    if out:
+        by_prio: dict[int, int] = {}
+        for r in out:
+            by_prio[r["priority"]] = by_prio.get(r["priority"], 0) + 1
+        log.info("[pending] reconciling %d rows from disk: %s",
+                 len(out), by_prio)
+    return out
+
+
+def count_pending() -> int:
+    with lock:
+        row = conn().execute("SELECT COUNT(*) AS n FROM pending_work").fetchone()
+    return int(row["n"]) if row else 0
+
+
+# ── Slot state (FSM refactor: per-GPU last-known FSM state, merLLM#54) ───────
+
+def upsert_slot_state(
+    gpu_url: str, state: str, model_loaded: Optional[str]
+) -> None:
+    """Record the latest observed FSM state for a GPU slot.
+
+    Persisted state is reconciled against a live probe at boot — it is a
+    hint, not a guarantee. Transient in-memory fields (load_attempts,
+    thermal_pending, drain_pending) are deliberately not persisted; they
+    reset to defaults on restart.
+    """
+    with lock:
+        conn().execute(
+            "INSERT INTO slot_state (gpu_url, state, model_loaded, last_transition_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(gpu_url) DO UPDATE SET "
+            "    state = excluded.state, "
+            "    model_loaded = excluded.model_loaded, "
+            "    last_transition_at = excluded.last_transition_at",
+            (gpu_url, state, model_loaded, time.time()),
+        )
+    log.info("[slot] %s state=%s model=%s", gpu_url, state, model_loaded)
+
+
+def list_slot_states() -> list[dict]:
+    with lock:
+        rows = conn().execute("SELECT * FROM slot_state").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_slot_state(gpu_url: str) -> bool:
+    with lock:
+        cur = conn().execute(
+            "DELETE FROM slot_state WHERE gpu_url = ?", (gpu_url,)
+        )
+    return cur.rowcount > 0
