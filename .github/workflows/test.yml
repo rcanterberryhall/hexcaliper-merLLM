@@ -22,8 +22,6 @@ jobs:
         run: pip install --no-cache-dir -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short -m "not stress"
+        run: pytest tests/ -v --tb=short -m "not stress and not integration"
         env:
           DB_PATH: ":memory:"
-          OLLAMA_0_URL: "http://localhost:11434"
-          OLLAMA_1_URL: "http://localhost:11435"
