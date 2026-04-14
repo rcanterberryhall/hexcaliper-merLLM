@@ -1212,6 +1212,7 @@ from scheduler import (  # noqa: E402  — sibling module, grouped with v2 code
     Slot, SlotState, Event, Effect,
     transition, dispatch_pass, stage_pass, project_status,
     log_transition, log_tick_summary, SchedulerStatus,
+    tick_log,
 )
 
 # Canonical slot list — one Slot per configured GPU URL. Single source of
@@ -1349,3 +1350,226 @@ async def _boot_reconcile() -> None:
     ]
     log.info("[boot] reconciled slots=%s buckets=%s total_pending=%d",
              slot_summary, depths, sum(depths))
+
+
+# ── v2: effect application ──────────────────────────────────────────────────
+
+# Wall-clock stamp set when a slot enters BUSY so _sweep_busy_timeouts
+# can drive recovery after SLOT_MAX_WALL_SECONDS. Keyed by slot index
+# (matches _slots[i]). Cleared on every transition out of BUSY.
+_busy_since: dict[int, float] = {}
+
+
+async def _do_load(slot_idx: int, url: str, model: str,
+                   evict: Optional[str]) -> None:
+    """Warm ``model`` on ``url``; feed LOAD_DONE on success, LOAD_FAIL else.
+
+    A ``load`` effect from the scheduler is the orchestrator's cue to
+    post a warmup request. Eviction of any prior model happens
+    implicitly — Ollama swaps on the first request carrying a different
+    ``model`` so the explicit ``evict`` field is observability only.
+    """
+    body: dict = {"model": model, "prompt": "", "keep_alive": "10m"}
+    if model.startswith("qwen3:"):
+        # feedback_reasoning_model_caps: without num_ctx, qwen3 auto-fits
+        # to training-max context on a cold GPU and reload takes ~12 s.
+        body["options"] = {"num_ctx": 8192}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            r = await client.post(f"{url}/api/generate", json=body)
+            r.raise_for_status()
+        log.info("[load] ok url=%s model=%r evict=%r", url, model, evict)
+        _feed_event(slot_idx, Event.LOAD_DONE)
+    except Exception as exc:
+        log.warning("[load] fail url=%s model=%r err=%s", url, model, exc)
+        _feed_event(slot_idx, Event.LOAD_FAIL)
+    _wake_tick(reason="load_settled")
+
+
+def _slot_idx_for_url(url: str) -> Optional[int]:
+    for i, s in enumerate(_slots):
+        if s.url == url:
+            return i
+    return None
+
+
+def _apply_effect(effect: Effect) -> None:
+    """Apply one scheduler effect to the outside world.
+
+    The four effect kinds that ``scheduler.transition`` emits:
+
+    - ``load`` — kick an async ``_do_load`` task. Fire-and-forget; the
+      task eventually feeds LOAD_DONE or LOAD_FAIL back into the FSM.
+    - ``start_work`` — resolve the owning tid's future so
+      ``wait_for_dispatch`` returns the target URL; stamp ``busy_since``
+      so the tick loop can enforce the SLOT_MAX_WALL_SECONDS timeout.
+      The pending_work row is NOT deleted here — durability demands it
+      survive until work_end, so a crash mid-inference re-dispatches.
+    - ``work_end`` — delete the pending_work row (durable queue drain)
+      and clear ``busy_since``. Batch rows live in batch_jobs, untouched.
+    - ``gpu_unreachable`` — observability only; the FSM has already
+      cleared the slot so there is nothing further to change.
+    """
+    kind = effect.kind
+    data = effect.data
+
+    if kind == "load":
+        url = data["url"]
+        idx = _slot_idx_for_url(url)
+        if idx is None:
+            log.error("[effect] load for unknown url=%s", url)
+            return
+        asyncio.create_task(_do_load(idx, url, data["model"], data.get("evict")))
+        return
+
+    if kind == "start_work":
+        url = data["url"]
+        job = data["job"]
+        tid = job.get("tid")
+        idx = _slot_idx_for_url(url)
+        if idx is not None:
+            _busy_since[idx] = time.time()
+        if tid:
+            fut = _inflight.pop(tid, None)
+            _tid_to_job.pop(tid, None)
+            if fut is not None and not fut.done():
+                fut.set_result(url)
+        return
+
+    if kind == "work_end":
+        url = data.get("url")
+        job = data.get("job") or {}
+        tid = job.get("tid")
+        idx = _slot_idx_for_url(url) if url else None
+        if idx is not None:
+            _busy_since.pop(idx, None)
+        if tid:
+            try:
+                db.delete_pending(tid)
+            except Exception:
+                log.exception("[effect] delete_pending failed tid=%s", tid)
+        return
+
+    if kind == "gpu_unreachable":
+        log.warning("[effect] gpu_unreachable url=%s", data.get("url"))
+        return
+
+    log.warning("[effect] unknown kind=%s data=%s", kind, data)
+
+
+# ── v2: tick loop ───────────────────────────────────────────────────────────
+
+def _wake_tick(reason: str = "unspecified") -> None:
+    """Signal the tick loop to re-evaluate. No-op before _ensure_tick."""
+    if _tick_wakeup is not None and not _tick_wakeup.is_set():
+        tick_log.info("[tick] wake reason=%s", reason)
+        _tick_wakeup.set()
+
+
+def _ensure_tick() -> None:
+    """Lazily start the tick loop on the running event loop, if any.
+
+    Mirrors the legacy ``_ensure_dispatcher`` so tests and the app
+    lifespan both pick up the loop without extra wiring. Safe to call
+    repeatedly.
+    """
+    global _tick_wakeup, _tick_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _tick_wakeup is None:
+        _tick_wakeup = asyncio.Event()
+    if _tick_task is None or _tick_task.done():
+        _tick_task = loop.create_task(_tick_loop())
+
+
+def _sweep_busy_timeouts() -> None:
+    """Feed WORK_END(outcome='timeout') on any BUSY slot past its deadline.
+
+    This collapses what used to be ``_watchdog_loop`` into the tick.
+    Recovery goes through LOADING with a forced eviction — the scheduler
+    models timeout as "fail to known state", so the recovery path is
+    identical to a normal reload.
+    """
+    now = time.time()
+    for i, s in enumerate(_slots):
+        if s.state is not SlotState.BUSY:
+            continue
+        since = _busy_since.get(i)
+        if since is None:
+            continue
+        if (now - since) >= config.SLOT_MAX_WALL_SECONDS:
+            tick_log.warning(
+                "[tick] busy timeout url=%s ran=%.0fs — driving work_end(timeout)",
+                s.url, now - since,
+            )
+            for e in _feed_event(i, Event.WORK_END, outcome="timeout"):
+                _apply_effect(e)
+
+
+def _drive_pass(label: str, fn) -> int:
+    """Run one pure scheduler pass, apply effects, update ``_slots``.
+
+    ``fn`` is ``dispatch_pass`` or ``stage_pass``. Returns the effect
+    count so the tick can decide whether to emit a summary line.
+    """
+    global _slots
+    effects, new_slots = fn(_buckets_v2, _slots)
+    _slots = new_slots
+    for e in effects:
+        _apply_effect(e)
+    if effects:
+        tick_log.info("[tick] %s produced %d effects", label, len(effects))
+    return len(effects)
+
+
+async def _tick_once() -> dict:
+    """Run one iteration of the tick body. Test-friendly entry point.
+
+    The main loop wraps this in an ``await _tick_wakeup.wait()`` /
+    periodic-timeout harness. Callers in tests drive it directly to
+    avoid racing a background task.
+    """
+    _sweep_busy_timeouts()
+    if _paused:
+        return {"dispatched": 0, "staged": 0, "paused": True}
+    dispatched = _drive_pass("dispatch", dispatch_pass)
+    staged     = _drive_pass("stage",    stage_pass)
+    if dispatched or staged:
+        status = project_status(
+            paused=_paused, recovered=True,
+            slots=_slots, buckets_nonempty=any(_buckets_v2),
+        )
+        log_tick_summary(
+            status=status,
+            dispatched=dispatched, staged=staged,
+            bucket_depths=[len(b) for b in _buckets_v2],
+            slot_summary=[(s.url, s.state.value, s.model_loaded)
+                          for s in _slots],
+        )
+    return {"dispatched": dispatched, "staged": staged, "paused": False}
+
+
+async def _tick_loop() -> None:
+    """Single background coroutine driving the scheduler forward.
+
+    Wakes on any of: enqueue, release, fail, cancel, probe result,
+    thermal, resume, load settle — plus a 250 ms periodic tick so BUSY
+    timeouts fire even during an otherwise silent period.
+
+    While paused the body skips dispatch and stage; in-flight work still
+    completes (its ``work_end`` effect drains pending_work) so pausing is
+    "no new starts", never "no drains".
+    """
+    log.info("[tick] loop started")
+    while True:
+        try:
+            await asyncio.wait_for(_tick_wakeup.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+        _tick_wakeup.clear()
+        try:
+            await _tick_once()
+        except Exception:
+            log.exception("[tick] loop iteration failed")
