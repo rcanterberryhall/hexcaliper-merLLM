@@ -1200,3 +1200,152 @@ def get_job_result(job_id: str) -> Optional[dict]:
         "id":     job["id"],
         "result": job.get("result", ""),
     }
+
+
+# ── v2: Pure-FSM scheduler path (merLLM#55 Phase 3 cutover) ─────────────────
+# Added alongside the legacy dispatcher above. During Phase 3 the two paths
+# coexist; the public API flips to v2 in a later commit of this series, and
+# the legacy TrackedRequest/_buckets/_dispatcher_loop/_watchdog_loop block is
+# then deleted. Design reference: merLLM#52.
+
+from scheduler import (  # noqa: E402  — sibling module, grouped with v2 code
+    Slot, SlotState, Event, Effect,
+    transition, dispatch_pass, stage_pass, project_status,
+    log_transition, log_tick_summary, SchedulerStatus,
+)
+
+# Canonical slot list — one Slot per configured GPU URL. Single source of
+# truth for per-GPU state once v2 is live (replaces _gpu_busy plus the
+# health/thermal flags currently scattered across gpu_router.GpuState).
+_slots: list[Slot] = []
+
+# Five in-memory FIFO buckets, parallel to _buckets until v1 is deleted.
+# Rebuilt from pending_work at boot; new arrivals are appended here and
+# persisted via db.insert_pending. Elements are plain dicts (see _make_job).
+_buckets_v2: list[list[dict]] = [[] for _ in range(5)]
+
+# Waiters — tid → Future[url]. Resolved when a start_work effect fires
+# for the owning job. Replaces TrackedRequest.status polling.
+_inflight: dict[str, "asyncio.Future[str]"] = {}
+
+# Reverse lookup for cancel_tracked — which job dict currently represents
+# this tid? Cleared when the job leaves its bucket (dispatch or cancel).
+_tid_to_job: dict[str, dict] = {}
+
+# Tick loop wiring. _tick_wakeup is set whenever bucket or slot state
+# changes; _tick_task owns the single background coroutine. Both are
+# wired in the next commit; declared here so reconcile can coexist.
+_tick_wakeup: Optional[asyncio.Event] = None
+_tick_task:   Optional[asyncio.Task] = None
+
+
+def _make_job(*, tid: str, source: str, request_type: str, model: str,
+              priority: int, batch_job_id: Optional[str],
+              submitted_at: float) -> dict:
+    """Canonical shape of the dict stored in _buckets_v2.
+
+    ``model`` is what the scheduler reads for dispatch decisions;
+    everything else is orchestrator/observability metadata.
+    """
+    return {
+        "tid":          tid,
+        "source":       source,
+        "request_type": request_type,
+        "model":        model,
+        "priority":     priority,
+        "batch_job_id": batch_job_id,
+        "submitted_at": submitted_at,
+    }
+
+
+def _feed_event(slot_idx: int, event: Event, **kw) -> list[Effect]:
+    """Feed one event into slot[i]'s FSM.
+
+    Applies the transition, persists the new slot_state row, logs via the
+    ``[fsm]`` prefix, and returns the produced effects. Callers that drive
+    I/O (``_apply_effect`` in the tick loop) consume the return value;
+    purely-state-change callers (boot probe, thermal) can ignore it.
+    """
+    global _slots
+    before = _slots[slot_idx]
+    after, effects = transition(before, event, **kw)
+    _slots = [*_slots[:slot_idx], after, *_slots[slot_idx + 1:]]
+    try:
+        db.upsert_slot_state(after.url, after.state.value, after.model_loaded)
+    except Exception:
+        # slot_state persistence is observability — a failed upsert must not
+        # take down the FSM. Log and carry on; the next transition's upsert
+        # will re-sync the durable row.
+        log.exception("[slot] upsert_slot_state failed url=%s", after.url)
+    log_transition(before, event, after, effects)
+    return effects
+
+
+async def _probe_url(url: str, timeout: float = 5.0) -> bool:
+    """Single ``/api/tags`` probe. True on 2xx, False on any error.
+
+    Used at boot to take each slot UNKNOWN→READY/UNREACHABLE, and later by
+    health recovery. Bounded timeout: a slow GPU must not delay the other
+    slot's READY at startup.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            r = await client.get(f"{url}/api/tags")
+            r.raise_for_status()
+        return True
+    except Exception as exc:
+        log.info("[boot] probe fail url=%s err=%s", url, exc)
+        return False
+
+
+async def _boot_reconcile() -> None:
+    """Rebuild in-memory state from durable SQLite state on app startup.
+
+    Three steps:
+
+    1. Seed ``_slots`` from configured GPU URLs. Enrich with last known
+       ``model_loaded`` from ``slot_state`` so the first tick treats the
+       slot as "probably holding this model" — the next probe confirms.
+    2. Probe every GPU in parallel once. PROBE_OK drives UNKNOWN→READY;
+       PROBE_FAIL drives UNKNOWN→UNREACHABLE.
+    3. Rebuild ``_buckets_v2`` from ``pending_work`` in strict priority,
+       FIFO-by-submission order. Waiter futures are *not* rehydrated —
+       their callers belong to the previous process and are gone. Batch
+       jobs still flow through (the batch row survives); proxy callers
+       get whatever timeout their HTTP client imposed.
+    """
+    global _slots, _buckets_v2, _tid_to_job, _inflight
+
+    rows_by_url = {r["gpu_url"]: r for r in db.list_slot_states()}
+    _slots = []
+    for url in [config.OLLAMA_0_URL, config.OLLAMA_1_URL]:
+        row = rows_by_url.get(url)
+        _slots.append(Slot(
+            url=url, state=SlotState.UNKNOWN,
+            model_loaded=(row["model_loaded"] if row else None),
+        ))
+
+    probes = await asyncio.gather(*[_probe_url(s.url) for s in _slots])
+    for i, ok in enumerate(probes):
+        _feed_event(i, Event.PROBE_OK if ok else Event.PROBE_FAIL)
+
+    _buckets_v2 = [[] for _ in range(5)]
+    _tid_to_job = {}
+    _inflight = {}
+    for row in db.list_pending_by_priority():
+        job = _make_job(
+            tid=row["id"], source=row["source"],
+            request_type=row["request_type"], model=row["model"],
+            priority=row["priority"], batch_job_id=row["batch_job_id"],
+            submitted_at=row["submitted_at"],
+        )
+        _buckets_v2[row["priority"]].append(job)
+        _tid_to_job[job["tid"]] = job
+
+    depths = [len(b) for b in _buckets_v2]
+    slot_summary = [
+        f"{s.url.rsplit(':', 1)[-1]}={s.state.value}/{s.model_loaded or '-'}"
+        for s in _slots
+    ]
+    log.info("[boot] reconciled slots=%s buckets=%s total_pending=%d",
+             slot_summary, depths, sum(depths))

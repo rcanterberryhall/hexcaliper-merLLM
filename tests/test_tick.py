@@ -1,0 +1,126 @@
+"""Tests for the v2 pure-FSM path in queue_manager (merLLM#55 cutover).
+
+Covers _boot_reconcile in this commit; the tick loop and public-API flips
+land in subsequent commits and will extend this file.
+"""
+import asyncio
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
+
+
+@pytest.fixture
+def qm(tmp_path, monkeypatch):
+    """Fresh queue_manager + db wired to a throwaway sqlite file.
+
+    Reloads the db/config/queue_manager modules so the tmp DB_PATH takes
+    effect. Module globals (_slots, _buckets_v2, _tid_to_job, _inflight)
+    therefore start empty for each test.
+    """
+    db_path = str(tmp_path / "test_merllm.db")
+    monkeypatch.setenv("DB_PATH", db_path)
+    # Probe calls httpx — default to "all probes succeed" unless a test
+    # overrides via the _set_probe helper returned below. Monkeypatching
+    # the already-imported httpx.AsyncClient is cleaner than per-test
+    # httpx mocks because _probe_url catches every exception.
+    for mod in ["db", "config", "notifications", "queue_manager"]:
+        sys.modules.pop(mod, None)
+    import queue_manager
+    return queue_manager
+
+
+def _install_probe(qm, results: dict[str, bool]):
+    """Replace _probe_url with a dict-backed stub — no httpx round-trip."""
+    async def fake(url: str, timeout: float = 5.0) -> bool:
+        return results.get(url, False)
+    qm._probe_url = fake
+
+
+# ── boot reconcile ──────────────────────────────────────────────────────────
+
+def test_reconcile_cold_start_no_rows_probes_ok(qm):
+    """Empty DB + healthy probes → two READY slots, no buckets."""
+    import config
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
+
+    asyncio.run(qm._boot_reconcile())
+
+    assert len(qm._slots) == 2
+    assert all(s.state is qm.SlotState.READY for s in qm._slots)
+    assert all(s.model_loaded is None for s in qm._slots)
+    assert all(len(b) == 0 for b in qm._buckets_v2)
+
+
+def test_reconcile_rehydrates_model_loaded_hint(qm):
+    """slot_state row → Slot.model_loaded seed; probe then confirms READY."""
+    import config, db
+    db.upsert_slot_state(config.OLLAMA_0_URL, "ready", "qwen3:32b")
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
+
+    asyncio.run(qm._boot_reconcile())
+
+    slot0 = next(s for s in qm._slots if s.url == config.OLLAMA_0_URL)
+    assert slot0.state is qm.SlotState.READY
+    assert slot0.model_loaded == "qwen3:32b"
+
+
+def test_reconcile_probe_fail_marks_unreachable(qm):
+    """One GPU unreachable at boot → that slot goes UNREACHABLE, other READY."""
+    import config
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: False})
+
+    asyncio.run(qm._boot_reconcile())
+
+    states = {s.url: s.state for s in qm._slots}
+    assert states[config.OLLAMA_0_URL] is qm.SlotState.READY
+    assert states[config.OLLAMA_1_URL] is qm.SlotState.UNREACHABLE
+
+
+def test_reconcile_rebuilds_buckets_priority_fifo(qm):
+    """pending_work → _buckets_v2 in strict priority, FIFO within bucket."""
+    import config, db, time as _t
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
+
+    db.insert_pending("bg-1",    "s", "batch", "m", 4)
+    _t.sleep(0.002)
+    db.insert_pending("chat-a",  "s", "chat",  "m", 0)
+    _t.sleep(0.002)
+    db.insert_pending("chat-b",  "s", "chat",  "m", 0)
+    _t.sleep(0.002)
+    db.insert_pending("short-1", "s", "chat",  "m", 2)
+
+    asyncio.run(qm._boot_reconcile())
+
+    assert [j["tid"] for j in qm._buckets_v2[0]] == ["chat-a", "chat-b"]
+    assert [j["tid"] for j in qm._buckets_v2[2]] == ["short-1"]
+    assert [j["tid"] for j in qm._buckets_v2[4]] == ["bg-1"]
+    assert qm._buckets_v2[1] == [] and qm._buckets_v2[3] == []
+
+
+def test_reconcile_populates_tid_lookup(qm):
+    """_tid_to_job must contain every rehydrated job (used by cancel_tracked)."""
+    import config, db
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
+
+    db.insert_pending("r1", "s", "chat", "m", 0)
+    db.insert_pending("r2", "s", "batch", "m", 4, batch_job_id="bjob-1")
+
+    asyncio.run(qm._boot_reconcile())
+
+    assert set(qm._tid_to_job.keys()) == {"r1", "r2"}
+    assert qm._tid_to_job["r2"]["batch_job_id"] == "bjob-1"
+
+
+def test_reconcile_persists_slot_state_after_probe(qm):
+    """PROBE_OK/FAIL must be reflected in slot_state (durable) post-reconcile."""
+    import config, db
+    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: False})
+
+    asyncio.run(qm._boot_reconcile())
+
+    rows = {r["gpu_url"]: r for r in db.list_slot_states()}
+    assert rows[config.OLLAMA_0_URL]["state"] == "ready"
+    assert rows[config.OLLAMA_1_URL]["state"] == "unreachable"
