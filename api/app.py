@@ -238,6 +238,12 @@ async def lifespan(app: FastAPI):
     # Wire queue-change notifications into the activity SSE stream
     queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
 
+    # Boot-reconcile the scheduler: probe each GPU, rehydrate slot_state,
+    # wipe stale pending_work rows. Must run before any track_request so the
+    # tick loop sees a valid slot lineup. _ensure_tick starts the loop.
+    await queue_manager._boot_reconcile()
+    queue_manager._ensure_tick()
+
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
     asyncio.create_task(gpu_router.reclaim_loop())
@@ -363,9 +369,9 @@ async def _generate_stream(target: str, path: str, body: dict, on_done=None):
     """
     buf = b""
     try:
-        # Bounded read timeout (defence-in-depth behind the queue watchdog)
-        # so a hung Ollama stream cannot pin a slot forever — see
-        # queue_manager._watchdog_loop for the primary deadlock guard.
+        # Bounded read timeout (defence-in-depth behind the tick's busy-slot
+        # timeout sweep) so a hung Ollama stream cannot pin a slot forever —
+        # see queue_manager._sweep_busy_timeouts for the primary deadlock guard.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
         ) as client:
@@ -441,11 +447,11 @@ async def _queued_stream(path: str, body: dict,
       - any other exception: finally runs ``cancel_tracked`` and re-raises.
 
     Before this wrapper existed, a client disconnect during the wait would
-    leave the ``_PendingRequest`` in its bucket; the dispatcher would later
-    pop a dead waiter, flip ``_gpu_busy[target] = True`` and mark the entry
-    ``running`` — but no httpx call was ever issued and no ``release`` fired,
-    wedging the GPU slot until the 1800 s watchdog reclaimed it.  See
-    queue_manager.cancel_tracked() for the idempotent cleanup helper.
+    leave the bucket entry behind; the scheduler would later try to start
+    work on a dead waiter and mark a slot busy — but no httpx call was ever
+    issued and no ``release`` fired, wedging the GPU slot until the busy
+    timeout sweep reclaimed it. See queue_manager.cancel_tracked() for the
+    idempotent cleanup helper.
     """
     async def generate():
         released = False
@@ -576,10 +582,10 @@ async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
     a ``DispatchTimeout``, or a plain unexpected exception.
 
     Without this guard, a client disconnect during the pre-dispatch wait
-    left the ``_PendingRequest`` in its bucket; the dispatcher would then
-    pop a dead waiter and wedge the GPU slot until the watchdog fired
-    1800 s later. See ``queue_manager.cancel_tracked`` for the idempotent
-    helper that handles every in-flight state.
+    left the bucket entry behind; the scheduler would then start work on a
+    dead waiter and wedge the GPU slot until the busy-timeout sweep fired
+    SLOT_MAX_WALL_SECONDS later. See ``queue_manager.cancel_tracked`` for
+    the idempotent helper that handles every in-flight state.
     """
     released = False
     try:
@@ -803,29 +809,6 @@ async def merllm_queue_resume():
     """Resume dispatching. Wakes the dispatcher so queued heads run now."""
     changed = queue_manager.set_paused(False)
     return {"ok": True, "paused": False, "changed": changed}
-
-
-@app.post("/api/merllm/queue/clear")
-async def merllm_queue_clear(force: bool = False):
-    """
-    Admin/test-only: drop entries from the in-memory queue tracker so the
-    next observation starts from a known baseline.
-
-    Not linked from any UI. Intended for integration-test setup and manual
-    operator reset. There is no auth on this endpoint — merllm-api is only
-    reachable from the host network and from sibling containers.
-
-    :param force: If false (default), only ``completed`` and ``failed``
-        entries are removed — safe, does not disturb in-flight work. If
-        true, queued waiters are cancelled with a RuntimeError and running
-        entries are marked failed; any in-flight upstream HTTP request
-        continues running but the tracker no longer reflects it. See
-        ``queue_manager.clear_tracker`` for the full safety contract.
-    :return: ``{"ok": True, "removed": {"completed": N, "failed": N,
-        "queued": N, "running": N}, "force": bool}``.
-    """
-    removed = queue_manager.clear_tracker(force=force)
-    return {"ok": True, "removed": removed, "force": force}
 
 
 @app.get("/api/merllm/activity")

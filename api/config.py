@@ -82,9 +82,6 @@ MODEL_SWAP_COST_SECONDS = int(_get("MODEL_SWAP_COST_SECONDS", "20"))
 # headroom). Tune up only if a legitimate caller hits the wall.
 SLOT_MAX_WALL_SECONDS = int(_get("SLOT_MAX_WALL_SECONDS", "1800"))
 
-# Watchdog poll interval. Cheap (linear scan over _tracked) so 30s is plenty.
-WATCHDOG_INTERVAL_SECONDS = int(_get("WATCHDOG_INTERVAL_SECONDS", "30"))
-
 # How often the streaming proxy emits a keepalive NDJSON chunk while a
 # request is waiting for a GPU slot. Each chunk resets the caller's
 # between-chunk read-gap timeout, so a client with a modest 60s timeout

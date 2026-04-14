@@ -105,12 +105,11 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
 **Operator pause / resume** — `POST /api/merllm/queue/pause` and `POST /api/merllm/queue/resume` stop the dispatcher from handing out new GPU slots. In-flight work keeps running to completion; queued waiters wait until the pause is lifted. The pause flag is stored in the `settings` table so a power outage mid-pause does not silently resume bulk work on reboot. The Overview's **Active Requests** card has a toggle button; the routing badge at the top shows `paused` while it is on.
 
-**Slot watchdog** — a background `_watchdog_loop` task scans `_tracked` every `WATCHDOG_INTERVAL_SECONDS` (default 30s) and force-fails any slot whose `started_at` exceeds `SLOT_MAX_WALL_SECONDS` (default 1800s). This is the last line of defence against hung upstream Ollama calls deadlocking the strict-priority dispatcher — a reclaim log line (`watchdog: reclaiming wedged slot ...`) indicates a bug in either the caller (missing `num_predict`) or the proxy layer, **not** a knob to tune. Bounded `PROXY_READ_TIMEOUT_SECONDS` (default 1800s) on every httpx call to Ollama is the defence-in-depth layer behind it.
+**Slot timeout sweep** — the tick loop's `_sweep_busy_timeouts` runs each iteration and force-fails any BUSY slot whose `started_at` exceeds `SLOT_MAX_WALL_SECONDS` (default 1800s). Recovery drives the slot through LOADING with a forced eviction (fail-to-known-state), so the recovery path is identical to a normal reload. This is the last line of defence against hung upstream Ollama calls deadlocking the strict-priority scheduler — a `[tick] busy timeout ...` log line indicates a bug in either the caller (missing `num_predict`) or the proxy layer, **not** a knob to tune. Bounded `PROXY_READ_TIMEOUT_SECONDS` (default 1800s) on every httpx call to Ollama is the defence-in-depth layer behind it.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SLOT_MAX_WALL_SECONDS` | `1800` | Per-slot wall-clock budget before the watchdog reclaims it |
-| `WATCHDOG_INTERVAL_SECONDS` | `30` | How often the watchdog scans for wedged slots |
+| `SLOT_MAX_WALL_SECONDS` | `1800` | Per-slot wall-clock budget before the tick force-fails it |
 | `PROXY_READ_TIMEOUT_SECONDS` | `1800` | httpx read timeout on every upstream Ollama call |
 | `QUEUE_HEARTBEAT_INTERVAL_SECONDS` | `20` | Interval between queue-wait keepalive NDJSON chunks (see [Transparent wait](#ollama-proxy-api)) |
 
