@@ -361,26 +361,6 @@ def cancel_tracked(tracking_id: str, reason: str = "cancelled") -> None:
     # Unknown / already terminal — nothing to do.
 
 
-# ── gpu_router shims (full removal in commit 5) ─────────────────────────────
-# gpu_router.reclaim_loop still calls these to coordinate model swaps with
-# the old dispatcher's busy bitmap. Commit 5 deletes reclaim_loop and pushes
-# all model-swap decisions through the FSM, at which point these vanish.
-
-def reserve_gpu(target: str) -> bool:
-    """No-op shim. Returns True so reclaim_loop's existing branches work."""
-    return True
-
-
-def unreserve_gpu(target: str) -> None:
-    """No-op shim; commit 5 removes the caller in gpu_router.reclaim_loop."""
-    return None
-
-
-def _wake_dispatcher(reason: str = "unspecified") -> None:
-    """Compat shim: thermal_resume in gpu_router calls this. Commit 5 deletes it."""
-    _wake_tick(reason=reason)
-
-
 # ── Queue visibility ─────────────────────────────────────────────────────────
 
 

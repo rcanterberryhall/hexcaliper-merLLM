@@ -246,7 +246,7 @@ async def lifespan(app: FastAPI):
 
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
-    asyncio.create_task(gpu_router.reclaim_loop())
+    asyncio.create_task(gpu_router.recovery_loop())
 
     log.info("started — routing=%s, default_model=%s",
              "round_robin", config.DEFAULT_MODEL)
@@ -895,12 +895,17 @@ async def default_model():
 
 @app.post("/api/merllm/gpu/{gpu}/reset")
 async def reset_gpu(gpu: str):
-    """Manually reset a faulted GPU to healthy."""
+    """Manually reset a wedged GPU slot — re-probe and feed result into the FSM.
+
+    Used when a slot has been UNREACHABLE long enough to stop being probed
+    by the recovery loop (past HEALTH_FAULT_TIMEOUT) and the operator wants
+    to force a fresh attempt without restarting the container.
+    """
     url_map = {"gpu0": config.OLLAMA_0_URL, "gpu1": config.OLLAMA_1_URL}
     url = url_map.get(gpu)
     if not url:
         raise HTTPException(status_code=422, detail="gpu must be 'gpu0' or 'gpu1'")
-    ok = gpu_router.reset_gpu(url)
+    ok = gpu_router.reset_slot(url)
     if not ok:
         raise HTTPException(status_code=404, detail="GPU not found")
     return {"ok": True, **gpu_router.status()}
@@ -925,7 +930,10 @@ async def get_settings():
 async def save_settings(request: Request):
     body = await request.json()
 
-    # DEFAULT_MODEL change requires explicit confirmation.
+    # DEFAULT_MODEL change requires explicit confirmation. The FSM loads
+    # models on demand (stage_pass mirrors current bucket-head demand onto
+    # idle slots), so the change takes effect the next time work arrives —
+    # no eager warm-load is scheduled here.
     new_model = body.get("default_model")
     if new_model and new_model != config.DEFAULT_MODEL:
         if not body.get("confirm_model_change"):
@@ -933,11 +941,10 @@ async def save_settings(request: Request):
                 status_code=409,
                 content={
                     "ok": False,
-                    "error": "Changing default_model will reload both GPUs when idle. "
+                    "error": "Changing default_model will affect new dispatches. "
                              "Resend with confirm_model_change: true to proceed.",
                 },
             )
-        gpu_router.set_pending_default_model(new_model)
 
     db.save_settings(body)
     config.apply_overrides(body)
