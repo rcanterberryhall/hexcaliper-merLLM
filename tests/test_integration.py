@@ -19,6 +19,8 @@ import uuid
 import pytest
 import httpx
 
+pytestmark = pytest.mark.integration
+
 LANCELLMOT = "http://localhost:8080"
 MERLLM     = "http://localhost:11400"
 PARSIVAL   = "http://localhost:8082"
