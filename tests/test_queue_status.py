@@ -93,6 +93,7 @@ def test_context_tokens_injected_into_done_line(tmp_path, monkeypatch):
     # Stub model swap so the dispatcher does not try to reach a real Ollama.
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     done_chunk = json.dumps({

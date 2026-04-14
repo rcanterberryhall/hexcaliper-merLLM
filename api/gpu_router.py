@@ -238,8 +238,22 @@ async def reclaim_loop() -> None:
                 log.info("DEFAULT_MODEL change complete")
 
 
-async def _reload_model(gpu: GpuState, model: str) -> None:
+async def _reload_model(gpu: GpuState, model: str) -> bool:
     """Send a warmup request to load a model on a GPU.
+
+    Ollama's ``/api/generate`` endpoint rejects embedding-only models with
+    HTTP 400 (``"<model>" does not support generate``). Warming those via
+    ``/api/generate`` would silently no-op — Ollama returns an error body
+    but does not load the model. The dispatcher would then hand off a
+    request to a GPU whose real load happens on the first ``/api/embeddings``
+    call, and any concurrent embedding traffic during that load races and
+    gets 500s. So we branch on the model name and use ``/api/embed`` for
+    anything with "embed" in it (nomic-embed-text, mxbai-embed-large, etc.).
+
+    ``resp.raise_for_status()`` makes a non-2xx warmup a hard failure:
+    ``gpu.model`` is only updated once the warmup actually succeeded, so
+    the reclaim loop will retry on its next tick instead of believing a
+    swap landed when it didn't. Returns True on success, False on failure.
 
     For large reasoning models we pin ``num_ctx`` so Ollama does not
     auto-fit the context window to the model's training maximum on a
@@ -251,16 +265,24 @@ async def _reload_model(gpu: GpuState, model: str) -> None:
     ``queue_manager._run_batch_job_async`` and the
     ``feedback_reasoning_model_caps`` rule.
     """
-    body: dict = {"model": model, "prompt": "", "keep_alive": "10m"}
-    if model.startswith("qwen3:"):
-        body["options"] = {"num_ctx": 8192}
+    if "embed" in model:
+        path = "/api/embed"
+        body: dict = {"model": model, "input": "x", "keep_alive": "10m"}
+    else:
+        path = "/api/generate"
+        body = {"model": model, "prompt": "", "keep_alive": "10m"}
+        if model.startswith("qwen3:"):
+            body["options"] = {"num_ctx": 8192}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            await client.post(f"{gpu.url}/api/generate", json=body)
+            resp = await client.post(f"{gpu.url}{path}", json=body)
+            resp.raise_for_status()
         gpu.model = model
         log.info("GPU %s reloaded with %r", gpu.url, model)
+        return True
     except Exception as exc:
         log.warning("failed to reload %r on GPU %s: %s", model, gpu.url, exc)
+        return False
 
 
 async def _probe_gpu(gpu: GpuState, now: float) -> None:

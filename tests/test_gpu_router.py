@@ -11,6 +11,7 @@ import sys
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
@@ -191,20 +192,79 @@ async def test_reload_model_pins_num_ctx_for_qwen3():
 
 
 @pytest.mark.asyncio
-async def test_reload_model_omits_options_for_non_qwen3():
-    """Non-qwen3 reloads must not inject num_ctx — only the known-large
-    reasoning models need pinning."""
+async def test_reload_model_omits_options_for_non_qwen3_generative():
+    """Non-qwen3 generative reloads must not inject num_ctx — only the
+    known-large reasoning models need pinning."""
     router, config = _get_router()
     gpu = router._gpus[config.OLLAMA_0_URL]
 
     mock_client, captured = _make_post_capturing_client()
     with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
-        await router._reload_model(gpu, "nomic-embed-text")
+        ok = await router._reload_model(gpu, "llama3.1:8b")
 
+    assert ok is True
+    assert captured["url"].endswith("/api/generate")
+    body = captured["kwargs"]["json"]
+    assert body["model"] == "llama3.1:8b"
+    assert "options" not in body
+    assert gpu.model == "llama3.1:8b"
+
+
+@pytest.mark.asyncio
+async def test_reload_model_uses_embed_endpoint_for_embedding_models():
+    """Embedding models must warm via /api/embed, not /api/generate.
+
+    Regression: 2026-04-14 upload 500 race. Ollama's /api/generate returns
+    HTTP 400 for embedding-only models, so warming via /api/generate never
+    actually loads the model. The dispatcher would then hand requests off
+    to a GPU whose real load happens on the first /api/embeddings call,
+    and concurrent traffic during that load races and 500s.
+    """
+    router, config = _get_router()
+    gpu = router._gpus[config.OLLAMA_0_URL]
+
+    mock_client, captured = _make_post_capturing_client()
+    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
+        ok = await router._reload_model(gpu, "nomic-embed-text")
+
+    assert ok is True
+    assert captured["url"].endswith("/api/embed")
     body = captured["kwargs"]["json"]
     assert body["model"] == "nomic-embed-text"
-    assert "options" not in body
+    assert "input" in body and body["input"]
+    assert "prompt" not in body
     assert gpu.model == "nomic-embed-text"
+
+
+@pytest.mark.asyncio
+async def test_reload_model_returns_false_and_preserves_model_on_http_error():
+    """A non-2xx warmup must leave gpu.model untouched and return False,
+    so the dispatcher / reclaim loop can decide whether to retry instead
+    of believing a swap landed when it didn't."""
+    router, config = _get_router()
+    gpu = router._gpus[config.OLLAMA_0_URL]
+    original_model = gpu.model
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "500", request=MagicMock(), response=MagicMock(status_code=500)
+        )
+    )
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    async def _post(url, **kwargs):
+        return mock_resp
+    mock_client.post = _post
+
+    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
+        ok = await router._reload_model(gpu, "qwen3:32b")
+
+    assert ok is False
+    assert gpu.model == original_model
 
 
 # ── Thermal pause tests ──────────────────────────────────────────────────────

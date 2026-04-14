@@ -756,8 +756,20 @@ async def _dispatch(req: _PendingRequest, target: str) -> None:
                 req.tid[:8], target[-5:], gpu_state.model, req.model,
             )
             swap_start = time.time()
-            await gpu_router._reload_model(gpu_state, req.model)
+            ok = await gpu_router._reload_model(gpu_state, req.model)
             swap_ms = (time.time() - swap_start) * 1000
+            if not ok:
+                # Warmup POST did not land: Ollama returned non-2xx, the
+                # connection failed, or the wrong endpoint was used. Do
+                # not hand off — the model is not actually loaded and
+                # the proxy call would 500 on the real request.
+                dispatch_log.warning(
+                    "[dispatch] swap failed tid=%s gpu=%s target=%r ms=%.0f",
+                    req.tid[:8], target[-5:], req.model, swap_ms,
+                )
+                raise RuntimeError(
+                    f"failed to load model {req.model!r} on GPU {target}"
+                )
             dispatch_log.info(
                 "[dispatch] swap done tid=%s gpu=%s ms=%.0f",
                 req.tid[:8], target[-5:], swap_ms,

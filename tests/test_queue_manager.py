@@ -60,6 +60,7 @@ def patch_reload(monkeypatch):
 
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
 
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
@@ -391,6 +392,7 @@ async def test_interactive_dispatch_timeout(monkeypatch):
 
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     # Saturate both GPUs via the reclaim-loop reservation hook so the
@@ -587,6 +589,29 @@ async def test_dispatcher_swaps_when_no_affinity(qm, patch_reload):
     qm.release(tid)
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_fails_request_when_reload_fails(qm, monkeypatch):
+    """If _reload_model returns False, the dispatcher must fail the request
+    rather than hand it off to a GPU whose model did not actually load.
+
+    Regression: 2026-04-14 upload 500 race. _reload_model used to silently
+    claim success for embedding models (wrong endpoint), and the dispatcher
+    would trust it and proxy to an unloaded GPU, where concurrent requests
+    raced on the real load and Ollama 500'd.
+    """
+    import gpu_router
+    gpu_router._init_gpus()
+
+    async def _failing_reload(gpu, model):
+        return False
+    monkeypatch.setattr(gpu_router, "_reload_model", _failing_reload)
+
+    tid = qm.track_request("test", "chat", "fresh-model:13b",
+                           qm.PRIORITY_INTERACTIVE)
+    with pytest.raises(RuntimeError, match="failed to load model"):
+        await qm.wait_for_dispatch(tid)
+
+
 # ── Reclaim cooperation ──────────────────────────────────────────────────────
 
 
@@ -698,6 +723,7 @@ async def test_run_batch_job_marks_activity_during_dispatch(tmp_path, monkeypatc
     # Stub the model swap so the dispatcher does not hit httpx itself.
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     # Fake httpx client that blocks inside post() until released, so the
@@ -771,6 +797,7 @@ async def test_empty_response_fails_job_without_retry(tmp_path, monkeypatch):
 
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     class _FakeResp:
@@ -832,6 +859,7 @@ async def test_batch_runner_lifts_think_flag_to_top_level(tmp_path, monkeypatch)
 
     async def _noop_reload(gpu, model):
         gpu.model = model
+        return True
     monkeypatch.setattr(gpu_router, "_reload_model", _noop_reload)
 
     captured: list[dict] = []
