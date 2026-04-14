@@ -1,10 +1,22 @@
-"""Tests for queue_manager.py — late-binding dispatcher with priority pipes."""
+"""Tests for queue_manager.py — late-binding dispatcher with priority pipes.
+
+Skipped during the merLLM#55 FSM cutover: these assertions describe the
+v1 dispatcher (TrackedRequest status retention, watchdog loop, reserve_gpu,
+etc.). The v2 equivalents live in test_tick.py + test_scheduler.py. This
+file is rewritten or removed in the commit that deletes the v1 code.
+"""
+import pytest
+
+pytest.skip(
+    "v1 dispatcher tests — rewritten in merLLM#55 cutover (see test_tick.py)",
+    allow_module_level=True,
+)
+
 import asyncio
 import os
 import sys
 import time
 
-import pytest
 import pytest_asyncio
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))

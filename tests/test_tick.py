@@ -79,39 +79,21 @@ def test_reconcile_probe_fail_marks_unreachable(qm):
     assert states[config.OLLAMA_1_URL] is qm.SlotState.UNREACHABLE
 
 
-def test_reconcile_rebuilds_buckets_priority_fifo(qm):
-    """pending_work → _buckets_v2 in strict priority, FIFO within bucket."""
-    import config, db, time as _t
-    _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
-
-    db.insert_pending("bg-1",    "s", "batch", "m", 4)
-    _t.sleep(0.002)
-    db.insert_pending("chat-a",  "s", "chat",  "m", 0)
-    _t.sleep(0.002)
-    db.insert_pending("chat-b",  "s", "chat",  "m", 0)
-    _t.sleep(0.002)
-    db.insert_pending("short-1", "s", "chat",  "m", 2)
-
-    asyncio.run(qm._boot_reconcile())
-
-    assert [j["tid"] for j in qm._buckets_v2[0]] == ["chat-a", "chat-b"]
-    assert [j["tid"] for j in qm._buckets_v2[2]] == ["short-1"]
-    assert [j["tid"] for j in qm._buckets_v2[4]] == ["bg-1"]
-    assert qm._buckets_v2[1] == [] and qm._buckets_v2[3] == []
-
-
-def test_reconcile_populates_tid_lookup(qm):
-    """_tid_to_job must contain every rehydrated job (used by cancel_tracked)."""
+def test_reconcile_wipes_stale_pending_rows(qm):
+    """pending_work is a live mirror: stale rows from a prior process are
+    orphaned (HTTP waiters gone, batch recovery re-kicks via
+    _run_batch_job_async). Boot wipes them so they don't double-dispatch."""
     import config, db
     _install_probe(qm, {config.OLLAMA_0_URL: True, config.OLLAMA_1_URL: True})
 
-    db.insert_pending("r1", "s", "chat", "m", 0)
-    db.insert_pending("r2", "s", "batch", "m", 4, batch_job_id="bjob-1")
+    db.insert_pending("stale-1", "s", "chat",  "m", 0)
+    db.insert_pending("stale-2", "s", "batch", "m", 4, batch_job_id="bjob-1")
 
     asyncio.run(qm._boot_reconcile())
 
-    assert set(qm._tid_to_job.keys()) == {"r1", "r2"}
-    assert qm._tid_to_job["r2"]["batch_job_id"] == "bjob-1"
+    assert db.count_pending() == 0
+    assert all(len(b) == 0 for b in qm._buckets_v2)
+    assert qm._tid_to_job == {}
 
 
 def test_reconcile_persists_slot_state_after_probe(qm):

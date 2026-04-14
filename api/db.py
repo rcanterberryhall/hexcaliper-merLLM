@@ -471,6 +471,24 @@ def count_pending() -> int:
     return int(row["n"]) if row else 0
 
 
+def clear_pending() -> int:
+    """Wipe every pending_work row. Returns the number deleted.
+
+    Used at boot: rows from a prior process are orphaned (their HTTP
+    waiters are gone, interactive clients have long since timed out,
+    batch recovery runs through ``_run_batch_job_async`` which
+    reinserts fresh rows via ``track_request``). A fresh mirror avoids
+    double-dispatch of a batch whose prior pending_work row survived
+    alongside the batch_jobs row that drives its re-kick.
+    """
+    with lock:
+        cur = conn().execute("DELETE FROM pending_work")
+    n = cur.rowcount
+    if n:
+        log.info("[pending] cleared %d stale row(s) at boot", n)
+    return n
+
+
 # ── Slot state (FSM refactor: per-GPU last-known FSM state, merLLM#54) ───────
 
 def upsert_slot_state(
