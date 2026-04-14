@@ -515,6 +515,19 @@ async function toggleQueuePause() {
   }
 }
 
+async function clearCompletedRequests() {
+  try {
+    const r = await post("/api/merllm/queue/clear", {});
+    const n = (r.removed?.completed || 0) + (r.removed?.failed || 0);
+    if (n === 0) {
+      alert("No completed or failed requests to clear.");
+    }
+    loadQueue();
+  } catch (err) {
+    alert("Clear failed: " + err.message);
+  }
+}
+
 function _gpuLabel(url) {
   if (!url) return "—";
   if (url.includes("11434")) return "GPU 0";
