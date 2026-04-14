@@ -38,6 +38,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from enum import IntEnum
 from typing import Optional, Union
 
@@ -464,60 +465,77 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
     return job_id
 
 
-async def _run_batch_job_async(job_id: str) -> None:
-    """Execute a batch job through the late-binding dispatcher."""
-    import gpu_router
-    # Deferred import: app imports queue_manager at module load time, so we
-    # cannot import app at the top of this file. Batch jobs must funnel
-    # through the same activity tracker that ``app._proxy`` uses, otherwise
-    # the Ollama Instances card and the SSE stream show the GPU as idle for
-    # the entire duration of the batch run even though it's hammering away.
-    import app as _app
+@asynccontextmanager
+async def tracked_dispatch(*, source: str, request_type: str, model: str,
+                           priority: Union[Priority, int],
+                           batch_job_id: Optional[str] = None):
+    """Track a request, await dispatch, yield the target URL.
 
-    job = db.get_batch_job(job_id)
-    if not job or job["status"] != "queued":
-        return
+    Cleanup is guaranteed: normal exit calls :func:`release` (WORK_END ok);
+    exceptional exit calls :func:`cancel_tracked`, which routes through
+    :func:`fail_request` if the tid was already on a slot or evicts it
+    from its bucket otherwise. Exceptions from ``wait_for_dispatch`` (e.g.
+    :class:`DispatchTimeout`) propagate after the tid is cleaned up.
 
-    retries = job.get("retries", 0)
-    db.update_batch_job(job_id, status="running", started_at=time.time())
+    Use this anywhere a coroutine takes ownership of a tid for the
+    duration of a single dispatched call.
+    """
+    tid = track_request(
+        source=source, request_type=request_type, model=model,
+        priority=priority, batch_job_id=batch_job_id,
+    )
+    try:
+        target = await wait_for_dispatch(tid)
+    except BaseException:
+        # wait_for_dispatch already cleans up on DispatchTimeout, but other
+        # raises (RuntimeError on cancellation, etc.) need a belt-and-braces
+        # cancel so the bucket entry can't outlive the caller.
+        cancel_tracked(tid, reason="wait_failed")
+        raise
+    try:
+        yield target
+    except BaseException:
+        cancel_tracked(tid, reason="caller_exception")
+        raise
+    else:
+        release(tid)
 
+
+def _build_batch_body(job: dict) -> tuple[dict, dict]:
+    """Build the Ollama /api/generate body for a batch job.
+
+    Returns ``(body, options)`` so the caller can later inspect ``options``
+    when classifying empty-response failures.
+
+    Defensive defaults guard against the "unbounded reasoning" failure mode:
+    qwen3:* without ``think=False`` + bounded ``num_predict`` + a fixed
+    ``num_ctx`` will burn its entire decode budget on reasoning and return
+    an empty response. Defaults only fill MISSING keys — explicit caller
+    values are respected.
+
+    ``num_ctx`` also forces both GPUs to converge on the same KV-cache size
+    so identical workloads run at the same speed regardless of which GPU
+    served them.
+
+    ``think`` is a top-level Ollama request parameter — Ollama silently
+    ignores it inside ``options`` — so we lift it out before sending.
+    """
     options: dict = {}
     try:
         options = json.loads(job.get("options", "{}"))
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # ── Defensive option defaults ────────────────────────────────────────
-    # Belt-and-suspenders for the "unbounded reasoning" failure mode:
-    # if a caller submitted a batch job without the three keys that keep
-    # qwen3:* from wedging a slot (think:false, num_predict, num_ctx),
-    # fill them in here so old jobs, buggy callers, and third-party clients
-    # still run with safe bounds. We only fill in MISSING keys — if the
-    # caller specified a value we respect it.
-    #
-    # num_ctx also serves a second purpose: it forces every Ollama instance
-    # to converge on the same KV-cache size. Without it the two GPUs can
-    # end up loaded with different context lengths (one from an earlier
-    # request, one from a later one) and the larger-ctx GPU becomes
-    # ~2× slower on identical workloads because of the bigger KV cache.
-    _defaults = {
-        "think":       False,     # disable qwen3 reasoning emission
-        "num_predict": 768,       # bounded decode cap
-        "num_ctx":     8192,      # fixed KV cache so both GPUs match
-        "temperature": 0.1,       # deterministic-ish for extraction tasks
+    defaults = {
+        "think":       False,
+        "num_predict": 768,
+        "num_ctx":     8192,
+        "temperature": 0.1,
     }
-    for k, v in _defaults.items():
+    for k, v in defaults.items():
         options.setdefault(k, v)
 
-    # ``think`` is a top-level Ollama request parameter, not an entry in
-    # ``options``. Callers (and our own defaults block above) routinely
-    # tuck it into options because it sits alongside num_predict/num_ctx
-    # conceptually — but Ollama silently ignores it there, so qwen3:* keeps
-    # reasoning and burns the entire num_predict budget before emitting any
-    # content, producing done_reason='length' with an empty response.
-    # Lift it out so it actually takes effect.
     think_flag = options.pop("think", False)
-
     body = {
         "model":   job["model"],
         "prompt":  job["prompt"],
@@ -525,126 +543,146 @@ async def _run_batch_job_async(job_id: str) -> None:
         "think":   think_flag,
         "options": options,
     }
+    return body, options
 
-    tracking_id = track_request(
-        source=job["source_app"],
-        request_type="batch",
-        model=job["model"],
-        priority=Priority.BACKGROUND,
-        batch_job_id=job_id,
+
+def _validate_batch_response(payload: dict, options: dict) -> str:
+    """Extract response text or raise :class:`EmptyResponseError` with a hint.
+
+    Distinguishes the two empty-response failure modes so the extractor
+    logs point at the right knob: ``done_reason='length'`` with the prompt
+    fitting inside ``num_ctx`` means ``num_predict`` was exhausted
+    (almost always qwen3:* reasoning emission not being suppressed);
+    otherwise the prompt was truncated past ``num_ctx``.
+    """
+    text = payload.get("response", "")
+    if text.strip():
+        return text
+
+    prompt_tokens = payload.get("prompt_eval_count")
+    done_reason   = payload.get("done_reason")
+    num_ctx       = options.get("num_ctx")
+    num_predict   = options.get("num_predict")
+    if (done_reason == "length"
+            and prompt_tokens is not None
+            and num_ctx is not None
+            and prompt_tokens < num_ctx):
+        hint = (f"decode hit num_predict={num_predict} before any "
+                f"content was emitted (check think=False for qwen3:*)")
+    else:
+        hint = "likely prompt exceeds num_ctx and was truncated"
+    raise EmptyResponseError(
+        f"Ollama returned empty response "
+        f"(done_reason={done_reason!r}, "
+        f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); {hint}"
     )
 
-    try:
-        dispatch_wait_start = time.time()
-        target = await wait_for_dispatch(tracking_id)
-        dispatch_wait_s = time.time() - dispatch_wait_start
-        dispatch_log.info(
-            "[dispatch] batch wait_done job=%s tid=%s gpu=%s wait=%.2fs",
-            job_id[:8], tracking_id[:8], target[-5:], dispatch_wait_s,
+
+def _notify_terminal(job_id: str) -> None:
+    """Fire-and-forget notification dispatch for a completed/failed job."""
+    j = db.get_batch_job(job_id)
+    if not j or j.get("status") not in ("completed", "failed"):
+        return
+    asyncio.ensure_future(notifications.dispatch(
+        j, webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+    ))
+
+
+async def _handle_batch_failure(job_id: str, retries: int, exc: Exception,
+                                prev_error: str) -> None:
+    """Decide retry vs final-fail for a batch job; persist the outcome.
+
+    Empty responses are deterministic given the same inputs, so they are
+    not retried — that would just burn another full decode for the same
+    blank result. Other exceptions retry up to BATCH_MAX_RETRIES with
+    exponential backoff (30 s × 4ⁿ).
+    """
+    is_retryable = not isinstance(exc, EmptyResponseError)
+    if is_retryable and retries < config.BATCH_MAX_RETRIES:
+        backoff     = 30 * (4 ** retries)
+        retry_after = time.time() + backoff
+        new_error   = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
+        db.update_batch_job(
+            job_id, status="queued", retries=retries + 1,
+            retry_after=retry_after, started_at=None, error=new_error,
         )
-        _app._activity_set(target, job["model"], "/api/generate")
-        try:
+        log.warning(
+            "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
+            job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
+        )
+        await asyncio.sleep(backoff)
+        await _run_batch_job_async(job_id)
+        return
+
+    final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
+    db.update_batch_job(job_id, status="failed",
+                        completed_at=time.time(), error=final_error)
+    log.error("batch job %s permanently failed after %d attempt(s): %s",
+              job_id[:8], retries + 1, exc)
+    _notify_terminal(job_id)
+
+
+async def _run_batch_job_async(job_id: str) -> None:
+    """Execute a batch job through the FSM dispatcher.
+
+    Lifecycle is anchored on :func:`tracked_dispatch` so the tid leaves the
+    queue/slot regardless of how this coroutine exits. Activity tracking
+    is nested inside the dispatch so the UI shows the GPU as busy for the
+    duration of the HTTP call (and only the HTTP call).
+    """
+    # Deferred import: app imports queue_manager at module load time, so we
+    # cannot import app at the top of this file. Batch jobs funnel through
+    # the same activity tracker as ``app._proxy`` so the Ollama Instances
+    # card stays accurate during a long batch run.
+    import app as _app
+    import gpu_router
+
+    job = db.get_batch_job(job_id)
+    if not job or job["status"] != "queued":
+        return
+
+    retries    = job.get("retries", 0)
+    prev_error = (job.get("error") or "").strip()
+    db.update_batch_job(job_id, status="running", started_at=time.time())
+
+    body, options = _build_batch_body(job)
+    target: Optional[str] = None
+
+    try:
+        async with tracked_dispatch(
+            source=job["source_app"], request_type="batch",
+            model=job["model"], priority=Priority.BACKGROUND,
+            batch_job_id=job_id,
+        ) as t:
+            target = t
+            _app._activity_set(target, job["model"], "/api/generate")
             # Bounded read timeout: defence-in-depth behind the tick's
             # busy-slot timeout sweep. If the slot has already been driven
             # through WORK_END(timeout), this still eventually unblocks the
             # coroutine instead of leaking the httpx connection forever.
-            http_start = time.time()
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
             ) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
                 resp.raise_for_status()
                 payload = resp.json()
-                result_text = payload.get("response", "")
-            http_s = time.time() - http_start
-            dispatch_log.info(
-                "[dispatch] batch http_done job=%s tid=%s gpu=%s http=%.2fs "
-                "resp_chars=%d",
-                job_id[:8], tracking_id[:8], target[-5:], http_s,
-                len(result_text),
-            )
             gpu_router.record_activity(target)
-            if not result_text.strip():
-                prompt_tokens = payload.get("prompt_eval_count")
-                done_reason   = payload.get("done_reason")
-                num_ctx       = options.get("num_ctx")
-                num_predict   = options.get("num_predict")
-                # Distinguish the two empty-response failure modes so the
-                # extractor logs point at the right knob. ``length`` with
-                # the prompt fitting inside num_ctx means num_predict was
-                # exhausted (almost always qwen3:* reasoning emission not
-                # being suppressed); otherwise the prompt really did get
-                # left-truncated past num_ctx.
-                if (done_reason == "length"
-                        and prompt_tokens is not None
-                        and num_ctx is not None
-                        and prompt_tokens < num_ctx):
-                    hint = (f"decode hit num_predict={num_predict} before any "
-                            f"content was emitted (check think=False for qwen3:*)")
-                else:
-                    hint = "likely prompt exceeds num_ctx and was truncated"
-                raise EmptyResponseError(
-                    f"Ollama returned empty response "
-                    f"(done_reason={done_reason!r}, "
-                    f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); "
-                    f"{hint}"
-                )
+            result_text = _validate_batch_response(payload, options)
             db.update_batch_job(job_id, status="completed",
                                 completed_at=time.time(), result=result_text)
             log.info("batch job %s completed", job_id[:8])
-            completed_job = db.get_batch_job(job_id)
-            if completed_job:
-                asyncio.ensure_future(notifications.dispatch(
-                    completed_job,
-                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-                ))
-        finally:
-            # Order matters: release() first so the dispatcher can hand the
-            # GPU to the next waiter in the same event-loop tick. If we
-            # clear activity before releasing, the UI briefly sees the GPU
-            # as idle even though a new job is about to start on it — the
-            # visible "stop/start" flicker the user reported during large
-            # batches. The new request's _activity_set() will overwrite
-            # ours, so the clear is only there to cover the "no work left"
-            # case.
-            release(tracking_id)
-            _app._activity_clear(target)
+        # tracked_dispatch __aexit__ has fired release() by here.
+        _notify_terminal(job_id)
     except Exception as exc:
-        fail_request(tracking_id, str(exc))
-        prev_error = (job.get("error") or "").strip()
-        # Empty responses are deterministic given the same prompt — retrying
-        # would just burn another full decode for the same blank result.
-        is_retryable = not isinstance(exc, EmptyResponseError)
-        if is_retryable and retries < config.BATCH_MAX_RETRIES:
-            backoff    = 30 * (4 ** retries)
-            retry_after = time.time() + backoff
-            new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
-            db.update_batch_job(
-                job_id,
-                status="queued",
-                retries=retries + 1,
-                retry_after=retry_after,
-                started_at=None,
-                error=new_error,
-            )
-            log.warning(
-                "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
-                job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
-            )
-            await asyncio.sleep(backoff)
-            await _run_batch_job_async(job_id)
-        else:
-            final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
-            db.update_batch_job(job_id, status="failed",
-                                completed_at=time.time(), error=final_error)
-            log.error("batch job %s permanently failed after %d attempt(s): %s",
-                      job_id[:8], retries + 1, exc)
-            failed_job = db.get_batch_job(job_id)
-            if failed_job:
-                asyncio.ensure_future(notifications.dispatch(
-                    failed_job,
-                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-                ))
+        await _handle_batch_failure(job_id, retries, exc, prev_error)
+    finally:
+        # Clear activity AFTER release so a follow-up batch's _activity_set
+        # overwrites ours without a visible idle gap. tracked_dispatch's
+        # __aexit__ runs before this finally on the success path, and
+        # before _handle_batch_failure on the failure path, so ordering
+        # holds in both cases.
+        if target is not None:
+            _app._activity_clear(target)
 
 
 def get_queue_position(job_id: str) -> Optional[int]:
