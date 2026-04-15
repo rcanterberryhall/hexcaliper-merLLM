@@ -559,14 +559,60 @@ function _priorityBadge(name) {
   return `<span class="priority-badge priority-${esc(safe)}">${esc(safe)}</span>`;
 }
 
-function renderQueueTable(queue) {
+// ── Table sorting ────────────────────────────────────────────────────────────
+
+const _sortState = {};
+let _lastQueueData = [];
+let _lastBatchData = [];
+
+function _sortRows(rows, key, dir) {
+  return [...rows].sort((a, b) => {
+    let va = a[key], vb = b[key];
+    if (va == null) va = "";
+    if (vb == null) vb = "";
+    if (typeof va === "number" && typeof vb === "number") return dir * (va - vb);
+    return dir * String(va).localeCompare(String(vb), undefined, { numeric: true });
+  });
+}
+
+function _handleSortClick(e) {
+  const th = e.target.closest("th.sortable");
+  if (!th) return;
+  const key = th.dataset.sortKey;
+  const table = th.closest("table");
+  const tbodyId = table.querySelector("tbody").id;
+
+  const prev = _sortState[tbodyId];
+  const dir = (prev && prev.key === key && prev.dir === 1) ? -1 : 1;
+  _sortState[tbodyId] = { key, dir };
+
+  table.querySelectorAll("th.sortable").forEach(h => h.classList.remove("sort-asc", "sort-desc"));
+  th.classList.add(dir === 1 ? "sort-asc" : "sort-desc");
+
+  if (tbodyId === "queue-tbody") renderQueueTable(_lastQueueData, true);
+  else if (tbodyId === "batch-tbody") renderBatchTable(_lastBatchData, true);
+}
+
+document.querySelectorAll("th.sortable").forEach(th =>
+  th.addEventListener("click", _handleSortClick)
+);
+
+function _applySortIfSet(rows, tbodyId) {
+  const s = _sortState[tbodyId];
+  if (s) return _sortRows(rows, s.key, s.dir);
+  return rows;
+}
+
+function renderQueueTable(queue, sortOnly) {
+  if (!sortOnly) _lastQueueData = queue || [];
   const tbody = document.getElementById("queue-tbody");
   if (!tbody) return;
-  if (!queue || !queue.length) {
+  const data = _applySortIfSet(_lastQueueData, "queue-tbody");
+  if (!data.length) {
     tbody.innerHTML = '<tr><td colspan="7" class="muted">No active requests.</td></tr>';
     return;
   }
-  tbody.innerHTML = queue.map(r => {
+  tbody.innerHTML = data.map(r => {
     const statusCls = r.status === "running" ? "pill-running"
       : r.status === "queued" ? "pill-queued"
       : r.status === "failed" ? "pill-failed" : "pill-completed";
@@ -605,27 +651,34 @@ function renderBucketLanes(buckets) {
 
 // ── Batch jobs ────────────────────────────────────────────────────────────────
 
+function renderBatchTable(jobs, sortOnly) {
+  if (!sortOnly) _lastBatchData = jobs || [];
+  const tbody = document.getElementById("batch-tbody");
+  if (!tbody) return;
+  const data = _applySortIfSet(_lastBatchData, "batch-tbody");
+  if (!data.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">No jobs.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = data.map(j => `
+    <tr>
+      <td class="mono" style="font-size:11px">${j.id.substring(0, 8)}&hellip;</td>
+      <td>${esc(j.source_app)}</td>
+      <td>${esc(j.model)}</td>
+      <td><span class="status-pill pill-${j.status}">${j.status}</span></td>
+      <td class="muted" style="font-size:11px">${fmtTs(j.submitted_at)}</td>
+      <td>
+        ${j.status === "queued" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelJob('${j.id}')">Cancel</button>` : ""}
+        ${j.status === "failed" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="requeueJob('${j.id}')">Requeue</button>` : ""}
+        ${j.status === "completed" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="viewResult('${j.id}')">Result</button>` : ""}
+      </td>
+    </tr>`).join("");
+}
+
 async function loadBatchJobs() {
   try {
     const jobs = await api("/api/batch/status");
-    const tbody = document.getElementById("batch-tbody");
-    if (!jobs || !jobs.length) {
-      tbody.innerHTML = '<tr><td colspan="6" class="muted">No jobs.</td></tr>';
-      return;
-    }
-    tbody.innerHTML = jobs.map(j => `
-      <tr>
-        <td class="mono" style="font-size:11px">${j.id.substring(0, 8)}&hellip;</td>
-        <td>${esc(j.source_app)}</td>
-        <td>${esc(j.model)}</td>
-        <td><span class="status-pill pill-${j.status}">${j.status}</span></td>
-        <td class="muted" style="font-size:11px">${fmtTs(j.submitted_at)}</td>
-        <td>
-          ${j.status === "queued" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="cancelJob('${j.id}')">Cancel</button>` : ""}
-          ${j.status === "failed" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="requeueJob('${j.id}')">Requeue</button>` : ""}
-          ${j.status === "completed" ? `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="viewResult('${j.id}')">Result</button>` : ""}
-        </td>
-      </tr>`).join("");
+    renderBatchTable(jobs);
   } catch (err) {
     console.error("Batch load error:", err);
   }

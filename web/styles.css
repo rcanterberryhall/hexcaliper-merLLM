@@ -250,6 +250,11 @@ th {
   text-transform: uppercase;
   letter-spacing: .5px;
 }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th.sortable::after { content: ""; margin-left: 4px; font-size: 9px; }
+th.sortable.sort-asc::after { content: "▲"; }
+th.sortable.sort-desc::after { content: "▼"; }
 td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: #1c2330; }

@@ -9,6 +9,7 @@ behaviour itself is covered by test_scheduler.py and test_tick.py.
 import os
 import sys
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
