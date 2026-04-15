@@ -77,7 +77,7 @@ class TestServiceHealth:
         r = api(MERLLM, "/api/merllm/status")
         assert r.status_code == 200
         d = r.json()
-        assert d["routing"] == "round_robin"
+        assert d["routing"] == "fsm"
         # GPUs can be transiently unavailable under heavy batch load
         gpus_ok = [d["ollama"][g]["ok"] for g in d["ollama"]]
         if not all(gpus_ok):

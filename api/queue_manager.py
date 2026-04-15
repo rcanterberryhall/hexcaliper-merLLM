@@ -251,6 +251,12 @@ async def wait_for_dispatch(tracking_id: str) -> str:
     Raises ``DispatchTimeout`` if a CHAT request exceeds
     ``INTERACTIVE_QUEUE_TIMEOUT``; other buckets wait indefinitely.
     Raises ``RuntimeError`` if the tid was cancelled while waiting.
+
+    Self-cleaning: any exit other than a normal return (timeout, caller
+    ``CancelledError``, or any other exception thrown into the await) runs
+    ``cancel_tracked`` before re-raising, so a still-bucketed entry never
+    outlives its waiter. Callers do not need a ``finally`` block for the
+    pre-dispatch phase.
     """
     job = _tid_to_job.get(tracking_id)
     if job is None:
@@ -272,6 +278,13 @@ async def wait_for_dispatch(tracking_id: str) -> str:
         # CHAT timed out in its bucket — pull it out and clean up.
         cancel_tracked(tracking_id, reason="chat_queue_timeout")
         raise DispatchTimeout("chat request exceeded INTERACTIVE_QUEUE_TIMEOUT")
+    except BaseException:
+        # CancelledError, connection drops, or any other exception thrown
+        # into the await: if we're still bucketed, cancel_tracked pops us
+        # out; if we've already been dispatched, it routes through
+        # fail_request so the slot recovers. Idempotent either way.
+        cancel_tracked(tracking_id, reason="wait_failed")
+        raise
 
 
 def _slot_idx_owning(tid: str) -> Optional[int]:
@@ -360,6 +373,28 @@ def cancel_tracked(tracking_id: str, reason: str = "cancelled") -> None:
         return
 
     # Unknown / already terminal — nothing to do.
+
+
+@asynccontextmanager
+async def dispatched(tracking_id: str):
+    """Await dispatch for a pre-tracked tid, yield target URL, release on exit.
+
+    Companion to :func:`tracked_dispatch` for handlers that need to keep the
+    tid on their own (e.g. a streaming path that interleaves keepalives with
+    the dispatch wait). Slot lifecycle is owned here, not by the caller:
+
+      * normal exit: :func:`release` (WORK_END ok).
+      * body raises: :func:`fail_request` (WORK_END fail), then re-raise.
+      * wait raises: :func:`wait_for_dispatch` already self-cleaned, re-raise.
+    """
+    target = await wait_for_dispatch(tracking_id)
+    try:
+        yield target
+    except BaseException as exc:
+        fail_request(tracking_id, str(exc))
+        raise
+    else:
+        release(tracking_id)
 
 
 # ── Queue visibility ─────────────────────────────────────────────────────────

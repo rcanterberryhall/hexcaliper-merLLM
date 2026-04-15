@@ -268,3 +268,103 @@ def test_tick_paused_skips_dispatch_and_stage(qm):
     assert result["paused"] is True
     # Slots stayed READY with no model — stage_pass never ran.
     assert all(s.model_loaded is None for s in slots)
+
+
+# ── self-cleaning wait_for_dispatch + dispatched() CM (merLLM#55 item 5) ────
+
+def _enqueue_manual(qm, tid: str, model: str = "m", priority=None):
+    """Match test_tick_dispatches_head's manual-state style: no background tick."""
+    if priority is None:
+        priority = qm.Priority.CHAT
+    job = qm._make_job(
+        tid=tid, source="s", request_type="chat", model=model,
+        priority=priority, batch_job_id=None, submitted_at=0.0,
+    )
+    qm._buckets_v2[int(priority)].append(job)
+    qm._tid_to_job[tid] = job
+    import db
+    db.insert_pending(tid, "s", "chat", model, int(priority))
+    return job
+
+
+def test_wait_for_dispatch_self_cleans_on_caller_cancel(qm):
+    """Caller CancelledError during wait ⇒ bucket entry evicted automatically.
+
+    Before #55 item 5, the caller's ``finally`` had to call cancel_tracked
+    or the bucket entry outlived the dead waiter and wedged a slot.
+    """
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        _enqueue_manual(qm, "t1")
+        task = asyncio.create_task(qm.wait_for_dispatch("t1"))
+        await asyncio.sleep(0)       # let the coro reach the await
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert all("t1" not in [j["tid"] for j in b] for b in qm._buckets_v2)
+    assert "t1" not in qm._tid_to_job
+    assert "t1" not in qm._inflight
+    import db
+    assert db.count_pending() == 0
+
+
+def test_dispatched_cm_releases_slot_on_happy_path(qm):
+    """Normal body exit ⇒ release fires, slot returns to READY."""
+    _install_fake_load(qm, succeed=True)
+
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        from scheduler import Event
+        qm._feed_event(0, Event.LOAD_BEGIN, model="m")
+        qm._feed_event(0, Event.LOAD_DONE)
+        _enqueue_manual(qm, "t1")
+
+        cm_target = {"url": None}
+
+        async def run():
+            async with qm.dispatched("t1") as target:
+                cm_target["url"] = target
+
+        run_task = asyncio.create_task(run())
+        await asyncio.sleep(0)          # wait_for_dispatch registers _inflight
+        await qm._tick_once()           # dispatch resolves the future
+        await run_task                  # body + release
+        return cm_target["url"], qm._slots[0].state
+
+    import config
+    target, state = asyncio.run(scenario())
+    assert target in (config.OLLAMA_0_URL, config.OLLAMA_1_URL)
+    from scheduler import SlotState
+    assert state is SlotState.READY
+
+
+def test_dispatched_cm_fails_slot_on_body_exception(qm):
+    """Body raises ⇒ fail_request fires; slot recovers without caller help."""
+    _install_fake_load(qm, succeed=True)
+
+    class Boom(RuntimeError):
+        pass
+
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        from scheduler import Event
+        qm._feed_event(0, Event.LOAD_BEGIN, model="m")
+        qm._feed_event(0, Event.LOAD_DONE)
+        _enqueue_manual(qm, "t1")
+
+        async def run():
+            async with qm.dispatched("t1") as _target:
+                raise Boom("kaboom")
+
+        run_task = asyncio.create_task(run())
+        await asyncio.sleep(0)
+        await qm._tick_once()
+        with pytest.raises(Boom):
+            await run_task
+        return qm._slots[0].state
+
+    from scheduler import SlotState
+    # WORK_END(fail) routes BUSY → READY via the FSM's fail-to-known-state.
+    assert asyncio.run(scenario()) is SlotState.READY
