@@ -879,6 +879,19 @@ async def _boot_reconcile() -> None:
 _busy_since: dict[int, float] = {}
 
 
+def _is_embedding_model(model: str) -> bool:
+    """Heuristic: names containing ``embed`` are embedding-only models.
+
+    Ollama's ``/api/generate`` returns 400 for embedding models (they have
+    no generation head). We route warmup for those to ``/api/embeddings``
+    instead. Covers ``nomic-embed-text``, ``mxbai-embed-*``, ``all-minilm``
+    family naming, etc. False positives are harmless — a chat model whose
+    name happens to contain ``embed`` would just get a slightly weirder
+    warmup call.
+    """
+    return "embed" in model.lower()
+
+
 async def _do_load(slot_idx: int, url: str, model: str,
                    evict: Optional[str]) -> None:
     """Warm ``model`` on ``url``; feed LOAD_DONE on success, LOAD_FAIL else.
@@ -887,20 +900,31 @@ async def _do_load(slot_idx: int, url: str, model: str,
     post a warmup request. Eviction of any prior model happens
     implicitly — Ollama swaps on the first request carrying a different
     ``model`` so the explicit ``evict`` field is observability only.
+
+    Embedding models (see :func:`_is_embedding_model`) get warmed via
+    ``/api/embeddings`` because ``/api/generate`` 400s on anything
+    without a generation head.
     """
-    body: dict = {"model": model, "prompt": "", "keep_alive": "10m"}
-    if model.startswith("qwen3:"):
-        # feedback_reasoning_model_caps: without num_ctx, qwen3 auto-fits
-        # to training-max context on a cold GPU and reload takes ~12 s.
-        body["options"] = {"num_ctx": 8192}
+    if _is_embedding_model(model):
+        endpoint = "/api/embeddings"
+        body: dict = {"model": model, "prompt": "warmup", "keep_alive": "10m"}
+    else:
+        endpoint = "/api/generate"
+        body = {"model": model, "prompt": "", "keep_alive": "10m"}
+        if model.startswith("qwen3:"):
+            # feedback_reasoning_model_caps: without num_ctx, qwen3 auto-fits
+            # to training-max context on a cold GPU and reload takes ~12 s.
+            body["options"] = {"num_ctx": 8192}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-            r = await client.post(f"{url}/api/generate", json=body)
+            r = await client.post(f"{url}{endpoint}", json=body)
             r.raise_for_status()
-        log.info("[load] ok url=%s model=%r evict=%r", url, model, evict)
+        log.info("[load] ok url=%s model=%r evict=%r endpoint=%s",
+                 url, model, evict, endpoint)
         _feed_event(slot_idx, Event.LOAD_DONE)
     except Exception as exc:
-        log.warning("[load] fail url=%s model=%r err=%s", url, model, exc)
+        log.warning("[load] fail url=%s model=%r endpoint=%s err=%s",
+                    url, model, endpoint, exc)
         _feed_event(slot_idx, Event.LOAD_FAIL)
     _wake_tick(reason="load_settled")
 
