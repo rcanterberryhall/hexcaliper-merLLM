@@ -69,6 +69,8 @@ Both Ollama instances run continuously. Requests are round-robined across health
 
 Every request that lands on merLLM is placed in one of five priority buckets. The dispatcher drains them **strictly top-down** — bucket *N* must be empty before bucket *N+1* gets a GPU slot. Within a bucket the order is FIFO. There is no preemption, no fairness, and no aging: a steady stream of chat would starve background forever (and that's the point — chat is cheap and background is resumable).
 
+> **Known gap (merLLM#59):** `dispatch_pass` only considers a bucket's head dispatchable if a READY slot is *already holding* the requested model. When both slots are BUSY on a model that only lower-priority work uses (e.g. `qwen3:32b` in `background`), a higher-priority bucket demanding a different model (e.g. `embeddings` wanting `nomic-embed-text`) can be skipped as slots free up, and lower-priority work keeps being fed onto the warm slot. Strict-priority is violated here in favour of avoiding model swaps. Tracked at merLLM#59.
+
 | # | Bucket       | `X-Priority` value | Intended for |
 |---|--------------|--------------------|--------------|
 | 1 | **chat**       | `chat` (alias: `interactive`) | Real-time human chat. Anything a user is actively waiting on. |
