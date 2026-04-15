@@ -194,6 +194,18 @@ async def lifespan(app: FastAPI):
         queue_manager.set_paused(True, persist=False)
         log.info("queue resumed in PAUSED state from persisted setting")
 
+    # Boot-reconcile the scheduler: probe each GPU, rehydrate slot_state,
+    # wipe stale pending_work rows. MUST run before any track_request so the
+    # tick loop sees a valid slot lineup. _boot_reconcile wipes _buckets_v2,
+    # _tid_to_job, and _inflight — doing this after the batch re-kick below
+    # would orphan those tasks' dispatch futures (they'd await forever while
+    # buckets sit empty). _ensure_tick starts the loop.
+    await queue_manager._boot_reconcile()
+    queue_manager._ensure_tick()
+
+    # Wire queue-change notifications into the activity SSE stream
+    queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
+
     # Recover any jobs that were running when the process was last killed.
     # ``requeue_orphaned_jobs`` only resets DB status; we also have to
     # re-enqueue an async task for each one or they sit queued forever
@@ -234,15 +246,6 @@ async def lifespan(app: FastAPI):
             "re-enqueued %d queued batch job(s): %d immediate, %d deferred by retry_after",
             len(pending), immediate, deferred,
         )
-
-    # Wire queue-change notifications into the activity SSE stream
-    queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
-
-    # Boot-reconcile the scheduler: probe each GPU, rehydrate slot_state,
-    # wipe stale pending_work rows. Must run before any track_request so the
-    # tick loop sees a valid slot lineup. _ensure_tick starts the loop.
-    await queue_manager._boot_reconcile()
-    queue_manager._ensure_tick()
 
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
