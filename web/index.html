@@ -129,7 +129,7 @@
         <table>
           <thead>
             <tr>
-              <th>Source</th><th>Type</th><th>Model</th><th>Priority</th><th>GPU</th><th>Status</th><th>Elapsed</th>
+              <th class="sortable" data-sort-key="source">Source</th><th class="sortable" data-sort-key="request_type">Type</th><th class="sortable" data-sort-key="model">Model</th><th class="sortable" data-sort-key="priority">Priority</th><th class="sortable" data-sort-key="target">GPU</th><th class="sortable" data-sort-key="status">Status</th><th class="sortable" data-sort-key="elapsed_sec">Elapsed</th>
             </tr>
           </thead>
           <tbody id="queue-tbody"></tbody>
@@ -167,7 +167,7 @@
             <table>
               <thead>
                 <tr>
-                  <th>ID</th><th>Source</th><th>Model</th><th>Status</th><th>Submitted</th><th>Actions</th>
+                  <th class="sortable" data-sort-key="id">ID</th><th class="sortable" data-sort-key="source_app">Source</th><th class="sortable" data-sort-key="model">Model</th><th class="sortable" data-sort-key="status">Status</th><th class="sortable" data-sort-key="submitted_at">Submitted</th><th>Actions</th>
                 </tr>
               </thead>
               <tbody id="batch-tbody"></tbody>
@@ -366,6 +366,8 @@
           <strong style="color:var(--text)">Call-site rule</strong> — when a new LLM call site is added in any repo,
           read this table, pick the bucket, and cite it in a code comment. Keeping the bucket assignment explicit at
           every call site is what prevents the tiers from drifting back into an accidental mix.<br><br>
+          <strong style="color:var(--text)">Column sorting</strong> — click any column header in the Active
+          Requests or Batch History tables to sort by that column. Click again to reverse the sort order.<br><br>
           <strong style="color:var(--text)">Pause / resume</strong> — the Active Requests card on Overview
           has a Pause Queue button that stops the dispatcher from handing out new GPU slots. In-flight work
           finishes normally; new requests wait in their buckets until you press Resume. The pause flag is
