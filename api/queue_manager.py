@@ -239,6 +239,17 @@ def track_request(source: str, request_type: str, model: str,
     _buckets_v2[prio].append(job)
     _tid_to_job[tid] = job
 
+    # Pre-register the dispatch future so a fast scheduler tick (start_work
+    # firing before wait_for_dispatch is even scheduled) cannot leave the
+    # waiter looking up an empty _inflight slot. See issue #63: the previous
+    # design lost the future when the tick won the race, leaving the BUSY
+    # slot wedged until SLOT_MAX_WALL_SECONDS reclaimed it.
+    try:
+        loop = asyncio.get_running_loop()
+        _inflight[tid] = loop.create_future()
+    except RuntimeError:
+        pass  # No running loop (sync test); wait_for_dispatch will create it.
+
     _ensure_tick()
     _wake_tick(reason=f"enqueue:{priority_name(prio)}")
     _notify_change()
@@ -257,21 +268,40 @@ async def wait_for_dispatch(tracking_id: str) -> str:
     ``cancel_tracked`` before re-raising, so a still-bucketed entry never
     outlives its waiter. Callers do not need a ``finally`` block for the
     pre-dispatch phase.
+
+    Race-safe handoff (#63): the future is pre-registered by
+    ``track_request`` and only popped from ``_inflight`` here, so a
+    scheduler tick that fires ``start_work`` before this coroutine even
+    starts running still settles the same future this waiter looks up.
     """
+    fut = _inflight.get(tracking_id)
     job = _tid_to_job.get(tracking_id)
-    if job is None:
+
+    if fut is None and job is None:
+        # Truly unknown OR the slot already raced through start_work AND
+        # work_end. If a slot still owns the tid, route through
+        # cancel_tracked so the slot recovers instead of pinning BUSY for
+        # SLOT_MAX_WALL_SECONDS.
+        if _slot_idx_owning(tracking_id) is not None:
+            cancel_tracked(tracking_id, reason="dispatch_handoff_lost")
         raise RuntimeError(f"unknown tracking_id {tracking_id}")
 
+    if fut is None:
+        # Legacy/test path: job present but no pre-registered future
+        # (caller built state manually instead of going through
+        # ``track_request``).
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        _inflight[tracking_id] = fut
+
     _ensure_tick()
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[str] = loop.create_future()
-    _inflight[tracking_id] = fut
     # A fresh enqueue may have happened before _ensure_tick finished setting
     # up the event; kick again to cover that race.
-    _wake_tick(reason=f"wait:{priority_name(job['priority'])}")
+    wake_label = priority_name(job["priority"]) if job is not None else "dispatched"
+    _wake_tick(reason=f"wait:{wake_label}")
 
     try:
-        if job["priority"] == Priority.CHAT:
+        if job is not None and job["priority"] == Priority.CHAT:
             return await asyncio.wait_for(fut, timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
         return await fut
     except asyncio.TimeoutError:
@@ -285,6 +315,11 @@ async def wait_for_dispatch(tracking_id: str) -> str:
         # fail_request so the slot recovers. Idempotent either way.
         cancel_tracked(tracking_id, reason="wait_failed")
         raise
+    finally:
+        # Drop our reference so a request that completes normally doesn't
+        # leak the future. start_work no longer pops _inflight (see #63),
+        # so the waiter owns post-dispatch cleanup.
+        _inflight.pop(tracking_id, None)
 
 
 def _slot_idx_owning(tid: str) -> Optional[int]:
@@ -1008,7 +1043,11 @@ def _apply_effect(effect: Effect) -> None:
         if idx is not None:
             _busy_since[idx] = time.time()
         if tid:
-            fut = _inflight.pop(tid, None)
+            # Settle the future in place — do NOT pop _inflight here. The
+            # waiter (wait_for_dispatch) owns the pop in its finally block;
+            # popping here would lose the future for a waiter that hasn't
+            # yet reached its own _inflight.get(tid) call (see #63).
+            fut = _inflight.get(tid)
             _tid_to_job.pop(tid, None)
             if fut is not None and not fut.done():
                 fut.set_result(url)
@@ -1026,6 +1065,15 @@ def _apply_effect(effect: Effect) -> None:
                 db.delete_pending(tid)
             except Exception:
                 log.exception("[effect] delete_pending failed tid=%s", tid)
+            # Defensive: if the waiter never showed up (e.g. handler died
+            # between track_request and wait_for_dispatch, or a watchdog
+            # timeout fired with no waiter), reject the orphaned future so
+            # _inflight does not grow without bound.
+            fut = _inflight.pop(tid, None)
+            if fut is not None and not fut.done():
+                fut.set_exception(RuntimeError(
+                    f"work_end before waiter consumed tid {tid}"
+                ))
         return
 
     if kind == "gpu_unreachable":

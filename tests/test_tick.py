@@ -182,9 +182,10 @@ def test_tick_dispatches_head_when_model_is_resident(qm):
     target = asyncio.run(scenario())
     import config
     assert target in (config.OLLAMA_0_URL, config.OLLAMA_1_URL)
-    # bucket drained, inflight popped, busy_since stamped for that slot.
+    # bucket drained, busy_since stamped. _inflight is now owned by the
+    # waiter (wait_for_dispatch's finally) per #63; this test bypasses
+    # wait_for_dispatch, so the entry persists until a real waiter runs.
     assert all(len(b) == 0 for b in qm._buckets_v2)
-    assert "t1" not in qm._inflight
     assert any(idx in qm._busy_since for idx in range(len(qm._slots)))
 
 
@@ -367,4 +368,100 @@ def test_dispatched_cm_fails_slot_on_body_exception(qm):
 
     from scheduler import SlotState
     # WORK_END(fail) routes BUSY → READY via the FSM's fail-to-known-state.
+    assert asyncio.run(scenario()) is SlotState.READY
+
+
+# ── #63 race regression tests ───────────────────────────────────────────────
+
+def test_track_request_pre_registers_inflight_future(qm):
+    """track_request must seed _inflight before returning so a fast tick
+    can settle the future even if wait_for_dispatch hasn't run yet (#63).
+    """
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        tid = qm.track_request(
+            source="s", request_type="chat", model="m", priority=qm.Priority.CHAT,
+        )
+        return tid
+
+    tid = asyncio.run(scenario())
+    assert tid in qm._inflight
+    assert isinstance(qm._inflight[tid], asyncio.Future)
+    assert not qm._inflight[tid].done()
+
+
+def test_dispatch_handoff_race_does_not_wedge_slot(qm):
+    """Reproduces #63: scheduler tick fires start_work BEFORE
+    wait_for_dispatch even starts running. With pre-registered futures and
+    deferred _inflight cleanup, the waiter still receives the URL and the
+    slot is not leaked BUSY.
+    """
+    _install_fake_load(qm, succeed=True)
+
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        # Pre-load slot 0 so dispatch_pass can immediately start work — no
+        # stage_pass round-trip — making the race window observable.
+        from scheduler import Event
+        qm._feed_event(0, Event.LOAD_BEGIN, model="m")
+        qm._feed_event(0, Event.LOAD_DONE)
+
+        tid = qm.track_request(
+            source="s", request_type="chat", model="m",
+            priority=qm.Priority.SHORT,
+        )
+        # Drive the tick BEFORE creating the wait_for_dispatch task.
+        # This is the production race: start_work lands, then the waiter
+        # finally gets to run.
+        await qm._tick_once()
+
+        # Slot must be BUSY now and the future must be settled.
+        from scheduler import SlotState
+        assert qm._slots[0].state is SlotState.BUSY
+        assert qm._inflight[tid].done(), "future should be settled by start_work"
+
+        # Now the waiter runs — must return the URL, not raise unknown_tid.
+        target = await qm.wait_for_dispatch(tid)
+        return target, qm._slots[0].state, tid
+
+    import config
+    target, state, tid = asyncio.run(scenario())
+    from scheduler import SlotState
+    assert target in (config.OLLAMA_0_URL, config.OLLAMA_1_URL)
+    assert state is SlotState.BUSY  # slot still doing work, not wedged-empty
+    # Waiter's finally popped _inflight on normal return.
+    assert tid not in qm._inflight
+
+
+def test_unknown_tid_with_owned_slot_routes_through_cancel(qm):
+    """If a tid somehow ends up owning a slot but no future/job mapping
+    exists, wait_for_dispatch must release the slot via cancel_tracked
+    instead of just raising and leaving the slot wedged BUSY (#63).
+    """
+    _install_fake_load(qm, succeed=True)
+
+    async def scenario():
+        await _reconcile_all_ready(qm)
+        from scheduler import Event, SlotState
+        qm._feed_event(0, Event.LOAD_BEGIN, model="m")
+        qm._feed_event(0, Event.LOAD_DONE)
+
+        # Manufacture the wedge state: a slot is BUSY for tid "ghost"
+        # but _inflight and _tid_to_job have no record of it.
+        job = qm._make_job(tid="ghost", source="s", request_type="chat",
+                           model="m", priority=0, batch_job_id=None,
+                           submitted_at=0.0)
+        qm._feed_event(0, Event.WORK_BEGIN, job=job)
+        assert qm._slots[0].state is SlotState.BUSY
+        assert "ghost" not in qm._inflight
+        assert "ghost" not in qm._tid_to_job
+
+        with pytest.raises(RuntimeError, match="unknown tracking_id"):
+            await qm.wait_for_dispatch("ghost")
+
+        return qm._slots[0].state
+
+    from scheduler import SlotState
+    # cancel_tracked → fail_request → WORK_END(fail) → BUSY recovers.
+    # The fail-to-known-state exit lands on READY (model still loaded).
     assert asyncio.run(scenario()) is SlotState.READY
