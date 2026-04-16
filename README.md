@@ -109,6 +109,8 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
 **Slot timeout sweep** — the tick loop's `_sweep_busy_timeouts` runs each iteration and force-fails any BUSY slot whose `started_at` exceeds `SLOT_MAX_WALL_SECONDS` (default 1800s). Recovery drives the slot through LOADING with a forced eviction (fail-to-known-state), so the recovery path is identical to a normal reload. This is the last line of defence against hung upstream Ollama calls deadlocking the strict-priority scheduler — a `[tick] busy timeout ...` log line indicates a bug in either the caller (missing `num_predict`) or the proxy layer, **not** a knob to tune. Bounded `PROXY_READ_TIMEOUT_SECONDS` (default 1800s) on every httpx call to Ollama is the defence-in-depth layer behind it.
 
+**Dispatch handoff race-safety** — `track_request` pre-registers the dispatch future in `_inflight` before returning the tracking id, `start_work` settles the future in place without popping, and `wait_for_dispatch` owns the pop in its finally block. This closes the TOCTOU window where a sub-millisecond scheduler tick could fire `start_work` before the waiter coroutine ran, leaving an empty `_inflight` lookup, an `unknown tracking_id` raise, and a wedged BUSY slot for 1800 s until the timeout sweep recovered it (merLLM#63, 2026-04-16). Any new tick effect that touches `_inflight` should settle or reject the future — never pop — so a still-pending waiter can find it.
+
 | Variable | Default | Description |
 |---|---|---|
 | `SLOT_MAX_WALL_SECONDS` | `1800` | Per-slot wall-clock budget before the tick force-fails it |
