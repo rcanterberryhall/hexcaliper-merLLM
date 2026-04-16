@@ -768,7 +768,7 @@ function renderMetrics(m) {
         <span class="bar-wrap">${bar(avg)}<span style="width:36px;font-size:11px;text-align:right">${avg.toFixed(1)}%</span></span>
       </div>
       <div class="stat-row" style="margin-bottom:8px"><span class="stat-label">${cpuKeys.length} cores</span>
-        <span class="muted" style="font-size:11px">&#9632; &lt;30% &nbsp; &#9632; 30–70% &nbsp; &#9632; 70–90% &nbsp; &#9632; &gt;90%</span>
+        <span class="muted" style="font-size:11px"><span style="color:var(--green)">&#9632;</span> &lt;30% &nbsp; <span style="color:var(--accent)">&#9632;</span> 30–70% &nbsp; <span style="color:var(--yellow)">&#9632;</span> 70–90% &nbsp; <span style="color:var(--red)">&#9632;</span> &gt;90%</span>
       </div>
       <div class="cpu-grid">${cells}</div>`;
   }
