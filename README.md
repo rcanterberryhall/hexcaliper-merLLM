@@ -69,7 +69,7 @@ Both Ollama instances run continuously. Requests are round-robined across health
 
 Every request that lands on merLLM is placed in one of five priority buckets. The dispatcher drains them **strictly top-down** — bucket *N* must be empty before bucket *N+1* gets a GPU slot. Within a bucket the order is FIFO. There is no preemption, no fairness, and no aging: a steady stream of chat would starve background forever (and that's the point — chat is cheap and background is resumable).
 
-> **Known gap (merLLM#59):** `dispatch_pass` only considers a bucket's head dispatchable if a READY slot is *already holding* the requested model. When both slots are BUSY on a model that only lower-priority work uses (e.g. `qwen3:32b` in `background`), a higher-priority bucket demanding a different model (e.g. `embeddings` wanting `nomic-embed-text`) can be skipped as slots free up, and lower-priority work keeps being fed onto the warm slot. Strict-priority is violated here in favour of avoiding model swaps. Tracked at merLLM#59.
+**Cross-bucket starvation guard (merLLM#59, 2026-04-17)** — `dispatch_pass` will skip dispatching a lower-priority bucket onto an idle slot when (a) some higher-priority bucket is blocked because its head model isn't resident anywhere AND (b) the lower bucket's model is already running on another slot. The idle slot is yielded to `stage_pass`, which loads the starved model onto it on the same tick. `stage_pass` first-pass demand matching prefers BUSY/LOADING satisfiers over READY for the same reason — so a coincidentally-warm READY slot doesn't get consumed by an already-served demand. Look for `[tick] starvation-guard skip ...` in the tick log when this fires.
 
 | # | Bucket       | `X-Priority` value | Intended for |
 |---|--------------|--------------------|--------------|
@@ -273,9 +273,10 @@ api/
   app.py            — FastAPI application, all HTTP + WebSocket endpoints, proxy normalizer
   config.py         — Environment variable loading and hot-reload
   db.py             — SQLite WAL: batch jobs, metrics, settings
-  gpu_router.py     — Per-GPU state, health probes, reclaim loop, model swap warm-load
+  gpu_router.py     — Per-GPU state, health probes, reclaim loop, model swap warm-load (rewired around the FSM in #55)
   metrics.py        — psutil + pynvml collection loop
-  queue_manager.py  — Late-binding 5-bucket priority dispatcher, batch runner with retry, slot watchdog
+  scheduler.py      — Pure FSM core: Slot FSM (transition), dispatch_pass, stage_pass, status projection
+  queue_manager.py  — Tick loop driving dispatch_pass + stage_pass, slot lifecycle ownership, batch runner with retry, slot watchdog
   notifications.py  — Batch job completion dispatch (webhook, SSE)
   Dockerfile
   requirements.txt
@@ -289,7 +290,8 @@ tests/
   test_config.py
   test_db.py
   test_gpu_router.py     — GPU health, reclaim conditions, _reload_model num_ctx pin
-  test_queue_manager.py  — Dispatcher, priority drain, slot watchdog
+  test_scheduler.py      — Slot FSM transitions, dispatch_pass, stage_pass, status projection (67 tests)
+  test_queue_manager.py  — Tick loop integration, batch runner, slot watchdog
   test_queue_status.py   — queue_status NDJSON, heartbeats, reasoning-body normalization
   test_activity_sse.py   — SSE push rate limiting, queue fan-out, activity helpers
   test_integration.py    — End-to-end ecosystem flows
