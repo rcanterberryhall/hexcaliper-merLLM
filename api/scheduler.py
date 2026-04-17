@@ -262,6 +262,52 @@ def _idle_ready_slot(slots: list[Slot], exclude: set[int]) -> Optional[int]:
     return None
 
 
+def _model_present(slots: list[Slot], model: str) -> bool:
+    for s in slots:
+        if s.state in (SlotState.READY, SlotState.BUSY) and s.model_loaded == model:
+            return True
+        if s.state is SlotState.LOADING and s.loading_model == model:
+            return True
+    return False
+
+
+def _model_served_elsewhere(
+    slots: list[Slot], model: str, exclude_idx: int
+) -> bool:
+    """True if some OTHER slot is BUSY or LOADING for ``model``.
+
+    "Served elsewhere" is the #59 starvation test: if this slot's model is
+    already in flight on another GPU, we can afford to skip this tick's
+    dispatch and let stage_pass LOAD a starved higher-priority model here.
+    """
+    for i, s in enumerate(slots):
+        if i == exclude_idx:
+            continue
+        if s.state is SlotState.BUSY and s.model_loaded == model:
+            return True
+        if s.state is SlotState.LOADING and s.loading_model == model:
+            return True
+    return False
+
+
+def _higher_bucket_blocked(
+    buckets: list[list[dict]], slots: list[Slot], p: int
+) -> Optional[tuple[int, str]]:
+    """Return ``(q, model)`` for the first higher-priority bucket q<p whose
+    head model is not present on any slot, else ``None``.
+
+    "Not present" means no slot is READY, BUSY, or LOADING for that model —
+    so dispatch cannot serve it this tick and stage_pass must load it.
+    """
+    for q in range(p):
+        if q >= len(buckets) or not buckets[q]:
+            continue
+        model = buckets[q][0]["model"]
+        if not _model_present(slots, model):
+            return (q, model)
+    return None
+
+
 def dispatch_pass(
     buckets: list[list[dict]], slots: list[Slot]
 ) -> tuple[list[Effect], list[Slot]]:
@@ -270,6 +316,15 @@ def dispatch_pass(
     Mutates ``buckets`` in place (pops). Returns ``(effects, updated_slots)``.
     Restarts from the top bucket after each pop so a higher-priority job
     arriving mid-dispatch cuts the line.
+
+    merLLM#59 starvation guard: if a higher-priority bucket is blocked
+    because its model is not resident on any slot, AND this bucket's
+    head model is already being served on another slot (BUSY/LOADING),
+    skip dispatching this tick. The idle READY slot is left available so
+    the companion ``stage_pass`` call can LOAD the starved model onto
+    it, unblocking the higher bucket on the next tick. Without the guard,
+    dispatch would repeatedly steal the only free slot and the
+    higher-priority bucket would starve indefinitely.
     """
     effects: list[Effect] = []
     progress = True
@@ -281,6 +336,16 @@ def dispatch_pass(
             head = buckets[p][0]
             slot_idx = _ready_slot_holding(slots, head["model"])
             if slot_idx is None:
+                continue
+            blocked = _higher_bucket_blocked(buckets, slots, p)
+            if blocked is not None and _model_served_elsewhere(
+                slots, head["model"], slot_idx
+            ):
+                tick_log.info(
+                    "[tick] starvation-guard skip bucket=%d head_model=%s "
+                    "slot_idx=%d blocked_bucket=%d blocked_model=%s",
+                    p, head["model"], slot_idx, blocked[0], blocked[1],
+                )
                 continue
             job = buckets[p].pop(0)
             new_slot, eff = transition(slots[slot_idx], Event.WORK_BEGIN, job=job)
@@ -322,20 +387,32 @@ def stage_pass(
 
     # First pass: any slot already holding / loading / running a demanded
     # model is treated as satisfying that demand — no speculative load.
+    # Prefer BUSY/LOADING satisfiers over READY ones so idle READY slots
+    # stay available for second-pass LOAD_BEGIN of unmet higher-priority
+    # demands (merLLM#59). Otherwise a READY slot that "coincidentally"
+    # holds the same model as a running job gets consumed here, leaving
+    # nowhere to load a starved model.
     for di, model in enumerate(demand):
+        best_si: Optional[int] = None
+        best_rank: Optional[int] = None
         for si, s in enumerate(slots):
             if si in used_slots:
                 continue
-            holds_it = (
-                s.state in (SlotState.READY, SlotState.BUSY)
-                and s.model_loaded == model
-            ) or (
-                s.state is SlotState.LOADING and s.loading_model == model
-            )
-            if holds_it:
-                used_slots.add(si)
-                satisfied_demands.add(di)
-                break
+            if s.state is SlotState.BUSY and s.model_loaded == model:
+                rank = 0
+            elif s.state is SlotState.LOADING and s.loading_model == model:
+                rank = 0
+            elif s.state is SlotState.READY and s.model_loaded == model:
+                rank = 1
+            else:
+                continue
+            if best_rank is None or rank < best_rank:
+                best_si, best_rank = si, rank
+                if rank == 0:
+                    break
+        if best_si is not None:
+            used_slots.add(best_si)
+            satisfied_demands.add(di)
 
     # Second pass: unmet demands seek an idle READY slot to load onto.
     for di, model in enumerate(demand):

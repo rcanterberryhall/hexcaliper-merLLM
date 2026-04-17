@@ -328,15 +328,68 @@ def test_dispatch_restart_from_top_after_each_pop():
 
 
 def test_dispatch_skips_bucket_whose_head_has_no_matching_slot():
-    """Priority inversion by design: if CHAT wants a model no slot holds, but
-    BACKGROUND wants a model that IS loaded, BACKGROUND runs. stage_pass
-    will separately kick off a load for the CHAT model."""
+    """Single-slot case: if CHAT wants a model no slot holds, but BACKGROUND
+    wants a model that IS loaded, BACKGROUND runs. The #59 starvation guard
+    does NOT fire here because the BG model is not being "served elsewhere"
+    — there are no other slots. stage_pass handles loading the CHAT model
+    on a later tick once a slot is free."""
     buckets = _buckets(p0=[job("unloaded", "chat")], p4=[job("m", "bg")])
     slots = [Slot(url=GPU, state=SlotState.READY, model_loaded="m")]
     eff, slots = dispatch_pass(buckets, slots)
     assert len(eff) == 1
     assert eff[0].data["job"]["id"] == "bg"
     assert len(buckets[0]) == 1  # CHAT job preserved for next tick
+
+
+def test_dispatch_starvation_guard_holds_bg_when_chat_starved_and_bg_running_elsewhere(caplog):
+    """merLLM#59: CHAT wants a model no slot holds. BG wants a model that's
+    already running on slot0 AND a second slot is idle READY with the same
+    model. Dispatch must NOT hand the idle slot to BG — it must leave it
+    free so the companion stage_pass can LOAD the starved CHAT model onto
+    it. Without the guard, dispatch repeatedly steals the only free slot
+    and CHAT starves indefinitely while BG drains."""
+    import logging as _logging
+    buckets = _buckets(
+        p0=[job("qwen3:30b-thinking", "chat")],
+        p4=[job("qwen3:32b", "bg")],
+    )
+    slots = [
+        Slot(url=GPU,  state=SlotState.BUSY,  model_loaded="qwen3:32b",
+             current_job=job("qwen3:32b", "inflight")),
+        Slot(url=GPU1, state=SlotState.READY, model_loaded="qwen3:32b"),
+    ]
+    with caplog.at_level(_logging.INFO, logger="merllm.scheduler.tick"):
+        eff, slots_after = dispatch_pass(buckets, slots)
+    assert eff == []
+    assert len(buckets[0]) == 1
+    assert len(buckets[4]) == 1
+    assert slots_after[1].state is SlotState.READY
+    # Diagnostic log must fire so the skip is observable in production.
+    assert any("starvation-guard" in rec.message for rec in caplog.records)
+
+
+def test_dispatch_guard_permits_first_bg_dispatch_then_reserves_second_slot():
+    """With 2 idle READY slots holding the BG model and CHAT starved,
+    one BG dispatch still lands (no slot is 'served elsewhere' yet). On
+    the second inner-loop iteration slot0 has become BUSY, so the guard
+    fires and the remaining READY slot is reserved for stage_pass to LOAD
+    the starved CHAT model. End state: 1 BG dispatched, 1 slot still free."""
+    buckets = _buckets(
+        p0=[job("qwen3:30b-thinking", "chat")],
+        p4=[job("qwen3:32b", "bg-a"), job("qwen3:32b", "bg-b")],
+    )
+    slots = [
+        Slot(url=GPU,  state=SlotState.READY, model_loaded="qwen3:32b"),
+        Slot(url=GPU1, state=SlotState.READY, model_loaded="qwen3:32b"),
+    ]
+    eff, slots_after = dispatch_pass(buckets, slots)
+    assert len(eff) == 1
+    assert eff[0].data["job"]["id"] == "bg-a"
+    assert buckets[0] == [job("qwen3:30b-thinking", "chat")]
+    assert len(buckets[4]) == 1  # bg-b reserved for next tick after CHAT gets a slot
+    # Exactly one slot stayed READY — that's the one stage_pass will claim.
+    ready_count = sum(1 for s in slots_after if s.state is SlotState.READY)
+    assert ready_count == 1
 
 
 def test_dispatch_requires_ready_state_not_busy_or_loading():
@@ -445,6 +498,53 @@ def test_stage_treats_in_progress_load_as_satisfying_demand():
     # The in-progress load on slot 0 satisfies demand 0; mirror fills slot 1.
     assert len(eff) == 1
     assert eff[0].data["url"] == GPU1
+
+
+def test_stage_prefers_busy_satisfier_over_ready_for_same_model():
+    """merLLM#59: when both BUSY and READY slots hold the demanded model,
+    first-pass matching must pick BUSY so the READY slot stays free for a
+    second-pass LOAD_BEGIN of any unmet higher-priority demand. Without
+    this preference, the READY slot gets consumed by a demand that's
+    already being served, leaving unmet demands nowhere to load."""
+    # p0 demands model "a" (no slot holds it), p2 demands model "m"
+    # (both slots hold it). The READY+m slot must be reserved to load "a".
+    buckets = _buckets(p0=[job("a", "ja")], p2=[job("m", "jm")])
+    slots = [
+        Slot(url=GPU,  state=SlotState.READY, model_loaded="m"),
+        Slot(url=GPU1, state=SlotState.BUSY,  model_loaded="m",
+             current_job=job("m", "inflight")),
+    ]
+    eff, slots = stage_pass(buckets, slots)
+    # Exactly one load: model "a" onto the READY slot. The BUSY slot
+    # satisfies the "m" demand.
+    assert len(eff) == 1
+    assert eff[0].data["url"] == GPU
+    assert eff[0].data["model"] == "a"
+    assert slots[0].state is SlotState.LOADING
+    assert slots[0].loading_model == "a"
+
+
+def test_stage_loads_starved_model_onto_idle_slot_companion_to_dispatch_guard():
+    """merLLM#59 companion test: when dispatch_pass yields to the guard
+    (BG running on slot0, slot1 idle with BG model, CHAT starved for a
+    different model), stage_pass must LOAD the CHAT model onto slot1.
+    This is the other half of the starvation fix — dispatch yields the
+    slot and stage claims it."""
+    buckets = _buckets(
+        p0=[job("qwen3:30b-thinking", "chat")],
+        p4=[job("qwen3:32b", "bg")],
+    )
+    slots = [
+        Slot(url=GPU,  state=SlotState.BUSY,  model_loaded="qwen3:32b",
+             current_job=job("qwen3:32b", "inflight")),
+        Slot(url=GPU1, state=SlotState.READY, model_loaded="qwen3:32b"),
+    ]
+    eff, slots = stage_pass(buckets, slots)
+    assert [e.kind for e in eff] == ["load"]
+    assert eff[0].data["url"] == GPU1
+    assert eff[0].data["model"] == "qwen3:30b-thinking"
+    assert slots[1].state is SlotState.LOADING
+    assert slots[1].loading_model == "qwen3:30b-thinking"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
