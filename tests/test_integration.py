@@ -733,13 +733,14 @@ class TestPriorityBucketContract:
             t.join(timeout=180)
 
     def test_embeddings_auto_classify_to_embeddings_bucket(self):
-        """PIN TEST: every /api/embeddings call lands in the embeddings bucket
-        regardless of the X-Priority header the caller sends.
+        """PIN TEST: a non-chat X-Priority on /api/embeddings still lands in
+        the embeddings bucket — the merLLM#58 override is narrow.
 
-        Embedding traffic is classified by endpoint, not by header — see
-        merLLM#38. We deliberately send ``X-Priority: background`` (the
-        wrong bucket, the one this whole change exists to escape) and
-        assert the proxy overrode it to ``embeddings``.
+        proxy_embeddings defaults to ``Priority.EMBEDDINGS`` and only
+        honors ``X-Priority: chat`` (or the ``interactive`` alias) as
+        an override (merLLM#58). Every other value — including the
+        lower ``background`` lane this whole bucket exists to escape
+        (merLLM#38) — must fall through to ``embeddings``.
         """
         source = f"integration_embed_{uuid.uuid4().hex[:8]}"
         t0 = time.time()
@@ -757,9 +758,63 @@ class TestPriorityBucketContract:
         )
         assert entry["request_type"] == "embeddings"
         assert entry["priority"] == "embeddings", (
-            f"embeddings call landed in {entry['priority']!r} despite the "
-            "endpoint forcing Priority.EMBEDDINGS — auto-classification "
-            "is broken (merLLM#38)"
+            f"embeddings call with X-Priority=background landed in "
+            f"{entry['priority']!r} — non-chat values must fall through "
+            "to EMBEDDINGS (merLLM#38)"
+        )
+
+    @pytest.mark.parametrize("header_value", ["chat", "interactive"])
+    def test_embeddings_chat_header_routes_to_chat_bucket(self, header_value):
+        """merLLM#58: ``X-Priority: chat`` on /api/embeddings routes to CHAT.
+
+        Chat-path RAG embeds are on the critical path of an interactive
+        response, so they jump ahead of ingest-chunk embeds that share
+        the ``embeddings`` bucket. The legacy ``interactive`` alias
+        must behave the same as ``chat``.
+        """
+        source = f"integration_embed_chat_{uuid.uuid4().hex[:8]}"
+        t0 = time.time()
+        r = post(
+            MERLLM, "/api/embeddings",
+            json={"model": "nomic-embed-text", "prompt": "chat-priority embed"},
+            headers={"X-Source": source, "X-Priority": header_value},
+        )
+        assert r.status_code == 200, (
+            f"/api/embeddings failed: {r.status_code} {r.text[:200]}"
+        )
+        entry = _find_queue_entry_by_source(source, after=t0, timeout=15.0)
+        assert entry is not None, (
+            f"no queue entry observed for chat-priority embed "
+            f"source={source!r}"
+        )
+        assert entry["request_type"] == "embeddings"
+        assert entry["priority"] == "chat", (
+            f"X-Priority={header_value!r} on /api/embeddings landed in "
+            f"{entry['priority']!r}, expected 'chat' (merLLM#58)"
+        )
+
+    def test_embeddings_typo_priority_falls_back_to_embeddings(self):
+        """merLLM#58: a typo in X-Priority on /api/embeddings must not
+        escalate — it falls through to EMBEDDINGS, not CHAT.
+
+        The override is a string-equality check on ``chat``/``interactive``;
+        anything else — including a near-miss like ``chta`` — stays in
+        EMBEDDINGS so a typo can't silently inflate priority.
+        """
+        source = f"integration_embed_typo_{uuid.uuid4().hex[:8]}"
+        t0 = time.time()
+        r = post(
+            MERLLM, "/api/embeddings",
+            json={"model": "nomic-embed-text", "prompt": "typo pin test"},
+            headers={"X-Source": source, "X-Priority": "chta"},
+        )
+        assert r.status_code == 200
+        entry = _find_queue_entry_by_source(source, after=t0, timeout=15.0)
+        assert entry is not None
+        assert entry["priority"] == "embeddings", (
+            f"typo X-Priority on /api/embeddings escalated to "
+            f"{entry['priority']!r} — only exact ``chat``/``interactive`` "
+            "is allowed to override, everything else stays in EMBEDDINGS"
         )
 
     def test_missing_priority_default_is_chat(self):

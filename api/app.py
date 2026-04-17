@@ -298,10 +298,14 @@ def _priority(request: Request) -> queue_manager.Priority:
     two-tier system. Unknown (non-empty) values fall back to ``BACKGROUND``
     so typos cannot silently escalate work to a higher lane.
 
-    Note: ``proxy_embeddings`` ignores this parser entirely and forces
-    ``Priority.EMBEDDINGS`` — embedding traffic is classified by endpoint,
-    not by header, so a missing or wrong ``X-Priority`` from any client
-    cannot route an embed into the wrong bucket.
+    Note: ``proxy_embeddings`` does not call this parser. It defaults
+    embeds to ``Priority.EMBEDDINGS`` and only honors one explicit
+    override — ``X-Priority: chat`` (or the ``interactive`` alias)
+    routes the embed to ``Priority.CHAT`` so a chat-path RAG embed
+    jumps ahead of ingest-chunk embeds (merLLM#58). Any other header
+    value still falls through to ``EMBEDDINGS``, so a missing or wrong
+    ``X-Priority`` from a non-chat client cannot route an embed into
+    the wrong bucket (preserves merLLM#38).
 
     TODO: once parsival and lancellmot are both sending explicit
     ``X-Priority`` on every call, tighten the missing-header default to
@@ -659,15 +663,24 @@ async def proxy_chat(request: Request):
 async def proxy_embeddings(request: Request):
     """Proxy POST /api/embeddings through the late-binding dispatcher.
 
-    Embedding traffic is auto-classified into ``Priority.EMBEDDINGS`` —
-    the incoming ``X-Priority`` header is intentionally ignored. Embedding
-    requests are sub-second on ``nomic-embed-text`` and have a dedicated
-    bucket so a burst of them never sits behind a 32b chat in the
-    ``background`` lane (see merLLM#38).
+    Embedding traffic defaults to ``Priority.EMBEDDINGS`` — a dedicated
+    bucket so a burst of ingest-chunk embeds never sits behind a 32b
+    chat in ``BACKGROUND`` (see merLLM#38). The only override honored
+    here is ``X-Priority: chat`` (or the legacy ``interactive`` alias),
+    which routes that single request to ``Priority.CHAT`` so a chat-path
+    RAG embed jumps ahead of ingest-chunk embeds (merLLM#58). Any other
+    ``X-Priority`` value — missing, unknown, or a lower bucket like
+    ``background`` — falls through to ``EMBEDDINGS``, so #38's narrow
+    rule (header can't silently route embeds into the wrong bucket) is
+    preserved for every non-chat caller.
     """
     body = await request.json()
     model = body.get("model", "")
-    priority = queue_manager.Priority.EMBEDDINGS
+    raw_priority = request.headers.get("x-priority")
+    if raw_priority and raw_priority.strip().lower() in ("chat", "interactive"):
+        priority = queue_manager.Priority.CHAT
+    else:
+        priority = queue_manager.Priority.EMBEDDINGS
     source = _source(request)
 
     tid = queue_manager.track_request(source, "embeddings", model, priority)
