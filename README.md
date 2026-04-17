@@ -81,11 +81,13 @@ Every request that lands on merLLM is placed in one of five priority buckets. Th
 
 **Call-site assignment rule** — each call site picks its bucket once and declares it on every request via the `X-Priority` header. Callers do not get to promote themselves at runtime. If a request has no `X-Priority` header, merLLM currently defaults it to `chat` for back-compat during the rollout; unknown string values fall back to `background` so typos cannot escalate. The one exception is `/api/embeddings`, which ignores the header entirely and always lands in bucket 2 — embedding traffic is classified by endpoint, not by caller intent.
 
-The dispatcher state is visible on the dashboard's Queue tab (one lane per bucket, with live depth) and machine-readably at `GET /api/merllm/queue`, which includes a `buckets` map keyed by bucket name.
+The dispatcher state is visible on the dashboard's Overview tab (one lane per bucket, with live depth) and machine-readably at `GET /api/merllm/queue`, which includes a `buckets` map keyed by bucket name.
+
+**Observable scheduler status** — `GET /api/merllm/status` returns a `scheduler_status` field set to one of six values: `recovering` (boot reconciliation in flight), `paused` (operator pause), `degraded` (every slot unreachable), `draining` (a slot is BUSY or LOADING), `dispatching` (a READY slot has work to pick up), or `idle`. This is a pure projection of `(paused, recovered, slots, buckets_nonempty)` defined in `scheduler.project_status`; the dispatcher itself does not consult it. Surfaced on the GPU Router card on Overview for at-a-glance health.
 
 ## Batch jobs
 
-Jobs submitted via `POST /api/batch/submit` are persisted in SQLite and run in the **background** bucket (bucket 5) whenever every higher bucket is empty. They survive restarts; directly-submitted `X-Priority: background` requests do not.
+A batch job is a fire-and-forget submission that enters the *same* unified queue as chat and embedding traffic, at bucket 5 (**background**). There is no separate batch queue — `POST /api/batch/submit` persists the job in SQLite, then runs it through the shared 5-bucket dispatcher whenever every higher bucket is empty. Persistence is what distinguishes a batch job from a directly-submitted `X-Priority: background` request; only batch jobs survive restarts.
 
 Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
@@ -214,7 +216,7 @@ Interval: 30s, timeout: 5s, retries: 3.
 
 | Tab | Contents |
 |---|---|
-| Overview | My Day panel, GPU state, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), batch counts |
+| Overview | My Day panel, GPU state, observable scheduler status, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), priority-bucket lanes, active requests, batch-job submission + history |
 | Batch Jobs | Submit jobs, view queue, cancel/requeue; failed jobs show retry count |
 | Metrics | Time-series charts (Chart.js) for CPU, RAM, disk, GPU utilization, GPU VRAM, GPU temperature, network throughput; range selector: 1h / 6h / 24h / 7d |
 | Logs | Live log tail from any Docker container (configurable via `LOG_CONTAINER_*` env vars) |

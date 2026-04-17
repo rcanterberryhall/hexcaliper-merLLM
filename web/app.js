@@ -245,6 +245,26 @@ function updateBadge(status) {
   }
 }
 
+// Observable scheduler status — one of recovering / paused / degraded /
+// draining / dispatching / idle (pure projection of queue_manager state).
+const _SCHEDULER_STATUS_LABEL = {
+  recovering:  { text: "recovering",  cls: "sched-warn" },
+  paused:      { text: "paused",      cls: "sched-warn" },
+  degraded:    { text: "degraded",    cls: "sched-fault" },
+  draining:    { text: "draining",    cls: "sched-ok" },
+  dispatching: { text: "dispatching", cls: "sched-ok" },
+  idle:        { text: "idle",        cls: "sched-muted" },
+};
+
+function renderSchedulerStatus(status) {
+  const el = document.getElementById("ov-scheduler-status");
+  if (!el) return;
+  const info = _SCHEDULER_STATUS_LABEL[status];
+  if (!info) { el.textContent = status || "—"; el.className = "stat-value"; return; }
+  el.textContent = info.text;
+  el.className = "stat-value " + info.cls;
+}
+
 function renderOverview(s) {
   // Warnings
   const warn = document.getElementById("warnings");
@@ -258,6 +278,7 @@ function renderOverview(s) {
 
   // GPU Router card
   set("ov-routing", s.routing || "round_robin");
+  renderSchedulerStatus(s.scheduler_status);
   set("ov-default-model", s.default_model || "—");
   const q = s.queue || {};
   const qTotal = (q.queued || 0) + (q.running || 0);
@@ -334,22 +355,6 @@ function renderOverview(s) {
            </div>`;
       }
     }
-  }
-
-  // Queue summary + batch counts
-  const bc = document.getElementById("batch-counts");
-  if (bc) {
-    let rows = "";
-    if (s.queue) {
-      rows += `<div class="stat-row"><span class="stat-label">Running</span><span class="stat-value">${s.queue.running || 0}</span></div>`;
-      rows += `<div class="stat-row"><span class="stat-label">Queued</span><span class="stat-value">${s.queue.queued || 0}</span></div>`;
-    }
-    if (s.batch_counts) {
-      Object.entries(s.batch_counts).forEach(([k, v]) => {
-        rows += `<div class="stat-row"><span class="stat-label">Batch ${esc(k)}</span><span class="stat-value">${v}</span></div>`;
-      });
-    }
-    bc.innerHTML = rows || '<span class="muted">No queue data</span>';
   }
 
   // GPU hardware metrics

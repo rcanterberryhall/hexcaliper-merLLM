@@ -129,6 +129,12 @@ class EmptyResponseError(Exception):
 _paused: bool = False
 _paused_since: Optional[float] = None
 
+# Flipped True once :func:`_boot_reconcile` has seeded slot state and drained
+# stale ``pending_work`` rows. Read by the observable-status projection so the
+# dashboard shows ``recovering`` instead of ``idle`` during the brief window
+# before boot probes resolve.
+_recovered: bool = False
+
 # Callback notified on every track/start/complete/fail so the SSE layer can
 # push updates. Set by app.py at startup.
 _on_queue_change: Optional[callable] = None
@@ -516,6 +522,19 @@ def pipe_depth() -> dict:
     depths["interactive"] = depths["chat"]
     depths["batch"]       = depths["background"]
     return depths
+
+
+def scheduler_status() -> str:
+    """Current observable scheduler status as a lowercase string.
+
+    Pure projection of (paused, recovered, slots, buckets). Used by the
+    dashboard Overview tab to surface one of: ``recovering``, ``paused``,
+    ``degraded``, ``draining``, ``dispatching``, ``idle``.
+    """
+    return project_status(
+        paused=_paused, recovered=_recovered,
+        slots=_slots, buckets_nonempty=any(_buckets_v2),
+    ).value
 
 
 # ── Batch job submission ──────────────────────────────────────────────────────
@@ -940,6 +959,9 @@ async def _boot_reconcile() -> None:
     log.info("[boot] reconciled slots=%s stale_pending_cleared=%d",
              slot_summary, stale)
 
+    global _recovered
+    _recovered = True
+
 
 # ── v2: effect application ──────────────────────────────────────────────────
 
@@ -1163,7 +1185,7 @@ async def _tick_once() -> dict:
     staged     = _drive_pass("stage",    stage_pass)
     if dispatched or staged:
         status = project_status(
-            paused=_paused, recovered=True,
+            paused=_paused, recovered=_recovered,
             slots=_slots, buckets_nonempty=any(_buckets_v2),
         )
         log_tick_summary(
