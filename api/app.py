@@ -696,13 +696,13 @@ async def merllm_status():
 
     return {
         **gpu_router.status(),
-        "queue":         queue_manager.queue_depth(),
-        "queue_paused":  queue_manager.is_paused(),
+        "queue":              queue_manager.queue_depth(),
+        "queue_paused":       queue_manager.is_paused(),
         "queue_paused_since": queue_manager.paused_since(),
-        "ollama":        ollama_health,
-        "gpu_metrics":   metrics.gpu_snapshot(),
-        "batch_counts":  db.count_batch_jobs_by_status(),
-        "warnings":      _build_warnings(ollama_health, latest),
+        "scheduler_status":   queue_manager.scheduler_status(),
+        "ollama":             ollama_health,
+        "gpu_metrics":        metrics.gpu_snapshot(),
+        "warnings":           _build_warnings(ollama_health, latest),
     }
 
 

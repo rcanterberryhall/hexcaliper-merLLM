@@ -52,6 +52,10 @@
           <span id="ov-routing" class="stat-value">—</span>
         </div>
         <div class="stat-row">
+          <span class="stat-label">Scheduler</span>
+          <span id="ov-scheduler-status" class="stat-value">—</span>
+        </div>
+        <div class="stat-row">
           <span class="stat-label">Default model</span>
           <span id="ov-default-model" class="stat-value">—</span>
         </div>
@@ -60,7 +64,7 @@
           <span id="ov-pending-model" class="stat-value" style="color:var(--yellow)">—</span>
         </div>
         <div class="stat-row">
-          <span class="stat-label">Active requests</span>
+          <span class="stat-label">In flight</span>
           <span id="ov-queue" class="stat-value">—</span>
         </div>
         <div id="gpu-router-cards"></div>
@@ -70,10 +74,6 @@
         <h2>Ollama Instances</h2>
         <div id="ollama-gpu0" class="instance-card">Loading&hellip;</div>
         <div id="ollama-gpu1" class="instance-card" style="margin-top:10px">Loading&hellip;</div>
-        <div class="mt">
-          <h2>GPU Queue</h2>
-          <div id="batch-counts"></div>
-        </div>
       </div>
 
       <div class="card">
@@ -368,6 +368,15 @@
           every call site is what prevents the tiers from drifting back into an accidental mix.<br><br>
           <strong style="color:var(--text)">Column sorting</strong> — click any column header in the Active
           Requests or Batch History tables to sort by that column. Click again to reverse the sort order.<br><br>
+          <strong style="color:var(--text)">Scheduler status</strong> — the GPU Router card on Overview shows
+          one of six observable states:
+          <code>recovering</code> (boot reconciliation in flight),
+          <code>paused</code> (operator pause),
+          <code>degraded</code> (every slot unreachable),
+          <code>draining</code> (a slot is BUSY or LOADING),
+          <code>dispatching</code> (a READY slot has work to pick up), or
+          <code>idle</code> (no work, no in-flight). This is a pure projection of scheduler state for
+          observability; the scheduler itself does not consult it.<br><br>
           <strong style="color:var(--text)">Pause / resume</strong> — the Active Requests card on Overview
           has a Pause Queue button that stops the dispatcher from handing out new GPU slots. In-flight work
           finishes normally; new requests wait in their buckets until you press Resume. The pause flag is
@@ -394,8 +403,11 @@
       <div class="card">
         <h2>Batch Jobs</h2>
         <p style="color:var(--muted);font-size:13px;line-height:1.7">
-          Batch jobs run at bucket 5 (<code>background</code>) — they only dispatch when every higher bucket is
-          empty. Chat, short foreground work, and feedback work all take priority.<br><br>
+          A batch job is a fire-and-forget submission that merLLM persists in SQLite and runs on its own.
+          It enters the <em>same</em> unified queue as chat and embedding traffic, just at bucket 5
+          (<code>background</code>), so it only dispatches when every higher bucket is empty. There is no
+          separate batch queue — the &ldquo;Batch Jobs&rdquo; card here is the submission and history
+          surface for background-bucket work.<br><br>
           <strong style="color:var(--text)">Automatic retry</strong> — failed jobs are retried up to
           <code>BATCH_MAX_RETRIES</code> times (default 2, giving 3 total attempts) with exponential
           backoff (30s, 120s). On final failure, the error messages are stored on the job record.<br><br>
