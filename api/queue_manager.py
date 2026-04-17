@@ -745,16 +745,15 @@ async def _run_batch_job_async(job_id: str) -> None:
         ) as t:
             target = t
             _app._activity_set(target, job["model"], "/api/generate")
-            # Bounded read timeout: defence-in-depth behind the tick's
-            # busy-slot timeout sweep. If the slot has already been driven
-            # through WORK_END(timeout), this still eventually unblocks the
-            # coroutine instead of leaking the httpx connection forever.
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
-            ) as client:
-                resp = await client.post(f"{target}/api/generate", json=body)
-                resp.raise_for_status()
-                payload = resp.json()
+            # Buffer-stream the Ollama response so the instance card's tok
+            # counter ticks per NDJSON line for the full batch run (#64).
+            # Wire-contract to the caller is unchanged; ``stream`` is only
+            # flipped on the Ollama-facing body. The PROXY_READ_TIMEOUT
+            # bound lives inside _stream_and_accumulate, behind the tick's
+            # busy-slot timeout sweep.
+            payload = await _app._stream_and_accumulate(
+                target, "/api/generate", body
+            )
             gpu_router.record_activity(target)
             result_text = _validate_batch_response(payload, options)
             db.update_batch_job(job_id, status="completed",
