@@ -194,6 +194,18 @@ async def lifespan(app: FastAPI):
         queue_manager.set_paused(True, persist=False)
         log.info("queue resumed in PAUSED state from persisted setting")
 
+    # Boot-reconcile the scheduler: probe each GPU, rehydrate slot_state,
+    # wipe stale pending_work rows. MUST run before any track_request so the
+    # tick loop sees a valid slot lineup. _boot_reconcile wipes _buckets_v2,
+    # _tid_to_job, and _inflight — doing this after the batch re-kick below
+    # would orphan those tasks' dispatch futures (they'd await forever while
+    # buckets sit empty). _ensure_tick starts the loop.
+    await queue_manager._boot_reconcile()
+    queue_manager._ensure_tick()
+
+    # Wire queue-change notifications into the activity SSE stream
+    queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
+
     # Recover any jobs that were running when the process was last killed.
     # ``requeue_orphaned_jobs`` only resets DB status; we also have to
     # re-enqueue an async task for each one or they sit queued forever
@@ -235,15 +247,12 @@ async def lifespan(app: FastAPI):
             len(pending), immediate, deferred,
         )
 
-    # Wire queue-change notifications into the activity SSE stream
-    queue_manager.set_queue_change_callback(lambda: _push_activity_sse(force=True))
-
     # Background tasks
     asyncio.create_task(metrics.collection_loop())
-    asyncio.create_task(gpu_router.reclaim_loop())
+    asyncio.create_task(gpu_router.recovery_loop())
 
     log.info("started — routing=%s, default_model=%s",
-             "round_robin", config.DEFAULT_MODEL)
+             "fsm", config.DEFAULT_MODEL)
     yield
     log.info("shutting down")
 
@@ -367,9 +376,9 @@ async def _generate_stream(target: str, path: str, body: dict, on_done=None):
     """
     buf = b""
     try:
-        # Bounded read timeout (defence-in-depth behind the queue watchdog)
-        # so a hung Ollama stream cannot pin a slot forever — see
-        # queue_manager._watchdog_loop for the primary deadlock guard.
+        # Bounded read timeout (defence-in-depth behind the tick's busy-slot
+        # timeout sweep) so a hung Ollama stream cannot pin a slot forever —
+        # see queue_manager._sweep_busy_timeouts for the primary deadlock guard.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
         ) as client:
@@ -422,111 +431,80 @@ def _any_gpu_busy() -> bool:
 
 async def _queued_stream(path: str, body: dict,
                          tracking_id: str) -> StreamingResponse:
-    """
-    Streaming proxy backed by the late-binding dispatcher.
+    """Streaming proxy backed by the FSM dispatcher.
 
     Emits a ``queue_status`` NDJSON line if no GPU is immediately available,
-    then awaits dispatch, then streams the Ollama response.  The assigned
-    target URL is determined by the dispatcher at dispatch time.
+    then awaits dispatch, then streams the Ollama response. The assigned
+    target URL is chosen by the dispatcher at dispatch time.
 
-    Cleanup contract
-    ────────────────
-    The outer ``try/finally`` block guarantees the slot is always released
-    regardless of how the generator exits:
+    Slot lifecycle is owned by ``queue_manager.dispatched``: release on
+    normal completion, fail_request on exception, cancel_tracked (inside
+    ``wait_for_dispatch``) on pre-dispatch caller exit. The streaming
+    generator itself is thin — no flags, no outer cancel_tracked.
 
-      - normal completion: ``released`` is flipped True inside the stream's
-        ``_on_done`` callback and finally is a no-op.
-      - client disconnect (``GeneratorExit`` thrown into a pending ``await``
-        or ``yield``): finally runs ``queue_manager.cancel_tracked``, which
-        handles both the "still in pending bucket" and the "dispatch handoff
-        already happened" races safely.
-      - ``DispatchTimeout``: finally is a no-op because
-        ``wait_for_dispatch`` already cleaned the pending entry itself.
-      - any other exception: finally runs ``cancel_tracked`` and re-raises.
-
-    Before this wrapper existed, a client disconnect during the wait would
-    leave the ``_PendingRequest`` in its bucket; the dispatcher would later
-    pop a dead waiter, flip ``_gpu_busy[target] = True`` and mark the entry
-    ``running`` — but no httpx call was ever issued and no ``release`` fired,
-    wedging the GPU slot until the 1800 s watchdog reclaimed it.  See
-    queue_manager.cancel_tracked() for the idempotent cleanup helper.
+    Keepalive: ``wait_for_dispatch`` is run as a task so this generator
+    can emit ``queue_status`` heartbeats while it blocks. Each heartbeat
+    resets the caller's between-chunk read-gap timeout; parsival's
+    ``requests.post(timeout=60)`` would otherwise trip when a BACKGROUND
+    drain pushes a feedback wait past 60 s (the 2026-04-11 wedge). Heartbeat
+    lines carry no ``response``/``thinking`` tokens so ``llm._collect_stream``
+    silently drops them — no caller change required.
     """
     async def generate():
-        released = False
-        slot_already_terminal = False
-        dispatch_task: Optional[asyncio.Task] = None
+        if _any_gpu_busy():
+            yield json.dumps({
+                "type":                    "queue_status",
+                "reason":                  "all GPU slots occupied — queued for dispatch",
+                "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
+            }).encode() + b"\n"
+
+        dispatch_task = asyncio.create_task(
+            queue_manager.wait_for_dispatch(tracking_id)
+        )
+        waiting_since = time.time()
         try:
-            # If the system is saturated, tell the caller before we start waiting.
-            if _any_gpu_busy():
+            while True:
+                done, _ = await asyncio.wait(
+                    {dispatch_task},
+                    timeout=config.QUEUE_HEARTBEAT_INTERVAL_SECONDS,
+                )
+                if dispatch_task in done:
+                    break
                 yield json.dumps({
-                    "type":                    "queue_status",
-                    "reason":                  "all GPU slots occupied — queued for dispatch",
-                    "estimated_wait_seconds":  config.INTERACTIVE_QUEUE_TIMEOUT,
+                    "type":             "queue_status",
+                    "waiting":          True,
+                    "elapsed_seconds":  int(time.time() - waiting_since),
                 }).encode() + b"\n"
+            target = dispatch_task.result()
+        except queue_manager.DispatchTimeout:
+            yield json.dumps({
+                "error": "GPU busy — timed out waiting for slot",
+                "done":  True,
+            }).encode() + b"\n"
+            return
+        except BaseException:
+            # wait_for_dispatch self-cleans; cancel the pending task so it
+            # unwinds quickly and re-raise for the ASGI layer.
+            if not dispatch_task.done():
+                dispatch_task.cancel()
+            raise
 
-            # Run wait_for_dispatch as a task so we can emit keepalive chunks
-            # while it blocks. Each heartbeat resets the caller's between-chunk
-            # read-gap timeout: parsival's requests.post(timeout=60) would
-            # otherwise trip before the slot is popped when a BACKGROUND drain
-            # pushes the feedback wait past 60 s, and the 2026-04-11 wedge was
-            # the downstream consequence of that disconnect pattern. Keepalive
-            # NDJSON lines carry no ``response``/``thinking`` tokens so
-            # ``llm._collect_stream`` silently drops them — no caller change
-            # required.
-            dispatch_task = asyncio.create_task(
-                queue_manager.wait_for_dispatch(tracking_id)
-            )
-            waiting_since = time.time()
-            try:
-                while True:
-                    done, _ = await asyncio.wait(
-                        {dispatch_task},
-                        timeout=config.QUEUE_HEARTBEAT_INTERVAL_SECONDS,
-                    )
-                    if dispatch_task in done:
-                        break
-                    yield json.dumps({
-                        "type":             "queue_status",
-                        "waiting":          True,
-                        "elapsed_seconds":  int(time.time() - waiting_since),
-                    }).encode() + b"\n"
-                target = dispatch_task.result()
-            except queue_manager.DispatchTimeout:
-                # wait_for_dispatch already marked the entry failed and
-                # removed it from its bucket, so the outer finally must
-                # not try to cancel it again.
-                slot_already_terminal = True
-                yield json.dumps({
-                    "error": "GPU busy — timed out waiting for slot",
-                    "done":  True,
-                }).encode() + b"\n"
-                return
-
-            _activity_set(target, body.get("model", ""), path)
-
-            _tid = tracking_id
+        _activity_set(target, body.get("model", ""), path)
+        released = False
+        try:
             def _on_done():
                 nonlocal released
                 _activity_clear(target)
-                queue_manager.release(_tid)
+                queue_manager.release(tracking_id)
                 released = True
 
             async for chunk in _generate_stream(target, path, body, _on_done):
                 yield chunk
-        finally:
-            # Cancel a still-pending dispatch task before touching the queue
-            # so wait_for_dispatch unwinds cleanly. cancel_tracked below
-            # handles whichever in-flight state the entry ended up in.
-            if dispatch_task is not None and not dispatch_task.done():
-                dispatch_task.cancel()
-            # Guaranteed cleanup: if _on_done never fired (client disconnect,
-            # exception between dispatch and streaming, GeneratorExit during
-            # an await, etc.) the slot still needs to be released.
-            # cancel_tracked is idempotent and handles every in-flight state.
-            if not released and not slot_already_terminal:
-                queue_manager.cancel_tracked(
-                    tracking_id, reason="client_disconnect_or_error"
-                )
+        except BaseException as exc:
+            _activity_clear(target)
+            if not released:
+                queue_manager.fail_request(tracking_id, str(exc))
+            raise
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -570,47 +548,19 @@ def _dispatch_timeout_response() -> JSONResponse:
 
 
 async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
-    """
-    Shared non-streaming proxy with leak-safe cleanup for every exit path.
+    """Non-streaming proxy backed by the FSM dispatcher.
 
-    The outer ``try/finally`` flips ``released`` only on the happy path
-    (release already called), so the finally falls through to
-    ``cancel_tracked`` for *any* other exit: a ``CancelledError`` thrown
-    into ``wait_for_dispatch`` when the client hangs up, an httpx error,
-    a ``DispatchTimeout``, or a plain unexpected exception.
-
-    Without this guard, a client disconnect during the pre-dispatch wait
-    left the ``_PendingRequest`` in its bucket; the dispatcher would then
-    pop a dead waiter and wedge the GPU slot until the watchdog fired
-    1800 s later. See ``queue_manager.cancel_tracked`` for the idempotent
-    helper that handles every in-flight state.
+    The ``queue_manager.dispatched`` CM owns slot lifecycle: release on
+    happy path, fail_request on exception, cancel_tracked on pre-dispatch
+    caller exit. No handler-side cleanup flags needed.
     """
-    released = False
     try:
-        try:
-            target = await queue_manager.wait_for_dispatch(tid)
-        except queue_manager.DispatchTimeout:
-            # wait_for_dispatch already marked the tracked entry failed
-            # and removed it from its bucket — suppress the outer cancel.
-            released = True
-            return _dispatch_timeout_response()
-        try:
+        async with queue_manager.dispatched(tid) as target:
             resp = await _proxy(target, path, body)
             gpu_router.record_activity(target)
             return resp
-        except Exception as exc:
-            queue_manager.fail_request(tid, str(exc))
-            released = True
-            raise
-        finally:
-            if not released:
-                queue_manager.release(tid)
-                released = True
-    finally:
-        if not released:
-            queue_manager.cancel_tracked(
-                tid, reason="client_disconnect_or_error"
-            )
+    except queue_manager.DispatchTimeout:
+        return _dispatch_timeout_response()
 
 
 @app.post("/api/generate")
@@ -818,29 +768,6 @@ async def merllm_queue_resume():
     return {"ok": True, "paused": False, "changed": changed}
 
 
-@app.post("/api/merllm/queue/clear")
-async def merllm_queue_clear(force: bool = False):
-    """
-    Admin/test-only: drop entries from the in-memory queue tracker so the
-    next observation starts from a known baseline.
-
-    Not linked from any UI. Intended for integration-test setup and manual
-    operator reset. There is no auth on this endpoint — merllm-api is only
-    reachable from the host network and from sibling containers.
-
-    :param force: If false (default), only ``completed`` and ``failed``
-        entries are removed — safe, does not disturb in-flight work. If
-        true, queued waiters are cancelled with a RuntimeError and running
-        entries are marked failed; any in-flight upstream HTTP request
-        continues running but the tracker no longer reflects it. See
-        ``queue_manager.clear_tracker`` for the full safety contract.
-    :return: ``{"ok": True, "removed": {"completed": N, "failed": N,
-        "queued": N, "running": N}, "force": bool}``.
-    """
-    removed = queue_manager.clear_tracker(force=force)
-    return {"ok": True, "removed": removed, "force": force}
-
-
 @app.get("/api/merllm/activity")
 async def merllm_activity():
     """
@@ -925,12 +852,17 @@ async def default_model():
 
 @app.post("/api/merllm/gpu/{gpu}/reset")
 async def reset_gpu(gpu: str):
-    """Manually reset a faulted GPU to healthy."""
+    """Manually reset a wedged GPU slot — re-probe and feed result into the FSM.
+
+    Used when a slot has been UNREACHABLE long enough to stop being probed
+    by the recovery loop (past HEALTH_FAULT_TIMEOUT) and the operator wants
+    to force a fresh attempt without restarting the container.
+    """
     url_map = {"gpu0": config.OLLAMA_0_URL, "gpu1": config.OLLAMA_1_URL}
     url = url_map.get(gpu)
     if not url:
         raise HTTPException(status_code=422, detail="gpu must be 'gpu0' or 'gpu1'")
-    ok = gpu_router.reset_gpu(url)
+    ok = gpu_router.reset_slot(url)
     if not ok:
         raise HTTPException(status_code=404, detail="GPU not found")
     return {"ok": True, **gpu_router.status()}
@@ -955,7 +887,10 @@ async def get_settings():
 async def save_settings(request: Request):
     body = await request.json()
 
-    # DEFAULT_MODEL change requires explicit confirmation.
+    # DEFAULT_MODEL change requires explicit confirmation. The FSM loads
+    # models on demand (stage_pass mirrors current bucket-head demand onto
+    # idle slots), so the change takes effect the next time work arrives —
+    # no eager warm-load is scheduled here.
     new_model = body.get("default_model")
     if new_model and new_model != config.DEFAULT_MODEL:
         if not body.get("confirm_model_change"):
@@ -963,11 +898,10 @@ async def save_settings(request: Request):
                 status_code=409,
                 content={
                     "ok": False,
-                    "error": "Changing default_model will reload both GPUs when idle. "
+                    "error": "Changing default_model will affect new dispatches. "
                              "Resend with confirm_model_change: true to proceed.",
                 },
             )
-        gpu_router.set_pending_default_model(new_model)
 
     db.save_settings(body)
     config.apply_overrides(body)
@@ -1534,4 +1468,4 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "routing": "round_robin"}
+    return {"ok": True, "routing": "fsm"}

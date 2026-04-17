@@ -1,12 +1,11 @@
 """
-queue_manager.py — Late-binding GPU dispatcher with five priority buckets.
+queue_manager.py — Pure-FSM scheduler over five priority buckets (merLLM#55).
 
-Requests enter one of five FIFO buckets by priority.  A central dispatcher
-assigns a GPU to the head of each bucket only when a GPU becomes idle.
-Callers do not pick a GPU at submission time — the target is determined by
-the dispatcher at the moment one can actually serve the request.  This is
-"late binding": the analogue of a thread scheduler that commits a thread to
-a CPU only at dispatch time.
+Requests enter one of five FIFO buckets by priority. A single tick loop
+drives a deterministic Slot FSM (see ``scheduler.py``) which decides when
+to load models and when to start work. Callers do not pick a GPU at submit
+time — the slot is chosen by ``dispatch_pass`` at the moment one is ready
+to serve the request.
 
 Priority buckets
 ────────────────
@@ -26,32 +25,12 @@ Priority buckets
 
 Strict priority: bucket N only dispatches when buckets 1..N-1 are all empty.
 
-Design rules
-────────────
-1. Late binding.  ``track_request`` registers the request with target=None.
-   ``wait_for_dispatch`` pushes it onto a bucket and awaits the assigned URL.
-2. Strict priority.  Higher buckets drain completely before the dispatcher
-   looks at lower buckets.  No preemption.
-3. Static swap cost.  ``config.MODEL_SWAP_COST_SECONDS`` is the conservative
-   upper bound on loading the largest model.  The decision rule treats a
-   swap as always preferable to waiting behind a busy match, because the
-   swap cost is deterministic while the wait is unbounded.
-4. No preemption.  A running job is never interrupted; the dispatcher only
-   acts at job-completion events (release, swap-completion, new arrival,
-   health change).
-
-Dispatch decision rule at the head of a bucket
-──────────────────────────────────────────────
-At dispatch time (some GPU is idle), ``_best_candidate_for(req)``:
-
-  - If an idle GPU already holds the requested model → that GPU (zero cost).
-  - Else if any GPU is idle → the least-recently-active idle GPU (will be
-    swapped before dispatch, ≤ MODEL_SWAP_COST_SECONDS cost).
-  - Else → None (request stays at the head of the bucket; dispatcher retries
-    on the next idle event).
+The orchestrator owns: the tick loop, effect application (load/start/end),
+durable pending_work mirroring, and busy-timeout sweeping. The scheduler
+itself is pure (state in → state+effects out) and lives in scheduler.py.
 
 Batch job submission stays in this module (SQLite-persisted, retryable) but
-executes through the same dispatcher as interactive requests, always at
+executes through the same path as interactive requests, always at
 ``Priority.BACKGROUND``.
 """
 import asyncio
@@ -59,8 +38,7 @@ import json
 import logging
 import time
 import uuid
-from collections import deque
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from enum import IntEnum
 from typing import Optional, Union
 
@@ -143,108 +121,30 @@ class EmptyResponseError(Exception):
     """
 
 
-# ── Request tracking ─────────────────────────────────────────────────────────
-
-
-@dataclass
-class TrackedRequest:
-    id: str
-    source: str            # "lancellmot", "parsival", "direct", ...
-    request_type: str      # "chat", "generate", "embeddings", "batch"
-    model: str
-    priority: int
-    target: Optional[str]  # GPU URL assigned by dispatcher (None until dispatched)
-    status: str            # "queued", "running", "completed", "failed"
-    submitted_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    error: Optional[str] = None
-    batch_job_id: Optional[str] = None
-    # Dispatcher instrumentation: set when the waiter enters its bucket.
-    queued_for_dispatch_at: Optional[float] = None
-
-
-_tracked: dict[str, TrackedRequest] = {}
-
-
-@dataclass
-class _PendingRequest:
-    tid: str
-    model: str
-    priority: int
-    future: "asyncio.Future[str]"   # resolves to assigned target URL
-
-
-# ── Dispatcher state ─────────────────────────────────────────────────────────
-
-# One deque per Priority bucket, indexed by the IntEnum value. The dispatcher
-# walks these in order (CHAT first, BACKGROUND last) and strictly drains each
-# bucket before moving to the next one down.
-_buckets: list[deque["_PendingRequest"]] = [deque() for _ in Priority]
-_gpu_busy: dict[str, bool] = {}
-_state_changed: Optional[asyncio.Event] = None
-_dispatcher_task: Optional[asyncio.Task] = None
-_watchdog_task: Optional[asyncio.Task] = None
-
 # ── Pause state ──────────────────────────────────────────────────────────────
-# Operator-controlled pause switch. When paused, the dispatcher stops handing
-# out new GPU slots; in-flight work continues to completion, the reclaim loop
-# still runs, and new requests pile up in their priority buckets. The paused
-# flag is persisted to the ``settings`` table at set time so a power-outage
-# mid-pause doesn't silently resume bulk work on reboot.
+# Operator-controlled pause switch. While paused the tick loop skips
+# dispatch and stage; in-flight work continues to completion. Persisted to
+# the ``settings`` table so a power-outage mid-pause does not silently
+# resume bulk work on reboot.
 _paused: bool = False
 _paused_since: Optional[float] = None
 
 # Callback notified on every track/start/complete/fail so the SSE layer can
-# push updates.  Set by app.py at startup.
+# push updates. Set by app.py at startup.
 _on_queue_change: Optional[callable] = None
-
-# ── Dispatcher-trace state (for observability only) ──────────────────────────
-# Monotonic counter and timestamps used to correlate wake events with dispatch
-# outcomes. None of this is load-bearing: it exists purely so the logs can
-# reveal where the dispatcher stalls and why.
-_wake_counter: int = 0
-_last_wake_ts: Optional[float] = None
-_last_dispatch_ts: Optional[float] = None   # last time a head was actually popped
-
-
-def _gpu_targets() -> list[str]:
-    """Return the configured GPU target URLs."""
-    return [config.OLLAMA_0_URL, config.OLLAMA_1_URL]
-
-
-def _ensure_gpu_state() -> None:
-    """Populate ``_gpu_busy`` for any configured GPU not yet seen."""
-    for url in _gpu_targets():
-        _gpu_busy.setdefault(url, False)
-
-
-def _ensure_dispatcher() -> None:
-    """
-    Start the dispatcher and watchdog loops lazily on first use.
-
-    Called from ``track_request`` so both the app lifespan and tests pick up
-    the dispatcher without extra wiring.  Safe to call repeatedly.
-    """
-    global _state_changed, _dispatcher_task, _watchdog_task
-    _ensure_gpu_state()
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop yet (e.g. import-time in a sync test) — defer.
-        return
-    if _state_changed is None:
-        _state_changed = asyncio.Event()
-    if _dispatcher_task is None or _dispatcher_task.done():
-        _dispatcher_task = loop.create_task(_dispatcher_loop())
-    if _watchdog_task is None or _watchdog_task.done():
-        _watchdog_task = loop.create_task(_watchdog_loop())
 
 
 def gpu_slot_busy(target: str) -> bool:
-    """Return True if ``target`` is currently running or swapping."""
-    _ensure_gpu_state()
-    return _gpu_busy.get(target, False)
+    """Return True if ``target`` is currently running or swapping.
+
+    Reads v2 Slot state: BUSY means an inference is in flight, LOADING
+    means a model swap is in flight. Either way, no new work should be
+    handed to this GPU.
+    """
+    for s in _slots:
+        if s.url == target:
+            return s.state in (SlotState.BUSY, SlotState.LOADING)
+    return False
 
 
 def set_queue_change_callback(cb: callable) -> None:
@@ -258,13 +158,6 @@ def _notify_change() -> None:
             _on_queue_change()
         except Exception:
             pass
-
-
-def _wake_dispatcher(reason: str = "unspecified") -> None:
-    if _state_changed is not None:
-        if not _state_changed.is_set():
-            dispatch_log.info("[dispatch] wake requested reason=%s", reason)
-        _state_changed.set()
 
 
 def is_paused() -> bool:
@@ -306,231 +199,184 @@ def set_paused(paused: bool, persist: bool = True) -> bool:
     log.info("queue %s by operator", "paused" if paused else "resumed")
     _notify_change()
     if not paused:
-        _wake_dispatcher(reason="resume")
+        _wake_tick(reason="resume")
     return True
 
 
 def track_request(source: str, request_type: str, model: str,
                   priority: Union[Priority, int],
                   batch_job_id: Optional[str] = None) -> str:
-    """
-    Register a new request in the tracker.
+    """Register a new request and enqueue it into its priority bucket.
 
-    The request starts with ``target=None``; the dispatcher assigns a URL at
-    dispatch time.  Returns a tracking ID.
+    Returns a tracking id. The caller then awaits ``wait_for_dispatch``
+    with that id to block until the tick loop assigns a GPU.
 
-    ``priority`` may be a :class:`Priority` enum member or its int value.
+    v2 contract (merLLM#55 cutover):
+      * A durable ``pending_work`` row is inserted before we touch the
+        in-memory bucket, so a crash between rows-written and bucket-pushed
+        is benign (boot wipes pending_work anyway).
+      * The job dict is appended to ``_buckets_v2[priority]`` and remembered
+        in ``_tid_to_job`` so ``cancel_tracked`` can find it.
+      * The tick loop is started lazily if an event loop is running.
     """
-    _ensure_dispatcher()
-    req_id = str(uuid.uuid4())
-    _tracked[req_id] = TrackedRequest(
-        id=req_id,
-        source=source,
-        request_type=request_type,
-        model=model,
-        priority=int(priority),
-        target=None,
-        status="queued",
-        submitted_at=time.time(),
-        batch_job_id=batch_job_id,
+    tid = str(uuid.uuid4())
+    submitted_at = time.time()
+    prio = int(priority)
+
+    try:
+        db.insert_pending(
+            req_id=tid, source=source, request_type=request_type,
+            model=model, priority=prio, batch_job_id=batch_job_id,
+        )
+    except Exception:
+        log.exception("[track] insert_pending failed tid=%s", tid)
+        raise
+
+    job = _make_job(
+        tid=tid, source=source, request_type=request_type, model=model,
+        priority=prio, batch_job_id=batch_job_id, submitted_at=submitted_at,
     )
+    _buckets_v2[prio].append(job)
+    _tid_to_job[tid] = job
+
+    # Pre-register the dispatch future so a fast scheduler tick (start_work
+    # firing before wait_for_dispatch is even scheduled) cannot leave the
+    # waiter looking up an empty _inflight slot. See issue #63: the previous
+    # design lost the future when the tick won the race, leaving the BUSY
+    # slot wedged until SLOT_MAX_WALL_SECONDS reclaimed it.
+    try:
+        loop = asyncio.get_running_loop()
+        _inflight[tid] = loop.create_future()
+    except RuntimeError:
+        pass  # No running loop (sync test); wait_for_dispatch will create it.
+
+    _ensure_tick()
+    _wake_tick(reason=f"enqueue:{priority_name(prio)}")
     _notify_change()
-    return req_id
+    return tid
 
 
 async def wait_for_dispatch(tracking_id: str) -> str:
-    """
-    Push the tracked request onto its priority bucket and await a GPU
-    assignment from the dispatcher.
+    """Await a GPU assignment for ``tracking_id``. Returns the target URL.
 
-    Returns the target URL once the dispatcher has marked the GPU busy and
-    completed any required model swap.  Raises :class:`DispatchTimeout` if
-    a ``CHAT`` request exceeds ``config.INTERACTIVE_QUEUE_TIMEOUT``; all
-    other buckets wait indefinitely.
+    Raises ``DispatchTimeout`` if a CHAT request exceeds
+    ``INTERACTIVE_QUEUE_TIMEOUT``; other buckets wait indefinitely.
+    Raises ``RuntimeError`` if the tid was cancelled while waiting.
+
+    Self-cleaning: any exit other than a normal return (timeout, caller
+    ``CancelledError``, or any other exception thrown into the await) runs
+    ``cancel_tracked`` before re-raising, so a still-bucketed entry never
+    outlives its waiter. Callers do not need a ``finally`` block for the
+    pre-dispatch phase.
+
+    Race-safe handoff (#63): the future is pre-registered by
+    ``track_request`` and only popped from ``_inflight`` here, so a
+    scheduler tick that fires ``start_work`` before this coroutine even
+    starts running still settles the same future this waiter looks up.
     """
-    entry = _tracked.get(tracking_id)
-    if entry is None:
+    fut = _inflight.get(tracking_id)
+    job = _tid_to_job.get(tracking_id)
+
+    if fut is None and job is None:
+        # Truly unknown OR the slot already raced through start_work AND
+        # work_end. If a slot still owns the tid, route through
+        # cancel_tracked so the slot recovers instead of pinning BUSY for
+        # SLOT_MAX_WALL_SECONDS.
+        if _slot_idx_owning(tracking_id) is not None:
+            cancel_tracked(tracking_id, reason="dispatch_handoff_lost")
         raise RuntimeError(f"unknown tracking_id {tracking_id}")
 
-    _ensure_dispatcher()
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[str] = loop.create_future()
+    if fut is None:
+        # Legacy/test path: job present but no pre-registered future
+        # (caller built state manually instead of going through
+        # ``track_request``).
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        _inflight[tracking_id] = fut
 
-    pending = _PendingRequest(
-        tid=tracking_id,
-        model=entry.model or config.DEFAULT_MODEL,
-        priority=entry.priority,
-        future=future,
-    )
-    _buckets[entry.priority].append(pending)
-    entry.queued_for_dispatch_at = time.time()
-    dispatch_log.info(
-        "[dispatch] enqueue tid=%s src=%s type=%s model=%s bucket=%s depth=%d",
-        tracking_id[:8], entry.source, entry.request_type, entry.model,
-        priority_name(entry.priority), len(_buckets[entry.priority]),
-    )
-
-    _wake_dispatcher(reason=f"enqueue:{priority_name(entry.priority)}")
+    _ensure_tick()
+    # A fresh enqueue may have happened before _ensure_tick finished setting
+    # up the event; kick again to cover that race.
+    wake_label = priority_name(job["priority"]) if job is not None else "dispatched"
+    _wake_tick(reason=f"wait:{wake_label}")
 
     try:
-        if entry.priority == Priority.CHAT:
-            target = await asyncio.wait_for(future, timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
-        else:
-            target = await future
+        if job is not None and job["priority"] == Priority.CHAT:
+            return await asyncio.wait_for(fut, timeout=config.INTERACTIVE_QUEUE_TIMEOUT)
+        return await fut
     except asyncio.TimeoutError:
-        _remove_pending(tracking_id)
-        if tracking_id in _tracked:
-            _tracked[tracking_id].status = "failed"
-            _tracked[tracking_id].error = "Timed out waiting for GPU slot"
-            _tracked[tracking_id].completed_at = time.time()
-            _notify_change()
-            loop.call_later(10, _remove_tracked, tracking_id)
+        # CHAT timed out in its bucket — pull it out and clean up.
+        cancel_tracked(tracking_id, reason="chat_queue_timeout")
         raise DispatchTimeout("chat request exceeded INTERACTIVE_QUEUE_TIMEOUT")
+    except BaseException:
+        # CancelledError, connection drops, or any other exception thrown
+        # into the await: if we're still bucketed, cancel_tracked pops us
+        # out; if we've already been dispatched, it routes through
+        # fail_request so the slot recovers. Idempotent either way.
+        cancel_tracked(tracking_id, reason="wait_failed")
+        raise
+    finally:
+        # Drop our reference so a request that completes normally doesn't
+        # leak the future. start_work no longer pops _inflight (see #63),
+        # so the waiter owns post-dispatch cleanup.
+        _inflight.pop(tracking_id, None)
 
-    return target
 
-
-def _remove_pending(tracking_id: str) -> None:
-    """Remove a pending request from whichever bucket it's in (if any)."""
-    for bucket in _buckets:
-        for i, p in enumerate(bucket):
-            if p.tid == tracking_id:
-                del bucket[i]
-                return
+def _slot_idx_owning(tid: str) -> Optional[int]:
+    """Return the index of the slot currently running ``tid``, or None."""
+    for i, s in enumerate(_slots):
+        cj = s.current_job
+        if cj is not None and cj.get("tid") == tid:
+            return i
+    return None
 
 
 def release(tracking_id: str) -> None:
-    """
-    Mark a dispatched request complete and return its GPU to the idle pool.
-
-    Wakes the dispatcher so the next pipe head can be evaluated.
-    """
-    entry = _tracked.get(tracking_id)
-    if entry is None:
+    """Mark a dispatched request complete. Feeds WORK_END(ok) on its slot."""
+    idx = _slot_idx_owning(tracking_id)
+    if idx is None:
+        # Not on any slot — either already released, cancelled, or tid unknown.
         return
-
-    if entry.target is not None:
-        _gpu_busy[entry.target] = False
-
-    entry.status = "completed"
-    entry.completed_at = time.time()
-    ran_for = (entry.completed_at - entry.started_at) if entry.started_at else None
-    dispatch_log.info(
-        "[dispatch] release tid=%s gpu=%s ran=%.1fs src=%s bucket=%s",
-        tracking_id[:8],
-        entry.target[-5:] if entry.target else "?",
-        ran_for if ran_for is not None else -1.0,
-        entry.source, priority_name(entry.priority),
-    )
+    for e in _feed_event(idx, Event.WORK_END, outcome="ok"):
+        _apply_effect(e)
     _notify_change()
-    _wake_dispatcher(reason="release")
-
-    # Non-batch requests drop from the tracker shortly after completion.
-    # Jobs backed by a batch_job_id stay visible (persisted in SQLite anyway).
-    if entry.batch_job_id is None:
-        try:
-            asyncio.get_running_loop().call_later(5, _remove_tracked, tracking_id)
-        except RuntimeError:
-            _remove_tracked(tracking_id)
+    _wake_tick(reason="release")
 
 
 def fail_request(tracking_id: str, error: str = "") -> None:
-    """
-    Mark a tracked request as failed (e.g. Ollama error during generation)
-    and return its GPU to the idle pool.
-    """
-    entry = _tracked.get(tracking_id)
-    if entry is None:
+    """Mark a dispatched request failed. Feeds WORK_END(fail) on its slot."""
+    idx = _slot_idx_owning(tracking_id)
+    if idx is None:
         return
-
-    if entry.target is not None:
-        _gpu_busy[entry.target] = False
-
-    entry.status = "failed"
-    entry.error = error
-    entry.completed_at = time.time()
-    ran_for = (entry.completed_at - entry.started_at) if entry.started_at else None
     dispatch_log.info(
-        "[dispatch] fail tid=%s gpu=%s ran=%.1fs err=%s",
-        tracking_id[:8],
-        entry.target[-5:] if entry.target else "?",
-        ran_for if ran_for is not None else -1.0,
-        (error or "")[:120],
+        "[dispatch] fail tid=%s err=%s",
+        tracking_id[:8], (error or "")[:120],
     )
+    for e in _feed_event(idx, Event.WORK_END, outcome="fail"):
+        _apply_effect(e)
     _notify_change()
-    _wake_dispatcher(reason="fail")
-
-    if entry.batch_job_id is None:
-        try:
-            asyncio.get_running_loop().call_later(10, _remove_tracked, tracking_id)
-        except RuntimeError:
-            _remove_tracked(tracking_id)
-
-
-def _remove_tracked(tracking_id: str) -> None:
-    _tracked.pop(tracking_id, None)
-    _notify_change()
+    _wake_tick(reason="fail")
 
 
 def cancel_tracked(tracking_id: str, reason: str = "cancelled") -> None:
+    """Idempotent cleanup for a request that exited abnormally.
+
+    Three cases, safe in all of them:
+
+    1. **Still in a priority bucket**: pop from bucket, delete pending_work,
+       reject the waiter future. Prevents the scheduler from popping a dead
+       waiter and locking a slot on a disconnected client.
+    2. **Already on a slot (BUSY)**: route through ``fail_request`` so
+       WORK_END fires and the slot recovers.
+    3. **Terminal / unknown**: no-op.
+
+    Called from every proxy-handler ``finally`` block so client disconnect,
+    upstream error, and normal completion all share one cleanup path.
     """
-    Idempotent cleanup for a tracked request that exited abnormally.
+    job = _tid_to_job.get(tracking_id)
+    idx = _slot_idx_owning(tracking_id)
 
-    Handles three cases safely, so a proxy-handler ``finally`` block can call
-    this without knowing which state the request is in:
-
-    1. **Still in a priority bucket** (``status == "queued"``): removes the
-       ``_PendingRequest`` from the bucket, resolves its future with an
-       exception so any concurrent waiter unblocks, and marks the tracked
-       entry ``failed``. Prevents the dispatcher from later popping a dead
-       waiter and wasting a GPU slot — the original bug behind the
-       2026-04-11 feedback-slot wedge.
-    2. **Already running** (``status == "running"``): delegates to
-       ``fail_request`` which releases ``_gpu_busy[target]`` and wakes the
-       dispatcher. The same path is safe against a normal ``release`` that
-       happens to race.
-    3. **Already terminal / already removed**: no-op.
-
-    Call this from every proxy-handler ``finally`` block so that whether the
-    exit path is a normal completion, an upstream error, a client disconnect
-    (``GeneratorExit`` into a pending ``await``), or an unexpected exception,
-    the slot always returns to the idle pool.
-    """
-    entry = _tracked.get(tracking_id)
-    if entry is None:
-        return
-
-    if entry.status == "queued":
-        # Still waiting in a bucket — pull the pending entry out and
-        # resolve its future so any concurrent awaiter unwinds cleanly.
-        for bucket in _buckets:
-            for i, p in enumerate(bucket):
-                if p.tid == tracking_id:
-                    del bucket[i]
-                    if not p.future.done():
-                        p.future.set_exception(
-                            RuntimeError(f"request cancelled: {reason}")
-                        )
-                    break
-        entry.status = "failed"
-        entry.error = reason
-        entry.completed_at = time.time()
-        dispatch_log.info(
-            "[dispatch] cancel tid=%s state=queued reason=%s",
-            tracking_id[:8], reason,
-        )
-        _notify_change()
-        _wake_dispatcher(reason="cancel")
-        if entry.batch_job_id is None:
-            try:
-                asyncio.get_running_loop().call_later(10, _remove_tracked, tracking_id)
-            except RuntimeError:
-                _remove_tracked(tracking_id)
-        return
-
-    if entry.status == "running":
-        # Slot is already assigned — route through fail_request so the
-        # GPU is released and the dispatcher wakes.
+    if idx is not None:
         dispatch_log.info(
             "[dispatch] cancel tid=%s state=running reason=%s",
             tracking_id[:8], reason,
@@ -538,431 +384,135 @@ def cancel_tracked(tracking_id: str, reason: str = "cancelled") -> None:
         fail_request(tracking_id, reason)
         return
 
-    # terminal (completed/failed) — nothing to do.
-
-
-def clear_tracker(force: bool = False) -> dict:
-    """
-    Drop entries from the in-memory tracker to restore a known baseline.
-
-    Default behaviour (safe):
-        Only entries with status in {"completed", "failed"} are removed.
-        In-flight work (``queued`` / ``running``) is left untouched.
-        Batch-job-backed entries that would normally stay visible forever
-        (see ``release`` line 327) are cleared.
-
-    ``force=True`` (unsafe — breaks in-flight requests):
-        Also cancels every queued waiter (their ``_PendingRequest.future``
-        is resolved with an exception so ``wait_for_dispatch`` raises and
-        the client gets an error), and marks every running entry as
-        ``failed``, releasing its GPU back to the idle pool. Any outbound
-        HTTP request currently held by the dispatcher is *not* cancelled
-        at the socket level — the httpx client keeps running until the
-        upstream Ollama responds — but the tracker will no longer reflect
-        it, so a subsequent ``release`` or ``fail_request`` becomes a
-        no-op. Use only for admin reset or integration-test setup; a
-        misfire during normal traffic will leak GPU accounting until the
-        orphaned request completes.
-
-    Returns a dict with per-status removal counts, e.g.::
-
-        {"completed": 12, "failed": 0, "queued": 0, "running": 0}
-    """
-    removed = {"completed": 0, "failed": 0, "queued": 0, "running": 0}
-
-    # Step 1: always drop terminal entries.
-    for tid in [tid for tid, e in _tracked.items()
-                if e.status in ("completed", "failed")]:
-        removed[_tracked[tid].status] += 1
-        _tracked.pop(tid, None)
-
-    if not force:
-        _notify_change()
-        return removed
-
-    # Step 2: force-clear queued entries. Resolve their pending futures
-    # with a RuntimeError so wait_for_dispatch raises and the client path
-    # unwinds cleanly.
-    for bucket in _buckets:
-        while bucket:
-            pending = bucket.popleft()
-            if not pending.future.done():
-                pending.future.set_exception(
-                    RuntimeError("queue cleared by admin force-reset")
-                )
-            entry = _tracked.pop(pending.tid, None)
-            if entry is not None:
-                removed["queued"] += 1
-
-    # Step 3: force-clear running entries. Mark them failed, release
-    # their GPU so the dispatcher can reuse it, drop from _tracked.
-    # The in-flight httpx request still runs to completion upstream;
-    # release()/fail_request() called by that path will no-op because
-    # the entry is gone.
-    for tid in [tid for tid, e in _tracked.items() if e.status == "running"]:
-        entry = _tracked[tid]
-        if entry.target is not None:
-            _gpu_busy[entry.target] = False
-        removed["running"] += 1
-        _tracked.pop(tid, None)
-
-    _notify_change()
-    _wake_dispatcher()
-    return removed
-
-
-# ── Dispatcher core ──────────────────────────────────────────────────────────
-
-
-def _best_candidate_for(model: str) -> Optional[str]:
-    """
-    Return the URL of the best idle GPU for ``model``, or None if no GPU
-    is currently dispatchable.
-
-    Decision rule:
-      1. Prefer an idle GPU that already holds the requested model (affinity).
-      2. Otherwise, any idle GPU is a candidate (will be swapped).
-      3. Exclude unhealthy GPUs.
-      4. Exclude thermally paused GPUs — their in-flight work is preserved
-         but no new work is dispatched until they cool down.
-    """
-    # Deferred import to avoid module-load cycle.
-    import gpu_router
-
-    _ensure_gpu_state()
-    dispatchable = {url for url in _gpu_targets()
-                    if gpu_router.is_dispatchable(url)}
-    if not dispatchable:
-        return None
-
-    idle = [url for url in _gpu_targets()
-            if url in dispatchable and not _gpu_busy.get(url, False)]
-    if not idle:
-        return None
-
-    # Prefer an idle GPU that already holds the requested model.
-    for url in idle:
-        gpu_state = gpu_router._gpus.get(url)
-        if gpu_state and gpu_state.model == model:
-            return url
-
-    # No affinity match — any idle GPU will do. Pick the least-recently-active
-    # one so load spreads evenly over time.
-    idle.sort(key=lambda u: gpu_router._gpus[u].last_active if u in gpu_router._gpus else 0)
-    return idle[0]
-
-
-def _try_dispatch_heads() -> None:
-    """
-    Walk the priority buckets from CHAT down to BACKGROUND.  For each
-    bucket, try to assign a GPU to the head.  Stop at the first head that
-    cannot be dispatched — FIFO must be preserved within a bucket, so we
-    never skip a head.  A lower-priority bucket only gets a turn when every
-    higher-priority bucket is empty.
-    """
-    global _last_dispatch_ts
-
-    # Paused by operator: do not hand out any new slots. In-flight work is
-    # untouched; the walk simply no-ops until set_paused(False) wakes us.
-    if _paused:
+    if job is not None:
+        # Still in a bucket — remove it.
+        prio = job["priority"]
+        try:
+            _buckets_v2[prio].remove(job)
+        except ValueError:
+            pass
+        _tid_to_job.pop(tracking_id, None)
+        try:
+            db.delete_pending(tracking_id)
+        except Exception:
+            log.exception("[cancel] delete_pending failed tid=%s", tracking_id)
+        fut = _inflight.pop(tracking_id, None)
+        if fut is not None and not fut.done():
+            fut.set_exception(RuntimeError(f"request cancelled: {reason}"))
         dispatch_log.info(
-            "[dispatch] walk skipped reason=paused paused_since=%s",
-            _paused_since,
+            "[dispatch] cancel tid=%s state=queued reason=%s",
+            tracking_id[:8], reason,
         )
+        _notify_change()
+        _wake_tick(reason="cancel")
         return
 
-    # Snapshot of dispatch-time state so the log has enough context to
-    # explain any stall we observe.
-    import gpu_router
-    depths = {priority_name(p): len(_buckets[p]) for p in Priority}
-    busy_snapshot = {u[-5:]: _gpu_busy.get(u, False) for u in _gpu_targets()}
+    # Unknown / already terminal — nothing to do.
+
+
+@asynccontextmanager
+async def dispatched(tracking_id: str):
+    """Await dispatch for a pre-tracked tid, yield target URL, release on exit.
+
+    Companion to :func:`tracked_dispatch` for handlers that need to keep the
+    tid on their own (e.g. a streaming path that interleaves keepalives with
+    the dispatch wait). Slot lifecycle is owned here, not by the caller:
+
+      * normal exit: :func:`release` (WORK_END ok).
+      * body raises: :func:`fail_request` (WORK_END fail), then re-raise.
+      * wait raises: :func:`wait_for_dispatch` already self-cleaned, re-raise.
+    """
+    target = await wait_for_dispatch(tracking_id)
     try:
-        dispatchable = {u for u in _gpu_targets() if gpu_router.is_dispatchable(u)}
-    except Exception:
-        dispatchable = set()
-    idle_count = sum(
-        1 for u in _gpu_targets()
-        if u in dispatchable and not _gpu_busy.get(u, False)
-    )
-    dispatch_log.info(
-        "[dispatch] walk start depths=%s gpus_busy=%s idle_gpus=%d",
-        depths, busy_snapshot, idle_count,
-    )
-
-    dispatched = 0
-    stopped_reason = "buckets_drained"
-    stopped_bucket: Optional[str] = None
-    for prio_idx, bucket in enumerate(_buckets):
-        if not bucket:
-            continue
-        while bucket:
-            req = bucket[0]
-            target = _best_candidate_for(req.model)
-            if target is None:
-                # Head of this bucket cannot dispatch right now. We must not
-                # fall through to a lower-priority bucket while a higher
-                # bucket still has pending work — strict priority forbids
-                # any inversion, even when the lower bucket's head happens
-                # to be a better model fit.
-                stopped_reason = "no_candidate"
-                stopped_bucket = priority_name(Priority(prio_idx))
-                dispatch_log.info(
-                    "[dispatch] walk stop dispatched=%d reason=%s bucket=%s "
-                    "head_tid=%s head_model=%s remaining_in_bucket=%d",
-                    dispatched, stopped_reason, stopped_bucket,
-                    req.tid[:8], req.model, len(bucket),
-                )
-                return
-            bucket.popleft()
-            _gpu_busy[target] = True
-            if req.tid in _tracked:
-                _tracked[req.tid].target = target
-            entry = _tracked.get(req.tid)
-            wait_ms = -1.0
-            if entry and entry.queued_for_dispatch_at:
-                wait_ms = (time.time() - entry.queued_for_dispatch_at) * 1000
-            dispatch_log.info(
-                "[dispatch] pop tid=%s bucket=%s gpu=%s model=%s wait_ms=%.0f",
-                req.tid[:8], priority_name(Priority(prio_idx)),
-                target[-5:], req.model, wait_ms,
-            )
-            asyncio.create_task(_dispatch(req, target))
-            dispatched += 1
-            _last_dispatch_ts = time.time()
-
-    dispatch_log.info(
-        "[dispatch] walk end dispatched=%d reason=%s bucket=%s",
-        dispatched, stopped_reason, stopped_bucket,
-    )
-
-
-async def _dispatch(req: _PendingRequest, target: str) -> None:
-    """
-    Perform any required model swap for ``target`` and then resolve the
-    waiter's future with the assigned URL.  Runs as a background task so
-    the dispatcher loop itself never blocks on the swap.
-    """
-    import gpu_router
-    t0 = time.time()
-    try:
-        gpu_state = gpu_router._gpus.get(target)
-        swap_ms: float = 0.0
-        if gpu_state is not None and gpu_state.model != req.model:
-            # Swap cost is bounded by MODEL_SWAP_COST_SECONDS in practice.
-            # The dispatcher has already marked the GPU busy so no other
-            # request can land here until the swap completes.
-            dispatch_log.info(
-                "[dispatch] swap start tid=%s gpu=%s %s -> %s",
-                req.tid[:8], target[-5:], gpu_state.model, req.model,
-            )
-            swap_start = time.time()
-            ok = await gpu_router._reload_model(gpu_state, req.model)
-            swap_ms = (time.time() - swap_start) * 1000
-            if not ok:
-                # Warmup POST did not land: Ollama returned non-2xx, the
-                # connection failed, or the wrong endpoint was used. Do
-                # not hand off — the model is not actually loaded and
-                # the proxy call would 500 on the real request.
-                dispatch_log.warning(
-                    "[dispatch] swap failed tid=%s gpu=%s target=%r ms=%.0f",
-                    req.tid[:8], target[-5:], req.model, swap_ms,
-                )
-                raise RuntimeError(
-                    f"failed to load model {req.model!r} on GPU {target}"
-                )
-            dispatch_log.info(
-                "[dispatch] swap done tid=%s gpu=%s ms=%.0f",
-                req.tid[:8], target[-5:], swap_ms,
-            )
-
-        entry = _tracked.get(req.tid)
-        if entry is not None:
-            entry.status = "running"
-            entry.started_at = time.time()
-            entry.target = target
-            _notify_change()
-
-        if not req.future.done():
-            req.future.set_result(target)
-        dispatch_log.info(
-            "[dispatch] handoff tid=%s gpu=%s total_ms=%.0f swap_ms=%.0f",
-            req.tid[:8], target[-5:], (time.time() - t0) * 1000, swap_ms,
-        )
-    except Exception as exc:
-        log.exception("dispatch failed for %s on %s", req.tid, target)
-        dispatch_log.warning(
-            "[dispatch] handoff_fail tid=%s gpu=%s err=%s",
-            req.tid[:8], target[-5:], exc,
-        )
-        _gpu_busy[target] = False
-        if not req.future.done():
-            req.future.set_exception(exc)
-        _wake_dispatcher(reason="handoff_fail")
-
-
-async def _watchdog_loop() -> None:
-    """
-    Reclaim wedged slots whose dispatched request has exceeded its
-    wall-clock budget.
-
-    Background: a downstream Ollama call can hang in ways the proxy
-    layer cannot detect (half-open socket, model unloaded mid-stream,
-    upstream silently dropping the connection). When that happens
-    ``release()`` is never called and the slot stays "running" forever,
-    blocking strict-priority dispatch — the queue deadlocks even though
-    no actual GPU work is in flight. The 2026-04-10 parsival re-analysis
-    incident wedged both GPUs this way for ~13 minutes with 295 batch
-    jobs queued behind two zombie ``feedback`` entries.
-
-    The watchdog scans tracked entries on a fixed interval and force-fails
-    any that have been ``running`` longer than ``SLOT_MAX_WALL_SECONDS``.
-    ``fail_request()`` releases the GPU slot and wakes the dispatcher so
-    queued work can finally make progress. The slot is the unit reclaimed,
-    not the upstream request — if Ollama eventually responds, the proxy
-    coroutine will discover the entry is gone and quietly no-op.
-    """
-    while True:
-        try:
-            await asyncio.sleep(config.WATCHDOG_INTERVAL_SECONDS)
-            now = time.time()
-            wedged: list[tuple[str, float]] = []
-            for tid, entry in list(_tracked.items()):
-                if entry.status != "running" or entry.started_at is None:
-                    continue
-                age = now - entry.started_at
-                if age > config.SLOT_MAX_WALL_SECONDS:
-                    wedged.append((tid, age))
-            for tid, age in wedged:
-                log.warning(
-                    "watchdog: reclaiming wedged slot %s (age=%.0fs > budget=%ds)",
-                    tid[:8], age, config.SLOT_MAX_WALL_SECONDS,
-                )
-                fail_request(
-                    tid,
-                    f"Watchdog reclaimed slot after {age:.0f}s "
-                    f"exceeded {config.SLOT_MAX_WALL_SECONDS}s budget",
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("watchdog loop iteration failed — continuing")
-            await asyncio.sleep(1.0)
-
-
-async def _dispatcher_loop() -> None:
-    """
-    Central dispatch loop: wakes on every relevant state change (new
-    arrival, release, swap completion, health transition) and tries to
-    assign work to any idle GPU.
-    """
-    global _state_changed, _wake_counter, _last_wake_ts
-    if _state_changed is None:
-        _state_changed = asyncio.Event()
-
-    while True:
-        try:
-            await _state_changed.wait()
-            _state_changed.clear()
-            _wake_counter += 1
-            now = time.time()
-            gap_s = (now - _last_wake_ts) if _last_wake_ts is not None else 0.0
-            gap_since_dispatch = (
-                (now - _last_dispatch_ts) if _last_dispatch_ts is not None else -1.0
-            )
-            dispatch_log.info(
-                "[dispatch] wake #%d gap_since_last_wake=%.2fs gap_since_last_pop=%.2fs",
-                _wake_counter, gap_s, gap_since_dispatch,
-            )
-            _last_wake_ts = now
-            _try_dispatch_heads()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("dispatcher loop iteration failed — continuing")
-            # Don't hot-loop on repeated failures.
-            await asyncio.sleep(0.1)
-
-
-# ── Reclaim-loop cooperation ─────────────────────────────────────────────────
-
-
-def reserve_gpu(target: str) -> bool:
-    """
-    Mark a GPU busy from outside the dispatcher (e.g. the reclaim loop in
-    ``gpu_router`` before a scheduled model swap).  Returns False if the
-    GPU was already busy.
-    """
-    _ensure_gpu_state()
-    if _gpu_busy.get(target, False):
-        return False
-    _gpu_busy[target] = True
-    return True
-
-
-def unreserve_gpu(target: str) -> None:
-    """Release a GPU previously reserved via ``reserve_gpu`` and wake the dispatcher."""
-    _gpu_busy[target] = False
-    _wake_dispatcher()
+        yield target
+    except BaseException as exc:
+        fail_request(tracking_id, str(exc))
+        raise
+    else:
+        release(tracking_id)
 
 
 # ── Queue visibility ─────────────────────────────────────────────────────────
 
 
 def active_queue() -> list[dict]:
-    """
-    Return all currently tracked requests (queued + running + recently
-    completed), sorted by submitted_at.
+    """Return the currently queued + running requests, sorted by submitted_at.
+
+    Queued entries come from ``_buckets_v2``, running entries from slots in
+    BUSY state. Post-completion tail is not retained — batch history lives
+    in the ``batch_jobs`` table; interactive requests are done when the
+    HTTP response returns to the client.
     """
     now = time.time()
-    result = []
-    for entry in sorted(_tracked.values(), key=lambda e: e.submitted_at):
-        d = {
-            "id":            entry.id,
-            "source":        entry.source,
-            "request_type":  entry.request_type,
-            "model":         entry.model,
-            "priority":      priority_name(entry.priority),
-            "target":        entry.target,
-            "status":        entry.status,
-            "submitted_at":  entry.submitted_at,
-            "started_at":    entry.started_at,
-            "completed_at":  entry.completed_at,
-            "error":         entry.error,
-            "batch_job_id":  entry.batch_job_id,
-        }
-        if entry.status == "running" and entry.started_at:
-            d["elapsed_sec"] = round(now - entry.started_at, 1)
-        elif entry.status == "queued":
-            d["waiting_sec"] = round(now - entry.submitted_at, 1)
-        result.append(d)
+    result: list[dict] = []
+
+    for bucket in _buckets_v2:
+        for job in bucket:
+            result.append({
+                "id":            job["tid"],
+                "source":        job["source"],
+                "request_type":  job["request_type"],
+                "model":         job["model"],
+                "priority":      priority_name(job["priority"]),
+                "target":        None,
+                "status":        "queued",
+                "submitted_at":  job["submitted_at"],
+                "started_at":    None,
+                "completed_at":  None,
+                "error":         None,
+                "batch_job_id":  job["batch_job_id"],
+                "waiting_sec":   round(now - job["submitted_at"], 1),
+            })
+
+    for i, s in enumerate(_slots):
+        if s.state is not SlotState.BUSY or s.current_job is None:
+            continue
+        job = s.current_job
+        started = _busy_since.get(i, now)
+        result.append({
+            "id":            job.get("tid", ""),
+            "source":        job.get("source", ""),
+            "request_type":  job.get("request_type", ""),
+            "model":         job.get("model", s.model_loaded or ""),
+            "priority":      priority_name(job.get("priority", Priority.BACKGROUND)),
+            "target":        s.url,
+            "status":        "running",
+            "submitted_at":  job.get("submitted_at", started),
+            "started_at":    started,
+            "completed_at":  None,
+            "error":         None,
+            "batch_job_id":  job.get("batch_job_id"),
+            "elapsed_sec":   round(now - started, 1),
+        })
+
+    result.sort(key=lambda d: d["submitted_at"])
     return result
 
 
 def queue_depth() -> dict:
     """Summary counts for the status endpoint."""
-    queued = sum(1 for e in _tracked.values() if e.status == "queued")
-    running = sum(1 for e in _tracked.values() if e.status == "running")
+    queued  = sum(len(b) for b in _buckets_v2)
+    running = sum(1 for s in _slots if s.state is SlotState.BUSY)
 
     gpus: dict = {}
-    for entry in _tracked.values():
-        if entry.status in ("queued", "running") and entry.target:
-            gpu = gpus.setdefault(entry.target, {"queued": 0, "running": 0})
-            gpu[entry.status] += 1
+    for s in _slots:
+        if s.state is SlotState.BUSY:
+            gpus.setdefault(s.url, {"queued": 0, "running": 0})["running"] += 1
+    # Per-GPU "queued" lane stays 0 — buckets are global, not per-GPU.
+    # Field shape preserved so dashboards from before the cutover still parse.
 
     return {"queued": queued, "running": running, "total": queued + running, "gpus": gpus}
 
 
 def pipe_depth() -> dict:
-    """Depth of each dispatcher bucket (pre-dispatch waiters).
+    """Depth of each priority bucket.
 
-    Returns one key per :class:`Priority` name plus legacy ``interactive`` /
-    ``batch`` aliases (CHAT / BACKGROUND) so existing dashboards and tests
-    that read the old keys keep working during the transition.
+    Returns one key per :class:`Priority` name plus legacy ``interactive``
+    / ``batch`` aliases so existing dashboards keep working.
     """
     depths: dict = {
-        priority_name(p): len(_buckets[p]) for p in Priority
+        priority_name(p): len(_buckets_v2[p]) for p in Priority
     }
-    # Back-compat aliases.
     depths["interactive"] = depths["chat"]
     depths["batch"]       = depths["background"]
     return depths
@@ -985,60 +535,77 @@ def submit_batch_job(source_app: str, model: str, prompt: str,
     return job_id
 
 
-async def _run_batch_job_async(job_id: str) -> None:
-    """Execute a batch job through the late-binding dispatcher."""
-    import gpu_router
-    # Deferred import: app imports queue_manager at module load time, so we
-    # cannot import app at the top of this file. Batch jobs must funnel
-    # through the same activity tracker that ``app._proxy`` uses, otherwise
-    # the Ollama Instances card and the SSE stream show the GPU as idle for
-    # the entire duration of the batch run even though it's hammering away.
-    import app as _app
+@asynccontextmanager
+async def tracked_dispatch(*, source: str, request_type: str, model: str,
+                           priority: Union[Priority, int],
+                           batch_job_id: Optional[str] = None):
+    """Track a request, await dispatch, yield the target URL.
 
-    job = db.get_batch_job(job_id)
-    if not job or job["status"] != "queued":
-        return
+    Cleanup is guaranteed: normal exit calls :func:`release` (WORK_END ok);
+    exceptional exit calls :func:`cancel_tracked`, which routes through
+    :func:`fail_request` if the tid was already on a slot or evicts it
+    from its bucket otherwise. Exceptions from ``wait_for_dispatch`` (e.g.
+    :class:`DispatchTimeout`) propagate after the tid is cleaned up.
 
-    retries = job.get("retries", 0)
-    db.update_batch_job(job_id, status="running", started_at=time.time())
+    Use this anywhere a coroutine takes ownership of a tid for the
+    duration of a single dispatched call.
+    """
+    tid = track_request(
+        source=source, request_type=request_type, model=model,
+        priority=priority, batch_job_id=batch_job_id,
+    )
+    try:
+        target = await wait_for_dispatch(tid)
+    except BaseException:
+        # wait_for_dispatch already cleans up on DispatchTimeout, but other
+        # raises (RuntimeError on cancellation, etc.) need a belt-and-braces
+        # cancel so the bucket entry can't outlive the caller.
+        cancel_tracked(tid, reason="wait_failed")
+        raise
+    try:
+        yield target
+    except BaseException:
+        cancel_tracked(tid, reason="caller_exception")
+        raise
+    else:
+        release(tid)
 
+
+def _build_batch_body(job: dict) -> tuple[dict, dict]:
+    """Build the Ollama /api/generate body for a batch job.
+
+    Returns ``(body, options)`` so the caller can later inspect ``options``
+    when classifying empty-response failures.
+
+    Defensive defaults guard against the "unbounded reasoning" failure mode:
+    qwen3:* without ``think=False`` + bounded ``num_predict`` + a fixed
+    ``num_ctx`` will burn its entire decode budget on reasoning and return
+    an empty response. Defaults only fill MISSING keys — explicit caller
+    values are respected.
+
+    ``num_ctx`` also forces both GPUs to converge on the same KV-cache size
+    so identical workloads run at the same speed regardless of which GPU
+    served them.
+
+    ``think`` is a top-level Ollama request parameter — Ollama silently
+    ignores it inside ``options`` — so we lift it out before sending.
+    """
     options: dict = {}
     try:
         options = json.loads(job.get("options", "{}"))
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # ── Defensive option defaults ────────────────────────────────────────
-    # Belt-and-suspenders for the "unbounded reasoning" failure mode:
-    # if a caller submitted a batch job without the three keys that keep
-    # qwen3:* from wedging a slot (think:false, num_predict, num_ctx),
-    # fill them in here so old jobs, buggy callers, and third-party clients
-    # still run with safe bounds. We only fill in MISSING keys — if the
-    # caller specified a value we respect it.
-    #
-    # num_ctx also serves a second purpose: it forces every Ollama instance
-    # to converge on the same KV-cache size. Without it the two GPUs can
-    # end up loaded with different context lengths (one from an earlier
-    # request, one from a later one) and the larger-ctx GPU becomes
-    # ~2× slower on identical workloads because of the bigger KV cache.
-    _defaults = {
-        "think":       False,     # disable qwen3 reasoning emission
-        "num_predict": 768,       # bounded decode cap
-        "num_ctx":     8192,      # fixed KV cache so both GPUs match
-        "temperature": 0.1,       # deterministic-ish for extraction tasks
+    defaults = {
+        "think":       False,
+        "num_predict": 768,
+        "num_ctx":     8192,
+        "temperature": 0.1,
     }
-    for k, v in _defaults.items():
+    for k, v in defaults.items():
         options.setdefault(k, v)
 
-    # ``think`` is a top-level Ollama request parameter, not an entry in
-    # ``options``. Callers (and our own defaults block above) routinely
-    # tuck it into options because it sits alongside num_predict/num_ctx
-    # conceptually — but Ollama silently ignores it there, so qwen3:* keeps
-    # reasoning and burns the entire num_predict budget before emitting any
-    # content, producing done_reason='length' with an empty response.
-    # Lift it out so it actually takes effect.
     think_flag = options.pop("think", False)
-
     body = {
         "model":   job["model"],
         "prompt":  job["prompt"],
@@ -1046,126 +613,146 @@ async def _run_batch_job_async(job_id: str) -> None:
         "think":   think_flag,
         "options": options,
     }
+    return body, options
 
-    tracking_id = track_request(
-        source=job["source_app"],
-        request_type="batch",
-        model=job["model"],
-        priority=Priority.BACKGROUND,
-        batch_job_id=job_id,
+
+def _validate_batch_response(payload: dict, options: dict) -> str:
+    """Extract response text or raise :class:`EmptyResponseError` with a hint.
+
+    Distinguishes the two empty-response failure modes so the extractor
+    logs point at the right knob: ``done_reason='length'`` with the prompt
+    fitting inside ``num_ctx`` means ``num_predict`` was exhausted
+    (almost always qwen3:* reasoning emission not being suppressed);
+    otherwise the prompt was truncated past ``num_ctx``.
+    """
+    text = payload.get("response", "")
+    if text.strip():
+        return text
+
+    prompt_tokens = payload.get("prompt_eval_count")
+    done_reason   = payload.get("done_reason")
+    num_ctx       = options.get("num_ctx")
+    num_predict   = options.get("num_predict")
+    if (done_reason == "length"
+            and prompt_tokens is not None
+            and num_ctx is not None
+            and prompt_tokens < num_ctx):
+        hint = (f"decode hit num_predict={num_predict} before any "
+                f"content was emitted (check think=False for qwen3:*)")
+    else:
+        hint = "likely prompt exceeds num_ctx and was truncated"
+    raise EmptyResponseError(
+        f"Ollama returned empty response "
+        f"(done_reason={done_reason!r}, "
+        f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); {hint}"
     )
 
-    try:
-        dispatch_wait_start = time.time()
-        target = await wait_for_dispatch(tracking_id)
-        dispatch_wait_s = time.time() - dispatch_wait_start
-        dispatch_log.info(
-            "[dispatch] batch wait_done job=%s tid=%s gpu=%s wait=%.2fs",
-            job_id[:8], tracking_id[:8], target[-5:], dispatch_wait_s,
+
+def _notify_terminal(job_id: str) -> None:
+    """Fire-and-forget notification dispatch for a completed/failed job."""
+    j = db.get_batch_job(job_id)
+    if not j or j.get("status") not in ("completed", "failed"):
+        return
+    asyncio.ensure_future(notifications.dispatch(
+        j, webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
+    ))
+
+
+async def _handle_batch_failure(job_id: str, retries: int, exc: Exception,
+                                prev_error: str) -> None:
+    """Decide retry vs final-fail for a batch job; persist the outcome.
+
+    Empty responses are deterministic given the same inputs, so they are
+    not retried — that would just burn another full decode for the same
+    blank result. Other exceptions retry up to BATCH_MAX_RETRIES with
+    exponential backoff (30 s × 4ⁿ).
+    """
+    is_retryable = not isinstance(exc, EmptyResponseError)
+    if is_retryable and retries < config.BATCH_MAX_RETRIES:
+        backoff     = 30 * (4 ** retries)
+        retry_after = time.time() + backoff
+        new_error   = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
+        db.update_batch_job(
+            job_id, status="queued", retries=retries + 1,
+            retry_after=retry_after, started_at=None, error=new_error,
         )
-        _app._activity_set(target, job["model"], "/api/generate")
-        try:
-            # Bounded read timeout: defence-in-depth behind the watchdog.
-            # If the watchdog has already reclaimed the slot, this still
-            # eventually unblocks the coroutine instead of leaking the
-            # httpx connection forever.
-            http_start = time.time()
+        log.warning(
+            "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
+            job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
+        )
+        await asyncio.sleep(backoff)
+        await _run_batch_job_async(job_id)
+        return
+
+    final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
+    db.update_batch_job(job_id, status="failed",
+                        completed_at=time.time(), error=final_error)
+    log.error("batch job %s permanently failed after %d attempt(s): %s",
+              job_id[:8], retries + 1, exc)
+    _notify_terminal(job_id)
+
+
+async def _run_batch_job_async(job_id: str) -> None:
+    """Execute a batch job through the FSM dispatcher.
+
+    Lifecycle is anchored on :func:`tracked_dispatch` so the tid leaves the
+    queue/slot regardless of how this coroutine exits. Activity tracking
+    is nested inside the dispatch so the UI shows the GPU as busy for the
+    duration of the HTTP call (and only the HTTP call).
+    """
+    # Deferred import: app imports queue_manager at module load time, so we
+    # cannot import app at the top of this file. Batch jobs funnel through
+    # the same activity tracker as ``app._proxy`` so the Ollama Instances
+    # card stays accurate during a long batch run.
+    import app as _app
+    import gpu_router
+
+    job = db.get_batch_job(job_id)
+    if not job or job["status"] != "queued":
+        return
+
+    retries    = job.get("retries", 0)
+    prev_error = (job.get("error") or "").strip()
+    db.update_batch_job(job_id, status="running", started_at=time.time())
+
+    body, options = _build_batch_body(job)
+    target: Optional[str] = None
+
+    try:
+        async with tracked_dispatch(
+            source=job["source_app"], request_type="batch",
+            model=job["model"], priority=Priority.BACKGROUND,
+            batch_job_id=job_id,
+        ) as t:
+            target = t
+            _app._activity_set(target, job["model"], "/api/generate")
+            # Bounded read timeout: defence-in-depth behind the tick's
+            # busy-slot timeout sweep. If the slot has already been driven
+            # through WORK_END(timeout), this still eventually unblocks the
+            # coroutine instead of leaking the httpx connection forever.
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
             ) as client:
                 resp = await client.post(f"{target}/api/generate", json=body)
                 resp.raise_for_status()
                 payload = resp.json()
-                result_text = payload.get("response", "")
-            http_s = time.time() - http_start
-            dispatch_log.info(
-                "[dispatch] batch http_done job=%s tid=%s gpu=%s http=%.2fs "
-                "resp_chars=%d",
-                job_id[:8], tracking_id[:8], target[-5:], http_s,
-                len(result_text),
-            )
             gpu_router.record_activity(target)
-            if not result_text.strip():
-                prompt_tokens = payload.get("prompt_eval_count")
-                done_reason   = payload.get("done_reason")
-                num_ctx       = options.get("num_ctx")
-                num_predict   = options.get("num_predict")
-                # Distinguish the two empty-response failure modes so the
-                # extractor logs point at the right knob. ``length`` with
-                # the prompt fitting inside num_ctx means num_predict was
-                # exhausted (almost always qwen3:* reasoning emission not
-                # being suppressed); otherwise the prompt really did get
-                # left-truncated past num_ctx.
-                if (done_reason == "length"
-                        and prompt_tokens is not None
-                        and num_ctx is not None
-                        and prompt_tokens < num_ctx):
-                    hint = (f"decode hit num_predict={num_predict} before any "
-                            f"content was emitted (check think=False for qwen3:*)")
-                else:
-                    hint = "likely prompt exceeds num_ctx and was truncated"
-                raise EmptyResponseError(
-                    f"Ollama returned empty response "
-                    f"(done_reason={done_reason!r}, "
-                    f"prompt_tokens={prompt_tokens}, num_ctx={num_ctx}); "
-                    f"{hint}"
-                )
+            result_text = _validate_batch_response(payload, options)
             db.update_batch_job(job_id, status="completed",
                                 completed_at=time.time(), result=result_text)
             log.info("batch job %s completed", job_id[:8])
-            completed_job = db.get_batch_job(job_id)
-            if completed_job:
-                asyncio.ensure_future(notifications.dispatch(
-                    completed_job,
-                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-                ))
-        finally:
-            # Order matters: release() first so the dispatcher can hand the
-            # GPU to the next waiter in the same event-loop tick. If we
-            # clear activity before releasing, the UI briefly sees the GPU
-            # as idle even though a new job is about to start on it — the
-            # visible "stop/start" flicker the user reported during large
-            # batches. The new request's _activity_set() will overwrite
-            # ours, so the clear is only there to cover the "no work left"
-            # case.
-            release(tracking_id)
-            _app._activity_clear(target)
+        # tracked_dispatch __aexit__ has fired release() by here.
+        _notify_terminal(job_id)
     except Exception as exc:
-        fail_request(tracking_id, str(exc))
-        prev_error = (job.get("error") or "").strip()
-        # Empty responses are deterministic given the same prompt — retrying
-        # would just burn another full decode for the same blank result.
-        is_retryable = not isinstance(exc, EmptyResponseError)
-        if is_retryable and retries < config.BATCH_MAX_RETRIES:
-            backoff    = 30 * (4 ** retries)
-            retry_after = time.time() + backoff
-            new_error  = f"{prev_error} [attempt {retries + 1} failed: {exc}]".lstrip()
-            db.update_batch_job(
-                job_id,
-                status="queued",
-                retries=retries + 1,
-                retry_after=retry_after,
-                started_at=None,
-                error=new_error,
-            )
-            log.warning(
-                "batch job %s failed (attempt %d/%d), retrying in %ds: %s",
-                job_id[:8], retries + 1, config.BATCH_MAX_RETRIES + 1, backoff, exc,
-            )
-            await asyncio.sleep(backoff)
-            await _run_batch_job_async(job_id)
-        else:
-            final_error = f"{prev_error} [final failure after {retries + 1} attempts: {exc}]".lstrip()
-            db.update_batch_job(job_id, status="failed",
-                                completed_at=time.time(), error=final_error)
-            log.error("batch job %s permanently failed after %d attempt(s): %s",
-                      job_id[:8], retries + 1, exc)
-            failed_job = db.get_batch_job(job_id)
-            if failed_job:
-                asyncio.ensure_future(notifications.dispatch(
-                    failed_job,
-                    webhook_url=config.NOTIFICATION_WEBHOOK_URL or None,
-                ))
+        await _handle_batch_failure(job_id, retries, exc, prev_error)
+    finally:
+        # Clear activity AFTER release so a follow-up batch's _activity_set
+        # overwrites ours without a visible idle gap. tracked_dispatch's
+        # __aexit__ runs before this finally on the success path, and
+        # before _handle_batch_failure on the failure path, so ordering
+        # holds in both cases.
+        if target is not None:
+            _app._activity_clear(target)
 
 
 def get_queue_position(job_id: str) -> Optional[int]:
@@ -1212,3 +799,402 @@ def get_job_result(job_id: str) -> Optional[dict]:
         "id":     job["id"],
         "result": job.get("result", ""),
     }
+
+
+# ── Scheduler wiring ────────────────────────────────────────────────────────
+
+from scheduler import (  # noqa: E402  — sibling module
+    Slot, SlotState, Event, Effect,
+    transition, dispatch_pass, stage_pass, project_status,
+    log_transition, log_tick_summary, SchedulerStatus,
+    tick_log,
+)
+
+# Canonical slot list — one Slot per configured GPU URL. Single source of
+# truth for per-GPU state.
+_slots: list[Slot] = []
+
+# Five in-memory FIFO buckets. New arrivals are appended here and persisted
+# via db.insert_pending. Elements are plain dicts (see _make_job).
+_buckets_v2: list[list[dict]] = [[] for _ in range(5)]
+
+# Waiters — tid → Future[url]. Resolved when a start_work effect fires
+# for the owning job.
+_inflight: dict[str, "asyncio.Future[str]"] = {}
+
+# Reverse lookup for cancel_tracked — which job dict currently represents
+# this tid? Cleared when the job leaves its bucket (dispatch or cancel).
+_tid_to_job: dict[str, dict] = {}
+
+# Tick loop wiring. _tick_wakeup is set whenever bucket or slot state
+# changes; _tick_task owns the single background coroutine.
+_tick_wakeup: Optional[asyncio.Event] = None
+_tick_task:   Optional[asyncio.Task] = None
+
+
+def _make_job(*, tid: str, source: str, request_type: str, model: str,
+              priority: int, batch_job_id: Optional[str],
+              submitted_at: float) -> dict:
+    """Canonical shape of the dict stored in _buckets_v2.
+
+    ``model`` is what the scheduler reads for dispatch decisions;
+    everything else is orchestrator/observability metadata.
+    """
+    return {
+        "tid":          tid,
+        "source":       source,
+        "request_type": request_type,
+        "model":        model,
+        "priority":     priority,
+        "batch_job_id": batch_job_id,
+        "submitted_at": submitted_at,
+    }
+
+
+def _feed_event(slot_idx: int, event: Event, **kw) -> list[Effect]:
+    """Feed one event into slot[i]'s FSM.
+
+    Applies the transition, persists the new slot_state row, logs via the
+    ``[fsm]`` prefix, and returns the produced effects. Callers that drive
+    I/O (``_apply_effect`` in the tick loop) consume the return value;
+    purely-state-change callers (boot probe, thermal) can ignore it.
+    """
+    global _slots
+    before = _slots[slot_idx]
+    after, effects = transition(before, event, **kw)
+    _slots = [*_slots[:slot_idx], after, *_slots[slot_idx + 1:]]
+    try:
+        db.upsert_slot_state(after.url, after.state.value, after.model_loaded)
+    except Exception:
+        # slot_state persistence is observability — a failed upsert must not
+        # take down the FSM. Log and carry on; the next transition's upsert
+        # will re-sync the durable row.
+        log.exception("[slot] upsert_slot_state failed url=%s", after.url)
+    log_transition(before, event, after, effects)
+    return effects
+
+
+async def _probe_url(url: str, timeout: float = 5.0) -> bool:
+    """Single ``/api/tags`` probe. True on 2xx, False on any error.
+
+    Used at boot to take each slot UNKNOWN→READY/UNREACHABLE, and later by
+    health recovery. Bounded timeout: a slow GPU must not delay the other
+    slot's READY at startup.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            r = await client.get(f"{url}/api/tags")
+            r.raise_for_status()
+        return True
+    except Exception as exc:
+        log.info("[boot] probe fail url=%s err=%s", url, exc)
+        return False
+
+
+async def _boot_reconcile() -> None:
+    """Rehydrate in-memory state from durable SQLite state on app startup.
+
+    Three steps:
+
+    1. Seed ``_slots`` from configured GPU URLs. Enrich with last known
+       ``model_loaded`` from ``slot_state`` so the first tick treats the
+       slot as "probably holding this model" — the next probe confirms.
+    2. Probe every GPU in parallel once. PROBE_OK drives UNKNOWN→READY;
+       PROBE_FAIL drives UNKNOWN→UNREACHABLE.
+    3. Wipe stale ``pending_work`` rows. pending_work is a live mirror of
+       in-memory queue state, not a durable queue: interactive requests
+       have no one to resume (their HTTP waiters are gone), and batch
+       requests recover through the ``_run_batch_job_async`` re-kick in
+       app lifespan — that path re-inserts fresh rows via
+       ``track_request``. Leaving stale rows would double-enqueue every
+       batch job whose prior row survived.
+
+    Buckets start empty; callers (lifespan batch re-kick, proxy
+    handlers) refill them via ``track_request``.
+    """
+    global _slots, _buckets_v2, _tid_to_job, _inflight, _busy_since
+
+    rows_by_url = {r["gpu_url"]: r for r in db.list_slot_states()}
+    _slots = []
+    for url in [config.OLLAMA_0_URL, config.OLLAMA_1_URL]:
+        row = rows_by_url.get(url)
+        _slots.append(Slot(
+            url=url, state=SlotState.UNKNOWN,
+            model_loaded=(row["model_loaded"] if row else None),
+        ))
+
+    probes = await asyncio.gather(*[_probe_url(s.url) for s in _slots])
+    for i, ok in enumerate(probes):
+        _feed_event(i, Event.PROBE_OK if ok else Event.PROBE_FAIL)
+
+    _buckets_v2 = [[] for _ in range(5)]
+    _tid_to_job = {}
+    _inflight = {}
+    _busy_since = {}
+    stale = db.clear_pending()
+
+    slot_summary = [
+        f"{s.url.rsplit(':', 1)[-1]}={s.state.value}/{s.model_loaded or '-'}"
+        for s in _slots
+    ]
+    log.info("[boot] reconciled slots=%s stale_pending_cleared=%d",
+             slot_summary, stale)
+
+
+# ── v2: effect application ──────────────────────────────────────────────────
+
+# Wall-clock stamp set when a slot enters BUSY so _sweep_busy_timeouts
+# can drive recovery after SLOT_MAX_WALL_SECONDS. Keyed by slot index
+# (matches _slots[i]). Cleared on every transition out of BUSY.
+_busy_since: dict[int, float] = {}
+
+
+def _is_embedding_model(model: str) -> bool:
+    """Heuristic: names containing ``embed`` are embedding-only models.
+
+    Ollama's ``/api/generate`` returns 400 for embedding models (they have
+    no generation head). We route warmup for those to ``/api/embeddings``
+    instead. Covers ``nomic-embed-text``, ``mxbai-embed-*``, ``all-minilm``
+    family naming, etc. False positives are harmless — a chat model whose
+    name happens to contain ``embed`` would just get a slightly weirder
+    warmup call.
+    """
+    return "embed" in model.lower()
+
+
+async def _do_load(slot_idx: int, url: str, model: str,
+                   evict: Optional[str]) -> None:
+    """Warm ``model`` on ``url``; feed LOAD_DONE on success, LOAD_FAIL else.
+
+    A ``load`` effect from the scheduler is the orchestrator's cue to
+    post a warmup request. Eviction of any prior model happens
+    implicitly — Ollama swaps on the first request carrying a different
+    ``model`` so the explicit ``evict`` field is observability only.
+
+    Embedding models (see :func:`_is_embedding_model`) get warmed via
+    ``/api/embeddings`` because ``/api/generate`` 400s on anything
+    without a generation head.
+    """
+    if _is_embedding_model(model):
+        endpoint = "/api/embeddings"
+        body: dict = {"model": model, "prompt": "warmup", "keep_alive": "10m"}
+    else:
+        endpoint = "/api/generate"
+        body = {"model": model, "prompt": "", "keep_alive": "10m"}
+        if model.startswith("qwen3:"):
+            # feedback_reasoning_model_caps: without num_ctx, qwen3 auto-fits
+            # to training-max context on a cold GPU and reload takes ~12 s.
+            body["options"] = {"num_ctx": 8192}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            r = await client.post(f"{url}{endpoint}", json=body)
+            r.raise_for_status()
+        log.info("[load] ok url=%s model=%r evict=%r endpoint=%s",
+                 url, model, evict, endpoint)
+        _feed_event(slot_idx, Event.LOAD_DONE)
+    except Exception as exc:
+        log.warning("[load] fail url=%s model=%r endpoint=%s err=%s",
+                    url, model, endpoint, exc)
+        _feed_event(slot_idx, Event.LOAD_FAIL)
+    _wake_tick(reason="load_settled")
+
+
+def _slot_idx_for_url(url: str) -> Optional[int]:
+    for i, s in enumerate(_slots):
+        if s.url == url:
+            return i
+    return None
+
+
+def _apply_effect(effect: Effect) -> None:
+    """Apply one scheduler effect to the outside world.
+
+    The four effect kinds that ``scheduler.transition`` emits:
+
+    - ``load`` — kick an async ``_do_load`` task. Fire-and-forget; the
+      task eventually feeds LOAD_DONE or LOAD_FAIL back into the FSM.
+    - ``start_work`` — resolve the owning tid's future so
+      ``wait_for_dispatch`` returns the target URL; stamp ``busy_since``
+      so the tick loop can enforce the SLOT_MAX_WALL_SECONDS timeout.
+      The pending_work row is NOT deleted here — durability demands it
+      survive until work_end, so a crash mid-inference re-dispatches.
+    - ``work_end`` — delete the pending_work row (durable queue drain)
+      and clear ``busy_since``. Batch rows live in batch_jobs, untouched.
+    - ``gpu_unreachable`` — observability only; the FSM has already
+      cleared the slot so there is nothing further to change.
+    """
+    kind = effect.kind
+    data = effect.data
+
+    if kind == "load":
+        url = data["url"]
+        idx = _slot_idx_for_url(url)
+        if idx is None:
+            log.error("[effect] load for unknown url=%s", url)
+            return
+        asyncio.create_task(_do_load(idx, url, data["model"], data.get("evict")))
+        return
+
+    if kind == "start_work":
+        url = data["url"]
+        job = data["job"]
+        tid = job.get("tid")
+        idx = _slot_idx_for_url(url)
+        if idx is not None:
+            _busy_since[idx] = time.time()
+        if tid:
+            # Settle the future in place — do NOT pop _inflight here. The
+            # waiter (wait_for_dispatch) owns the pop in its finally block;
+            # popping here would lose the future for a waiter that hasn't
+            # yet reached its own _inflight.get(tid) call (see #63).
+            fut = _inflight.get(tid)
+            _tid_to_job.pop(tid, None)
+            if fut is not None and not fut.done():
+                fut.set_result(url)
+        return
+
+    if kind == "work_end":
+        url = data.get("url")
+        job = data.get("job") or {}
+        tid = job.get("tid")
+        idx = _slot_idx_for_url(url) if url else None
+        if idx is not None:
+            _busy_since.pop(idx, None)
+        if tid:
+            try:
+                db.delete_pending(tid)
+            except Exception:
+                log.exception("[effect] delete_pending failed tid=%s", tid)
+            # Defensive: if the waiter never showed up (e.g. handler died
+            # between track_request and wait_for_dispatch, or a watchdog
+            # timeout fired with no waiter), reject the orphaned future so
+            # _inflight does not grow without bound.
+            fut = _inflight.pop(tid, None)
+            if fut is not None and not fut.done():
+                fut.set_exception(RuntimeError(
+                    f"work_end before waiter consumed tid {tid}"
+                ))
+        return
+
+    if kind == "gpu_unreachable":
+        log.warning("[effect] gpu_unreachable url=%s", data.get("url"))
+        return
+
+    log.warning("[effect] unknown kind=%s data=%s", kind, data)
+
+
+# ── v2: tick loop ───────────────────────────────────────────────────────────
+
+def _wake_tick(reason: str = "unspecified") -> None:
+    """Signal the tick loop to re-evaluate. No-op before _ensure_tick."""
+    if _tick_wakeup is not None and not _tick_wakeup.is_set():
+        tick_log.info("[tick] wake reason=%s", reason)
+        _tick_wakeup.set()
+
+
+def _ensure_tick() -> None:
+    """Lazily start the tick loop on the running event loop, if any.
+
+    Called from ``track_request`` so both the app lifespan and tests pick
+    up the loop without extra wiring. Safe to call repeatedly.
+    """
+    global _tick_wakeup, _tick_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _tick_wakeup is None:
+        _tick_wakeup = asyncio.Event()
+    if _tick_task is None or _tick_task.done():
+        _tick_task = loop.create_task(_tick_loop())
+
+
+def _sweep_busy_timeouts() -> None:
+    """Feed WORK_END(outcome='timeout') on any BUSY slot past its deadline.
+
+    This collapses what used to be ``_watchdog_loop`` into the tick.
+    Recovery goes through LOADING with a forced eviction — the scheduler
+    models timeout as "fail to known state", so the recovery path is
+    identical to a normal reload.
+    """
+    now = time.time()
+    for i, s in enumerate(_slots):
+        if s.state is not SlotState.BUSY:
+            continue
+        since = _busy_since.get(i)
+        if since is None:
+            continue
+        if (now - since) >= config.SLOT_MAX_WALL_SECONDS:
+            tick_log.warning(
+                "[tick] busy timeout url=%s ran=%.0fs — driving work_end(timeout)",
+                s.url, now - since,
+            )
+            for e in _feed_event(i, Event.WORK_END, outcome="timeout"):
+                _apply_effect(e)
+
+
+def _drive_pass(label: str, fn) -> int:
+    """Run one pure scheduler pass, apply effects, update ``_slots``.
+
+    ``fn`` is ``dispatch_pass`` or ``stage_pass``. Returns the effect
+    count so the tick can decide whether to emit a summary line.
+    """
+    global _slots
+    effects, new_slots = fn(_buckets_v2, _slots)
+    _slots = new_slots
+    for e in effects:
+        _apply_effect(e)
+    if effects:
+        tick_log.info("[tick] %s produced %d effects", label, len(effects))
+    return len(effects)
+
+
+async def _tick_once() -> dict:
+    """Run one iteration of the tick body. Test-friendly entry point.
+
+    The main loop wraps this in an ``await _tick_wakeup.wait()`` /
+    periodic-timeout harness. Callers in tests drive it directly to
+    avoid racing a background task.
+    """
+    _sweep_busy_timeouts()
+    if _paused:
+        return {"dispatched": 0, "staged": 0, "paused": True}
+    dispatched = _drive_pass("dispatch", dispatch_pass)
+    staged     = _drive_pass("stage",    stage_pass)
+    if dispatched or staged:
+        status = project_status(
+            paused=_paused, recovered=True,
+            slots=_slots, buckets_nonempty=any(_buckets_v2),
+        )
+        log_tick_summary(
+            status=status,
+            dispatched=dispatched, staged=staged,
+            bucket_depths=[len(b) for b in _buckets_v2],
+            slot_summary=[(s.url, s.state.value, s.model_loaded)
+                          for s in _slots],
+        )
+    return {"dispatched": dispatched, "staged": staged, "paused": False}
+
+
+async def _tick_loop() -> None:
+    """Single background coroutine driving the scheduler forward.
+
+    Wakes on any of: enqueue, release, fail, cancel, probe result,
+    thermal, resume, load settle — plus a 250 ms periodic tick so BUSY
+    timeouts fire even during an otherwise silent period.
+
+    While paused the body skips dispatch and stage; in-flight work still
+    completes (its ``work_end`` effect drains pending_work) so pausing is
+    "no new starts", never "no drains".
+    """
+    log.info("[tick] loop started")
+    while True:
+        try:
+            await asyncio.wait_for(_tick_wakeup.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+        _tick_wakeup.clear()
+        try:
+            await _tick_once()
+        except Exception:
+            log.exception("[tick] loop iteration failed")

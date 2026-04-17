@@ -1,15 +1,13 @@
-"""Tests for gpu_router.py — GPU state, health probes, reclaim cooperation.
+"""Tests for gpu_router.py — thermal hysteresis, FSM event feeds, status.
 
-Dispatch logic (which GPU serves a request) lives in queue_manager and is
-exercised by test_queue_manager.py.  This file only covers state ownership
-that gpu_router still holds: health transitions, reclaim conditions,
-record_activity, and the status snapshot.
+In the FSM rewrite (merLLM#55) gpu_router is no longer the dispatch
+authority. It only translates hardware-level signals (temperature,
+ollama reachability) into Slot FSM events and projects current slot
+state for the UI. These tests cover the translation layer; lifecycle
+behaviour itself is covered by test_scheduler.py and test_tick.py.
 """
-import asyncio
 import os
 import sys
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -19,328 +17,196 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
 
 @pytest.fixture(autouse=True)
 def fresh_modules(tmp_path, monkeypatch):
-    """Reload gpu_router and dependencies fresh for each test."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("DEFAULT_MODEL", "test-model:7b")
-    monkeypatch.setenv("RECLAIM_TIMEOUT", "60")
     monkeypatch.setenv("HEALTH_BACKOFF_BASE", "5")
     monkeypatch.setenv("HEALTH_BACKOFF_CAP", "30")
     monkeypatch.setenv("HEALTH_FAULT_TIMEOUT", "60")
+    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
+    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
     for mod in list(sys.modules.keys()):
-        if mod in ("gpu_router", "queue_manager", "db", "config",
-                   "metrics", "notifications"):
+        if mod in ("gpu_router", "queue_manager", "scheduler", "db",
+                   "config", "metrics", "notifications"):
             sys.modules.pop(mod, None)
     yield
     for mod in list(sys.modules.keys()):
-        if mod in ("gpu_router", "queue_manager", "db", "config",
-                   "metrics", "notifications"):
+        if mod in ("gpu_router", "queue_manager", "scheduler", "db",
+                   "config", "metrics", "notifications"):
             sys.modules.pop(mod, None)
 
 
-def _get_router():
-    import gpu_router
+def _seed_slots(state="ready", model="test-model:7b"):
+    """Build a minimal _slots list so gpu_router can find indices."""
     import config
-    # Force re-init with current config values.
-    gpu_router._gpus.clear()
-    gpu_router._pending_default_model = None
-    gpu_router._init_gpus()
-    return gpu_router, config
+    import queue_manager
+    from scheduler import Slot, SlotState
+    st = SlotState(state) if isinstance(state, str) else state
+    queue_manager._slots = [
+        Slot(url=config.OLLAMA_0_URL, state=st, model_loaded=model),
+        Slot(url=config.OLLAMA_1_URL, state=st, model_loaded=model),
+    ]
+    return queue_manager, config
 
 
-# ── Health tests ─────────────────────────────────────────────────────────────
+# ── Activity tracking ────────────────────────────────────────────────────────
 
 
-def test_init_creates_both_gpus():
-    router, config = _get_router()
-    assert config.OLLAMA_0_URL in router._gpus
-    assert config.OLLAMA_1_URL in router._gpus
-    assert all(g.health == router.GpuHealth.HEALTHY
-               for g in router._gpus.values())
+def test_record_activity_populates_idle_seconds():
+    import gpu_router
+    qm, config = _seed_slots()
+
+    gpu_router.record_activity(config.OLLAMA_0_URL)
+    s = gpu_router.status()
+    assert s["gpus"]["gpu0"]["idle_seconds"] is not None
+    assert s["gpus"]["gpu0"]["idle_seconds"] >= 0
+    # gpu1 was never touched — no last_active recorded.
+    assert s["gpus"]["gpu1"]["idle_seconds"] is None
 
 
-def test_mark_failed_sets_degraded():
-    router, config = _get_router()
-    router.mark_failed(config.OLLAMA_0_URL)
-    assert router._gpus[config.OLLAMA_0_URL].health == router.GpuHealth.DEGRADED
+# ── Thermal hysteresis ──────────────────────────────────────────────────────
 
 
-def test_mark_failed_does_nothing_for_unknown_target():
-    router, _ = _get_router()
-    router.mark_failed("http://nowhere:1234")
-    # Just shouldn't raise.
+def test_thermal_pause_engages_at_threshold():
+    import gpu_router
+    qm, config = _seed_slots()
+    url = config.OLLAMA_0_URL
+
+    gpu_router.update_thermal_state(url, 70.0)
+    assert gpu_router._thermal_paused.get(url, False) is False
+
+    gpu_router.update_thermal_state(url, 85.0)
+    assert gpu_router._thermal_paused[url] is True
+    assert gpu_router._thermal_paused_since[url] is not None
 
 
-def test_healthy_gpus_excludes_degraded():
-    router, config = _get_router()
-    router.mark_failed(config.OLLAMA_0_URL)
-    healthy = router._healthy_gpus()
-    urls = [g.url for g in healthy]
-    assert config.OLLAMA_0_URL not in urls
-    assert config.OLLAMA_1_URL in urls
+def test_thermal_pause_hysteresis_holds_until_resume_threshold():
+    import gpu_router
+    qm, config = _seed_slots()
+    url = config.OLLAMA_0_URL
+
+    gpu_router.update_thermal_state(url, 90.0)
+    assert gpu_router._thermal_paused[url] is True
+
+    for t in (84.0, 75.0, 65.0, 61.0):
+        gpu_router.update_thermal_state(url, t)
+        assert gpu_router._thermal_paused[url] is True, f"flipped at {t}"
+
+    gpu_router.update_thermal_state(url, 60.0)
+    assert gpu_router._thermal_paused[url] is False
+    assert gpu_router._thermal_paused_since[url] is None
 
 
-def test_reset_gpu_restores_healthy():
-    router, config = _get_router()
-    router.mark_failed(config.OLLAMA_0_URL)
-    router._gpus[config.OLLAMA_0_URL].health = router.GpuHealth.FAULTED
+def test_thermal_trip_drives_ready_slot_to_cooling():
+    """READY + THERMAL_TRIP → COOLING (immediate)."""
+    import gpu_router
+    from scheduler import SlotState
+    qm, config = _seed_slots(state="ready")
+    url = config.OLLAMA_0_URL
 
-    ok = router.reset_gpu(config.OLLAMA_0_URL)
-    assert ok is True
-    assert router._gpus[config.OLLAMA_0_URL].health == router.GpuHealth.HEALTHY
-    assert router._gpus[config.OLLAMA_0_URL].model == config.DEFAULT_MODEL
-
-
-def test_reset_unknown_gpu_returns_false():
-    router, _ = _get_router()
-    assert router.reset_gpu("http://nowhere:1234") is False
+    gpu_router.update_thermal_state(url, 90.0)
+    assert qm._slots[0].state is SlotState.COOLING
 
 
-# ── Reclaim tests ────────────────────────────────────────────────────────────
+def test_thermal_trip_latches_on_busy_slot():
+    """BUSY + THERMAL_TRIP latches; slot stays BUSY until WORK_END."""
+    import gpu_router
+    from scheduler import SlotState
+    qm, config = _seed_slots(state="busy")
+    qm._slots[0].current_job = {"tid": "x", "model": "test-model:7b"}
+    url = config.OLLAMA_0_URL
+
+    gpu_router.update_thermal_state(url, 90.0)
+    assert qm._slots[0].state is SlotState.BUSY
+    assert qm._slots[0].thermal_pending is True
 
 
-def test_reclaim_identifies_idle_non_default():
-    """GPU with non-default model and idle > RECLAIM_TIMEOUT should be reclaimable."""
-    router, config = _get_router()
-    gpu = router._gpus[config.OLLAMA_0_URL]
-    gpu.model = "other:7b"
-    gpu.last_active = time.time() - config.RECLAIM_TIMEOUT - 1
+def test_thermal_clear_drives_cooling_slot_to_ready():
+    import gpu_router
+    from scheduler import SlotState
+    qm, config = _seed_slots(state="ready")
+    url = config.OLLAMA_0_URL
 
-    # The reclaim_loop is async, so just verify the condition check.
-    now = time.time()
-    assert gpu.model != config.DEFAULT_MODEL
-    assert (now - gpu.last_active) >= config.RECLAIM_TIMEOUT
-
-
-def test_record_activity_updates_timestamp():
-    router, config = _get_router()
-    before = router._gpus[config.OLLAMA_0_URL].last_active
-    time.sleep(0.01)
-    router.record_activity(config.OLLAMA_0_URL)
-    after = router._gpus[config.OLLAMA_0_URL].last_active
-    assert after > before
+    gpu_router.update_thermal_state(url, 90.0)        # READY → COOLING
+    assert qm._slots[0].state is SlotState.COOLING
+    gpu_router.update_thermal_state(url, 55.0)        # COOLING → READY
+    assert qm._slots[0].state is SlotState.READY
 
 
-# ── Status tests ─────────────────────────────────────────────────────────────
+def test_thermal_event_swallowed_on_invalid_state():
+    """THERMAL_TRIP from UNREACHABLE has no FSM transition — must not raise."""
+    import gpu_router
+    from scheduler import SlotState
+    qm, config = _seed_slots(state="unreachable", model=None)
+    url = config.OLLAMA_0_URL
+
+    # Should not raise InvalidTransition.
+    gpu_router.update_thermal_state(url, 95.0)
+    assert qm._slots[0].state is SlotState.UNREACHABLE
+
+
+# ── Status projection ──────────────────────────────────────────────────────
 
 
 def test_status_returns_expected_fields():
-    router, config = _get_router()
-    s = router.status()
-    assert s["routing"] == "round_robin"
+    import gpu_router
+    qm, config = _seed_slots(state="ready")
+    s = gpu_router.status()
+    assert s["routing"] == "fsm"
     assert s["default_model"] == "test-model:7b"
-    assert "gpu0" in s["gpus"]
-    assert "gpu1" in s["gpus"]
-    assert s["gpus"]["gpu0"]["health"] == "healthy"
-    assert s["gpus"]["gpu0"]["model"] == "test-model:7b"
-
-
-# ── Pending default model change ─────────────────────────────────────────────
-
-
-def test_set_pending_default_model():
-    router, _ = _get_router()
-    router.set_pending_default_model("new-model:7b")
-    assert router._pending_default_model == "new-model:7b"
-    s = router.status()
-    assert s["pending_default_model"] == "new-model:7b"
-
-
-# ── Reload model num_ctx pinning ─────────────────────────────────────────────
-
-
-def _make_post_capturing_client():
-    """Build a mock httpx.AsyncClient that records POST kwargs."""
-    captured = {}
-
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-
-    async def _post(url, **kwargs):
-        captured["url"] = url
-        captured["kwargs"] = kwargs
-        return mock_resp
-
-    mock_client.post = _post
-    return mock_client, captured
-
-
-@pytest.mark.asyncio
-async def test_reload_model_pins_num_ctx_for_qwen3():
-    """qwen3:* reloads must pin num_ctx so Ollama does not auto-fit to 32k.
-
-    Regression: 2026-04-11 GPU 11435 wedge. Ollama auto-picks num_ctx based
-    on free VRAM at load time. On a freshly empty 24 GB Tesla P40, qwen3:32b
-    loaded at 32768 ctx, forcing CPU offload of the output layer and split
-    KV cache, turning 330 ms reloads into 12 s reloads and slowing every
-    inference. Pinning to 8192 inside _reload_model fixes the entire class.
-    """
-    router, config = _get_router()
-    gpu = router._gpus[config.OLLAMA_0_URL]
-
-    mock_client, captured = _make_post_capturing_client()
-    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
-        await router._reload_model(gpu, "qwen3:32b")
-
-    body = captured["kwargs"]["json"]
-    assert body["model"] == "qwen3:32b"
-    assert body.get("options", {}).get("num_ctx") == 8192
-    assert gpu.model == "qwen3:32b"
-
-
-@pytest.mark.asyncio
-async def test_reload_model_omits_options_for_non_qwen3_generative():
-    """Non-qwen3 generative reloads must not inject num_ctx — only the
-    known-large reasoning models need pinning."""
-    router, config = _get_router()
-    gpu = router._gpus[config.OLLAMA_0_URL]
-
-    mock_client, captured = _make_post_capturing_client()
-    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
-        ok = await router._reload_model(gpu, "llama3.1:8b")
-
-    assert ok is True
-    assert captured["url"].endswith("/api/generate")
-    body = captured["kwargs"]["json"]
-    assert body["model"] == "llama3.1:8b"
-    assert "options" not in body
-    assert gpu.model == "llama3.1:8b"
-
-
-@pytest.mark.asyncio
-async def test_reload_model_uses_embed_endpoint_for_embedding_models():
-    """Embedding models must warm via /api/embed, not /api/generate.
-
-    Regression: 2026-04-14 upload 500 race. Ollama's /api/generate returns
-    HTTP 400 for embedding-only models, so warming via /api/generate never
-    actually loads the model. The dispatcher would then hand requests off
-    to a GPU whose real load happens on the first /api/embeddings call,
-    and concurrent traffic during that load races and 500s.
-    """
-    router, config = _get_router()
-    gpu = router._gpus[config.OLLAMA_0_URL]
-
-    mock_client, captured = _make_post_capturing_client()
-    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
-        ok = await router._reload_model(gpu, "nomic-embed-text")
-
-    assert ok is True
-    assert captured["url"].endswith("/api/embed")
-    body = captured["kwargs"]["json"]
-    assert body["model"] == "nomic-embed-text"
-    assert "input" in body and body["input"]
-    assert "prompt" not in body
-    assert gpu.model == "nomic-embed-text"
-
-
-@pytest.mark.asyncio
-async def test_reload_model_returns_false_and_preserves_model_on_http_error():
-    """A non-2xx warmup must leave gpu.model untouched and return False,
-    so the dispatcher / reclaim loop can decide whether to retry instead
-    of believing a swap landed when it didn't."""
-    router, config = _get_router()
-    gpu = router._gpus[config.OLLAMA_0_URL]
-    original_model = gpu.model
-
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError(
-            "500", request=MagicMock(), response=MagicMock(status_code=500)
-        )
-    )
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-
-    async def _post(url, **kwargs):
-        return mock_resp
-    mock_client.post = _post
-
-    with patch("gpu_router.httpx.AsyncClient", return_value=mock_client):
-        ok = await router._reload_model(gpu, "qwen3:32b")
-
-    assert ok is False
-    assert gpu.model == original_model
-
-
-# ── Thermal pause tests ──────────────────────────────────────────────────────
-
-
-def test_thermal_pause_engages_at_threshold(monkeypatch):
-    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
-    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
-    router, config = _get_router()
-    url = config.OLLAMA_0_URL
-
-    router.update_thermal_state(url, 70.0)
-    assert router._gpus[url].thermal_paused is False
-
-    router.update_thermal_state(url, 85.0)
-    assert router._gpus[url].thermal_paused is True
-    assert router._gpus[url].thermal_paused_since is not None
-    assert router.is_dispatchable(url) is False
-
-
-def test_thermal_pause_hysteresis_holds_until_resume_threshold(monkeypatch):
-    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
-    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
-    router, config = _get_router()
-    url = config.OLLAMA_0_URL
-
-    router.update_thermal_state(url, 90.0)
-    assert router._gpus[url].thermal_paused is True
-
-    # Temps between resume and pause thresholds preserve the paused state.
-    for t in (84.0, 75.0, 65.0, 61.0):
-        router.update_thermal_state(url, t)
-        assert router._gpus[url].thermal_paused is True, f"flipped at {t}"
-
-    # Crossing the resume threshold clears the pause.
-    router.update_thermal_state(url, 60.0)
-    assert router._gpus[url].thermal_paused is False
-    assert router._gpus[url].thermal_paused_since is None
-    assert router.is_dispatchable(url) is True
-
-
-def test_is_dispatchable_requires_healthy_and_not_paused(monkeypatch):
-    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
-    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
-    router, config = _get_router()
-    url = config.OLLAMA_0_URL
-
-    assert router.is_dispatchable(url) is True
-
-    # Thermally paused but healthy → not dispatchable.
-    router.update_thermal_state(url, 90.0)
-    assert router.is_dispatchable(url) is False
-
-    # Cool down → dispatchable again.
-    router.update_thermal_state(url, 55.0)
-    assert router.is_dispatchable(url) is True
-
-    # Mark failed → not dispatchable even when cool.
-    router.mark_failed(url)
-    assert router.is_dispatchable(url) is False
-
-
-def test_status_exposes_thermal_state(monkeypatch):
-    monkeypatch.setenv("GPU_TEMP_PAUSE_C", "85")
-    monkeypatch.setenv("GPU_TEMP_RESUME_C", "60")
-    router, config = _get_router()
-    url = config.OLLAMA_0_URL
-
-    router.update_thermal_state(url, 72.5)
-    s = router.status()
     assert s["gpu_temp_pause_c"] == 85
     assert s["gpu_temp_resume_c"] == 60
+    assert "gpu0" in s["gpus"]
+    assert "gpu1" in s["gpus"]
+    assert s["gpus"]["gpu0"]["state"] == "ready"
+    assert s["gpus"]["gpu0"]["health"] == "healthy"
+    assert s["gpus"]["gpu0"]["model"] == "test-model:7b"
+    assert s["gpus"]["gpu0"]["in_flight"] is False
+
+
+def test_status_marks_unreachable_as_degraded():
+    import gpu_router
+    _seed_slots(state="unreachable", model=None)
+    s = gpu_router.status()
+    assert s["gpus"]["gpu0"]["health"] == "degraded"
+    assert s["gpus"]["gpu0"]["state"] == "unreachable"
+
+
+def test_status_marks_busy_loading_as_in_flight():
+    import gpu_router
+    qm, config = _seed_slots(state="busy")
+    s = gpu_router.status()
+    assert s["gpus"]["gpu0"]["in_flight"] is True
+
+
+def test_status_exposes_thermal_state():
+    import gpu_router
+    qm, config = _seed_slots()
+    url = config.OLLAMA_0_URL
+
+    gpu_router.update_thermal_state(url, 72.5)
+    s = gpu_router.status()
     assert s["gpus"]["gpu0"]["last_temp_c"] == 72.5
     assert s["gpus"]["gpu0"]["thermal_paused"] is False
 
-    router.update_thermal_state(url, 88.0)
-    s = router.status()
+    gpu_router.update_thermal_state(url, 88.0)
+    s = gpu_router.status()
     assert s["gpus"]["gpu0"]["thermal_paused"] is True
     assert s["gpus"]["gpu0"]["thermal_paused_since"] is not None
+
+
+# ── Operator reset ──────────────────────────────────────────────────────────
+
+
+def test_reset_slot_unknown_url_returns_false():
+    import gpu_router
+    _seed_slots()
+    assert gpu_router.reset_slot("http://nowhere:1234") is False
+
+
+@pytest.mark.asyncio
+async def test_reset_slot_known_url_returns_true():
+    import gpu_router
+    qm, config = _seed_slots(state="unreachable", model=None)
+    # ensure_future needs a running loop; the spawned probe task will fail
+    # to connect, which is fine — we just need reset_slot to schedule it.
+    assert gpu_router.reset_slot(config.OLLAMA_0_URL) is True
