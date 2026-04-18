@@ -509,6 +509,75 @@ async def _queued_stream(path: str, body: dict,
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
+async def _stream_and_accumulate(target: str, path: str, body: dict) -> dict:
+    """Buffer-stream Ollama NDJSON and return the single-JSON payload shape.
+
+    Forces ``stream=True`` on the wire so every NDJSON line ticks
+    ``_activity_inc`` + ``_activity_append_token`` (the instance card's tok
+    counter + rolling text buffer), then accumulates the streamed tokens into
+    the same dict shape a ``stream=False`` request would have returned.
+    Caller-facing wire contract is unchanged; only the Ollama-facing request
+    is rewritten. ``stream`` is wire-format only — KV cache / num_ctx /
+    num_predict are identical in both modes.
+    """
+    wire_body = {**body, "stream": True}
+    text, thinking = "", ""
+    final: dict = {}
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
+    ) as client:
+        async with client.stream("POST", f"{target}{path}", json=wire_body) as resp:
+            resp.raise_for_status()
+            buf = b""
+            async for chunk in resp.aiter_bytes():
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    _activity_inc(target)
+                    _activity_append_token(target, line, path)
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if path == "/api/generate":
+                        text += obj.get("response", "") or ""
+                    elif path == "/api/chat":
+                        msg = obj.get("message") or {}
+                        text     += msg.get("content", "")  or ""
+                        thinking += msg.get("thinking", "") or ""
+                    if obj.get("done"):
+                        final = obj
+    if path == "/api/generate":
+        final["response"] = text
+    elif path == "/api/chat":
+        msg = dict(final.get("message") or {"role": "assistant"})
+        msg["content"] = text
+        if thinking:
+            msg["thinking"] = thinking
+        final["message"] = msg
+    return final
+
+
+async def _buffered_stream_proxy(target: str, path: str, body: dict) -> Response:
+    """Non-streaming wire contract, streamed internally for live card updates.
+
+    Used for generate/chat when the caller sends ``stream: False``. Wraps
+    ``_activity_set`` / ``_activity_clear`` around ``_stream_and_accumulate``
+    so the instance card shows model+endpoint for the full call duration
+    while the tok counter ticks per line.
+    """
+    model = body.get("model", "")
+    _activity_set(target, model, path)
+    try:
+        payload = await _stream_and_accumulate(target, path, body)
+        return Response(content=json.dumps(payload).encode(),
+                        media_type="application/json")
+    finally:
+        _activity_clear(target)
+
+
 async def _proxy(target: str, path: str, body: dict) -> Response:
     """Non-streaming Ollama proxy (e.g. embeddings), tracking activity per instance."""
     model = body.get("model", "")
@@ -553,10 +622,18 @@ async def _proxy_nonstream(path: str, body: dict, tid: str) -> Response:
     The ``queue_manager.dispatched`` CM owns slot lifecycle: release on
     happy path, fail_request on exception, cancel_tracked on pre-dispatch
     caller exit. No handler-side cleanup flags needed.
+
+    For generate/chat, routes through ``_buffered_stream_proxy`` so the
+    instance card's tok counter ticks per NDJSON line even when the caller
+    sent ``stream: False``. Embeddings/show/pull stay on the plain ``_proxy``
+    path — no NDJSON to accumulate.
     """
     try:
         async with queue_manager.dispatched(tid) as target:
-            resp = await _proxy(target, path, body)
+            if path in ("/api/generate", "/api/chat"):
+                resp = await _buffered_stream_proxy(target, path, body)
+            else:
+                resp = await _proxy(target, path, body)
             gpu_router.record_activity(target)
             return resp
     except queue_manager.DispatchTimeout:
