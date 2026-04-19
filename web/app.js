@@ -128,8 +128,11 @@ function _startActivityStream() {
       // Live queue updates from SSE
       if (a.queue !== undefined) renderQueueTable(a.queue);
       if (a.queue_summary !== undefined) {
-        const qTotal = (a.queue_summary.queued || 0) + (a.queue_summary.running || 0);
-        set("ov-queue", qTotal);
+        // active = running on a GPU right now; queued = waiting in merLLM's
+        // SQLite-backed queue. Keep the two numbers distinct so the user
+        // can see queue depth even when the GPUs are saturated.
+        const qs = a.queue_summary;
+        set("ov-queue", `${qs.running || 0} / ${qs.queued || 0}`);
       }
     } catch (_) {}
   };
@@ -281,8 +284,7 @@ function renderOverview(s) {
   renderSchedulerStatus(s.scheduler_status);
   set("ov-default-model", s.default_model || "—");
   const q = s.queue || {};
-  const qTotal = (q.queued || 0) + (q.running || 0);
-  set("ov-queue", s.queue ? qTotal : "—");
+  set("ov-queue", s.queue ? `${q.running || 0} / ${q.queued || 0}` : "—");
 
   // Pending model change
   const pendingRow = document.getElementById("ov-pending-model-row");

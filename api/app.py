@@ -48,7 +48,7 @@ _req_log = logging.getLogger("merllm.requests")
 log = logging.getLogger("merllm")
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -946,6 +946,22 @@ async def batch_submit(request: Request):
 @app.get("/api/batch/status")
 async def batch_status_list():
     return db.list_batch_jobs()
+
+
+@app.post("/api/batch/status-by-ids")
+async def batch_status_by_ids(body: dict = Body(...)):
+    """Return status for the given job IDs. Missing IDs are omitted from the
+    response — the client distinguishes 'not yet written' from 'deleted' by
+    consecutive-miss count on its side, not by HTTP error.
+
+    Bypasses the LIMIT 200 window on GET /api/batch/status, so clients with
+    many in-flight jobs don't lose visibility when newer jobs from other
+    sources push theirs past the window.
+    """
+    ids = body.get("ids") or []
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="'ids' must be a list")
+    return db.get_batch_jobs_by_ids([str(x) for x in ids])
 
 
 @app.get("/api/batch/status/{job_id}")
