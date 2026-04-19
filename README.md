@@ -131,7 +131,24 @@ curl -X POST http://localhost:11400/api/batch/submit \
 
 curl http://localhost:11400/api/batch/status/<uuid>
 curl http://localhost:11400/api/batch/results/<uuid>
+
+# Status for many IDs at once — immune to the 200-row LIMIT on GET /api/batch/status.
+# Unknown IDs are omitted from the response; clients detect loss by consecutive-miss count.
+curl -X POST http://localhost:11400/api/batch/status-by-ids \
+  -H "Content-Type: application/json" \
+  -d '{"ids":["<uuid1>","<uuid2>"]}'
 ```
+
+**Status polling pattern** — clients tracking many in-flight jobs should use
+`POST /api/batch/status-by-ids` rather than `GET /api/batch/status`. The GET
+endpoint is capped at the 200 most-recent jobs (shape of a human browsing
+history); concurrent traffic from another source can push a client's jobs
+out of that window. The POST endpoint scopes to an explicit ID list via
+`WHERE id IN (...)`, so visibility is bounded only by the caller's pending
+set. merLLM owns each job's lifetime (see `SLOT_MAX_WALL_SECONDS` for the
+per-slot cap); clients should **not** apply a wall-clock deadline to a
+queued job and should give up only on terminal status or after the job
+goes missing for a few consecutive polls.
 
 ## Ollama proxy API
 
