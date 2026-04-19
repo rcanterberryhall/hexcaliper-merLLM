@@ -169,6 +169,25 @@ def list_batch_jobs(status: Optional[str] = None, ready_only: bool = False) -> l
     return [dict(r) for r in rows]
 
 
+def get_batch_jobs_by_ids(ids: list[str]) -> list[dict]:
+    """
+    Return batch_jobs rows whose id is in ``ids``. Unknown ids are omitted
+    (caller must detect absence by comparing input to output). Used by clients
+    that track their own in-flight job IDs and need status regardless of how
+    many newer jobs other clients have submitted (bypasses the LIMIT 200
+    window on list_batch_jobs).
+    """
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    with lock:
+        rows = conn().execute(
+            f"SELECT * FROM batch_jobs WHERE id IN ({placeholders})",
+            tuple(ids)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_earliest_retry_after() -> Optional[float]:
     """
     Return the smallest retry_after timestamp among deferred queued jobs

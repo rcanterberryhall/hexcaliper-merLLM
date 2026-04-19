@@ -223,6 +223,35 @@ class TestMerllmFeatures:
         # Clean up: cancel the test job
         post(MERLLM, f"/api/batch/{job_id}/cancel")
 
+    def test_batch_status_by_ids(self):
+        """POST /api/batch/status-by-ids returns known IDs, omits unknowns."""
+        r = post(MERLLM, "/api/batch/submit", json={
+            "source_app": "integration_test",
+            "prompt": "Say hello.",
+            "model": "qwen3:30b-a3b",
+        })
+        assert r.status_code == 200
+        job_id = r.json()["id"]
+
+        bogus = str(uuid.uuid4())
+        r2 = post(MERLLM, "/api/batch/status-by-ids", json={"ids": [job_id, bogus]})
+        assert r2.status_code == 200
+        rows = r2.json()
+        returned = {row["id"] for row in rows}
+        assert job_id in returned
+        assert bogus not in returned
+
+        # Empty list returns empty list, not error.
+        r3 = post(MERLLM, "/api/batch/status-by-ids", json={"ids": []})
+        assert r3.status_code == 200
+        assert r3.json() == []
+
+        # Malformed body rejected.
+        r4 = post(MERLLM, "/api/batch/status-by-ids", json={"ids": "not-a-list"})
+        assert r4.status_code == 400
+
+        post(MERLLM, f"/api/batch/{job_id}/cancel")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Section 4: Cross-Service — My Day Panel
