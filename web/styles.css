@@ -297,12 +297,72 @@ tr:hover td { background: #1c2330; }
 }
 .settings-actions { margin-top: 16px; display: flex; gap: 8px; }
 
-/* Terminal */
-#terminal-container {
+/* SSH terminals (2×2 grid) */
+.term-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 8px;
+  height: 72vh;
+  min-height: 480px;
+}
+.term-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;            /* let the body shrink so FitAddon can measure it */
+  min-width: 0;
   background: #000;
+  border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
-  height: 500px;
+}
+.term-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.term-pane-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.term-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.term-dot.up   { background: var(--green); }
+.term-dot.down { background: var(--red); }
+.term-pane-actions { display: flex; gap: 4px; }
+.term-pane-btn {
+  padding: 0 7px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.term-pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px;
+}
+.term-pane-body .xterm { height: 100%; }
+
+@media (max-width: 700px) {
+  .term-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: repeat(4, minmax(220px, 1fr));
+    height: auto;
+  }
 }
 
 /* VNC */

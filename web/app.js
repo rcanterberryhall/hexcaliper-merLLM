@@ -1033,45 +1033,80 @@ async function fetchLogs() {
   }
 }
 
-// ── SSH Terminal ──────────────────────────────────────────────────────────────
+// ── SSH Terminals (2×2 grid, 4 independent sessions) ────────────────────────────
 
-let _term = null;
-let _termWs = null;
+const SSH_PANE_COUNT = 4;
+// One slot per pane: null when closed, else { term, ws, fit }.
+const _sshPanes = new Array(SSH_PANE_COUNT).fill(null);
 
-function connectSSH() {
-  if (_term) { _term.dispose(); _term = null; }
-  if (_termWs) { _termWs.close(); _termWs = null; }
+function _sshPaneEl(i) {
+  return document.querySelector(`.term-pane[data-pane="${i}"]`);
+}
 
-  const container = document.getElementById("terminal-container");
-  container.innerHTML = "";
+function _sshSetDot(i, up) {
+  const dot = _sshPaneEl(i)?.querySelector("[data-dot]");
+  if (dot) dot.className = `term-dot ${up ? "up" : "down"}`;
+}
 
-  _term = new Terminal({ theme: { background: "#000" }, cursorBlink: true });
-  const fitAddon = new FitAddon.FitAddon();
-  _term.loadAddon(fitAddon);
-  _term.open(container);
-  fitAddon.fit();
+// Open (or re-open) a single pane's SSH session.
+function sshConnectPane(i) {
+  sshDisconnectPane(i);   // dispose any existing session in this slot first
+
+  const pane = _sshPaneEl(i);
+  if (!pane) return;
+  const body = pane.querySelector("[data-body]");
+  body.innerHTML = "";
+
+  const term = new Terminal({ theme: { background: "#000" }, cursorBlink: true, fontSize: 13 });
+  const fit  = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(body);
+  try { fit.fit(); } catch (_) {}
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  _termWs = new WebSocket(`${proto}//${location.host}/ws/ssh`);
-  _termWs.binaryType = "arraybuffer";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/ssh`);
+  ws.binaryType = "arraybuffer";
 
-  _termWs.onopen = () => _term.writeln("\r\nConnected.\r\n");
-  _termWs.onmessage = e => _term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
-  _termWs.onclose = () => _term.writeln("\r\n\r\nDisconnected.");
-  _termWs.onerror = () => _term.writeln("\r\nWebSocket error.");
+  ws.onopen    = () => { _sshSetDot(i, true);  term.writeln("\r\nConnected.\r\n"); };
+  ws.onmessage = e  => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+  ws.onclose   = () => { _sshSetDot(i, false); term.writeln("\r\n\r\nDisconnected."); };
+  ws.onerror   = () => { _sshSetDot(i, false); term.writeln("\r\nWebSocket error."); };
 
-  _term.onData(data => {
-    if (_termWs && _termWs.readyState === WebSocket.OPEN) _termWs.send(data);
+  term.onData(data => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
   });
 
-  window.addEventListener("resize", () => { try { fitAddon.fit(); } catch (_) {} });
+  _sshPanes[i] = { term, ws, fit };
 }
 
-function disconnectSSH() {
-  if (_termWs) { _termWs.close(); _termWs = null; }
-  if (_term) { _term.dispose(); _term = null; }
-  document.getElementById("terminal-container").innerHTML = "";
+// Tear down a single pane's session.
+function sshDisconnectPane(i) {
+  const slot = _sshPanes[i];
+  if (slot) {
+    try { slot.ws.close(); }  catch (_) {}
+    try { slot.term.dispose(); } catch (_) {}
+    _sshPanes[i] = null;
+  }
+  const body = _sshPaneEl(i)?.querySelector("[data-body]");
+  if (body) body.innerHTML = "";
+  _sshSetDot(i, false);
 }
+
+function sshConnectAll() {
+  for (let i = 0; i < SSH_PANE_COUNT; i++) sshConnectPane(i);
+}
+
+function sshDisconnectAll() {
+  for (let i = 0; i < SSH_PANE_COUNT; i++) sshDisconnectPane(i);
+}
+
+// Re-fit every live pane on window resize (registered once).
+function _sshFitAll() {
+  for (const slot of _sshPanes) {
+    if (slot) { try { slot.fit.fit(); } catch (_) {} }
+  }
+}
+window.addEventListener("resize", _sshFitAll);
 
 // ── VNC ───────────────────────────────────────────────────────────────────────
 

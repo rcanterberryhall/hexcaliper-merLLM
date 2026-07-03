@@ -250,18 +250,59 @@
     </div>
   </div>
 
-  <!-- ── SSH Terminal ── -->
+  <!-- ── SSH Terminals (2×2) ── -->
   <div id="tab-terminal" class="tab">
     <div class="card">
-      <h2>SSH Terminal</h2>
+      <h2>SSH Terminals</h2>
       <p class="muted" style="margin-bottom:12px;font-size:12px">
-        Connects to the host via WebSocket SSH. Requires SSH_USER and SSH_KEY_PATH configured.
+        Four independent SSH sessions to the host. Requires SSH_USER and SSH_KEY_PATH configured.
       </p>
       <div style="margin-bottom:10px;display:flex;gap:8px">
-        <button class="btn primary" onclick="connectSSH()">Connect</button>
-        <button class="btn" onclick="disconnectSSH()">Disconnect</button>
+        <button class="btn primary" onclick="sshConnectAll()">Connect All</button>
+        <button class="btn" onclick="sshDisconnectAll()">Disconnect All</button>
       </div>
-      <div id="terminal-container"></div>
+      <div id="term-grid" class="term-grid">
+        <div class="term-pane" data-pane="0">
+          <div class="term-pane-head">
+            <span class="term-pane-title"><span class="term-dot" data-dot></span>SSH 1</span>
+            <span class="term-pane-actions">
+              <button class="btn term-pane-btn" title="Reconnect" onclick="sshConnectPane(0)">&#8635;</button>
+              <button class="btn term-pane-btn" title="Close" onclick="sshDisconnectPane(0)">&times;</button>
+            </span>
+          </div>
+          <div class="term-pane-body" data-body></div>
+        </div>
+        <div class="term-pane" data-pane="1">
+          <div class="term-pane-head">
+            <span class="term-pane-title"><span class="term-dot" data-dot></span>SSH 2</span>
+            <span class="term-pane-actions">
+              <button class="btn term-pane-btn" title="Reconnect" onclick="sshConnectPane(1)">&#8635;</button>
+              <button class="btn term-pane-btn" title="Close" onclick="sshDisconnectPane(1)">&times;</button>
+            </span>
+          </div>
+          <div class="term-pane-body" data-body></div>
+        </div>
+        <div class="term-pane" data-pane="2">
+          <div class="term-pane-head">
+            <span class="term-pane-title"><span class="term-dot" data-dot></span>SSH 3</span>
+            <span class="term-pane-actions">
+              <button class="btn term-pane-btn" title="Reconnect" onclick="sshConnectPane(2)">&#8635;</button>
+              <button class="btn term-pane-btn" title="Close" onclick="sshDisconnectPane(2)">&times;</button>
+            </span>
+          </div>
+          <div class="term-pane-body" data-body></div>
+        </div>
+        <div class="term-pane" data-pane="3">
+          <div class="term-pane-head">
+            <span class="term-pane-title"><span class="term-dot" data-dot></span>SSH 4</span>
+            <span class="term-pane-actions">
+              <button class="btn term-pane-btn" title="Reconnect" onclick="sshConnectPane(3)">&#8635;</button>
+              <button class="btn term-pane-btn" title="Close" onclick="sshDisconnectPane(3)">&times;</button>
+            </span>
+          </div>
+          <div class="term-pane-body" data-body></div>
+        </div>
+      </div>
     </div>
   </div>
 
