@@ -137,6 +137,26 @@ PARSIVAL_URL = _get("PARSIVAL_URL", "http://host.docker.internal:8082")
 # URL of the LanceLLMot nginx, reachable from merLLM container.
 LANCELLMOT_URL = _get("LANCELLMOT_URL", "http://host.docker.internal:8080")
 
+# Internal probe URLs for the remaining Hexcaliper sites — reachable from the
+# merLLM container, used only for server-side reachability/health checks.
+SOONSTONE_URL = _get("SOONSTONE_URL", "http://host.docker.internal:5055")
+HAVELOCK_URL  = _get("HAVELOCK_URL",  "http://host.docker.internal:8000")
+SCRIVENER_URL = _get("SCRIVENER_URL", "http://host.docker.internal:8086")
+CODEX_URL     = _get("CODEX_URL",     "http://host.docker.internal:8085")
+WARDEN_URL    = _get("WARDEN_URL",    "http://host.docker.internal:8087")
+
+# ── Public (browser-facing) site URLs for Ecosystem tile links ───────────────
+# These are the addresses a browser uses to open each site (Cloudflare DNS root
+# is hexcaliper.com). They differ from the internal probe URLs above, which are
+# only reachable from inside the container network.
+PARSIVAL_PUBLIC_URL   = _get("PARSIVAL_PUBLIC_URL",   "https://parsival.hexcaliper.com")
+LANCELLMOT_PUBLIC_URL = _get("LANCELLMOT_PUBLIC_URL", "https://lancellmot.hexcaliper.com")
+SOONSTONE_PUBLIC_URL  = _get("SOONSTONE_PUBLIC_URL",  "https://soonstone.hexcaliper.com")
+HAVELOCK_PUBLIC_URL   = _get("HAVELOCK_PUBLIC_URL",   "https://havelock.hexcaliper.com")
+SCRIVENER_PUBLIC_URL  = _get("SCRIVENER_PUBLIC_URL",  "https://scrivener.hexcaliper.com")
+CODEX_PUBLIC_URL      = _get("CODEX_PUBLIC_URL",      "https://codex.hexcaliper.com")
+WARDEN_PUBLIC_URL     = _get("WARDEN_PUBLIC_URL",     "https://warden.hexcaliper.com")
+
 # ── Log container name mapping ────────────────────────────────────────────────
 # Maps logical service names to Docker container names for the /api/merllm/logs
 # endpoint. Override if your compose project name or container names differ.
@@ -159,6 +179,11 @@ def apply_overrides(d: dict) -> None:
         "notification_webhook_url":  "NOTIFICATION_WEBHOOK_URL",
         "parsival_url":              "PARSIVAL_URL",
         "lancellmot_url":            "LANCELLMOT_URL",
+        "soonstone_url":             "SOONSTONE_URL",
+        "havelock_url":              "HAVELOCK_URL",
+        "scrivener_url":             "SCRIVENER_URL",
+        "codex_url":                 "CODEX_URL",
+        "warden_url":                "WARDEN_URL",
     }
     int_fields = {
         "reclaim_timeout":         "RECLAIM_TIMEOUT",

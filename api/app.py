@@ -1201,6 +1201,7 @@ async def merllm_myday():
     _myday_log = logging.getLogger("merllm.myday")
 
     async def _fetch(url: str) -> dict | None:
+        """Fetch a JSON summary; None if unreachable or non-2xx."""
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get(url)
@@ -1210,12 +1211,43 @@ async def merllm_myday():
             _myday_log.warning("myday fetch failed for %s: %s", url, exc)
             return None
 
+    async def _probe(url: str) -> dict:
+        """
+        Reachability probe for sites that expose only a liveness endpoint.
+
+        Returns ``{ok, latency_ms, status, body}``.  Tolerant of plain-text
+        bodies (codex/warden ``/healthz`` return ``"ok"``, not JSON) and of
+        error status codes (soonstone ``/health`` returns 503 when its data is
+        stale but the site is still reachable) — ``status`` is None only when
+        the host could not be reached at all.
+        """
+        start = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(url)
+        except Exception as exc:
+            _myday_log.warning("myday probe failed for %s: %s", url, exc)
+            return {"ok": False, "latency_ms": None, "status": None, "body": None}
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return {"ok": r.status_code < 400, "latency_ms": latency_ms,
+                "status": r.status_code, "body": body}
+
     parsival_url    = f"{config.PARSIVAL_URL}/page/api/attention/summary"
     lancellmot_url  = f"{config.LANCELLMOT_URL}/api/status/pending"
 
-    parsival_data, lancellmot_data = await asyncio.gather(
+    (parsival_data, lancellmot_data, soonstone_p, havelock_p,
+     scrivener_p, codex_p, warden_p) = await asyncio.gather(
         _fetch(parsival_url),
         _fetch(lancellmot_url),
+        _probe(f"{config.SOONSTONE_URL}/health"),
+        _probe(f"{config.HAVELOCK_URL}/healthz"),
+        _probe(f"{config.SCRIVENER_URL}/"),
+        _probe(f"{config.CODEX_URL}/healthz"),
+        _probe(f"{config.WARDEN_URL}/healthz"),
     )
 
     queued_jobs    = db.list_batch_jobs(status="queued")
@@ -1225,6 +1257,7 @@ async def merllm_myday():
     return {
         "parsival": {
             "ok":               parsival_data is not None,
+            "url":              config.PARSIVAL_PUBLIC_URL,
             "active_situations": parsival_data.get("active_situations", 0) if parsival_data else 0,
             "new_investigating": parsival_data.get("new_investigating", 0) if parsival_data else 0,
             "overdue_followups": parsival_data.get("overdue_followups", 0) if parsival_data else 0,
@@ -1232,9 +1265,37 @@ async def merllm_myday():
         },
         "lancellmot": {
             "ok":                   lancellmot_data is not None,
+            "url":                  config.LANCELLMOT_PUBLIC_URL,
             "acquisition_pending":  lancellmot_data.get("acquisition_pending", 0) if lancellmot_data else 0,
             "escalation_pending":   lancellmot_data.get("escalation_pending", 0) if lancellmot_data else 0,
             "total_pending":        lancellmot_data.get("total_pending", 0) if lancellmot_data else 0,
+        },
+        "soonstone": {
+            # Reachable even when /health returns 503 (data stale but site up).
+            "ok":         soonstone_p["status"] is not None,
+            "url":        config.SOONSTONE_PUBLIC_URL,
+            "latency_ms": soonstone_p["latency_ms"],
+            "data_status": (soonstone_p["body"] or {}).get("status") if soonstone_p["body"] else None,
+        },
+        "havelock": {
+            "ok":         havelock_p["ok"],
+            "url":        config.HAVELOCK_PUBLIC_URL,
+            "latency_ms": havelock_p["latency_ms"],
+        },
+        "scrivener": {
+            "ok":         scrivener_p["ok"],
+            "url":        config.SCRIVENER_PUBLIC_URL,
+            "latency_ms": scrivener_p["latency_ms"],
+        },
+        "codex": {
+            "ok":         codex_p["ok"],
+            "url":        config.CODEX_PUBLIC_URL,
+            "latency_ms": codex_p["latency_ms"],
+        },
+        "warden": {
+            "ok":         warden_p["ok"],
+            "url":        config.WARDEN_PUBLIC_URL,
+            "latency_ms": warden_p["latency_ms"],
         },
         "merllm": {
             "ok":              True,

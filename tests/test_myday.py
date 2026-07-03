@@ -45,8 +45,14 @@ def _lancellmot_payload():
 
 
 def _mock_httpx(parsival=None, lancellmot=None,
-                parsival_exc=None, lancellmot_exc=None):
-    """Return a mock httpx.AsyncClient that returns configured responses."""
+                parsival_exc=None, lancellmot_exc=None,
+                probe_exc=None, probe_status=200, soonstone_status="ok"):
+    """Return a mock httpx.AsyncClient that returns configured responses.
+
+    Probe endpoints (soonstone/havelock/scrivener/codex/warden) are matched by
+    exclusion — any URL that is neither the parsival ``attention`` summary nor
+    the lancellmot ``pending`` status is treated as a reachability probe.
+    """
 
     call_count = [0]
 
@@ -54,14 +60,21 @@ def _mock_httpx(parsival=None, lancellmot=None,
         call_count[0] += 1
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
+        resp.status_code = 200
         if "attention" in url:
             if parsival_exc:
                 raise parsival_exc
             resp.json = MagicMock(return_value=parsival or _parsival_payload())
-        else:
+        elif "pending" in url:
             if lancellmot_exc:
                 raise lancellmot_exc
             resp.json = MagicMock(return_value=lancellmot or _lancellmot_payload())
+        else:
+            # Reachability probe endpoints (/health, /healthz, /).
+            if probe_exc:
+                raise probe_exc
+            resp.status_code = probe_status
+            resp.json = MagicMock(return_value={"status": soonstone_status})
         return resp
 
     mock_client = AsyncMock()
@@ -160,6 +173,46 @@ def test_myday_both_offline_still_200(client):
     assert body["parsival"]["ok"] is False
     assert body["lancellmot"]["ok"] is False
     assert body["merllm"]["ok"] is True
+
+
+# ── Ecosystem site sections (soonstone / havelock / scrivener / codex / warden) ─
+
+_SITE_KEYS = ["soonstone", "havelock", "scrivener", "codex", "warden"]
+
+
+def test_myday_returns_all_eight_sections(client):
+    with patch("httpx.AsyncClient", return_value=_mock_httpx()):
+        body = client.get("/api/merllm/myday").json()
+    for key in ["parsival", "lancellmot", "merllm", *_SITE_KEYS]:
+        assert key in body, key
+
+
+def test_myday_sites_ok_and_linked_when_reachable(client):
+    with patch("httpx.AsyncClient", return_value=_mock_httpx()):
+        body = client.get("/api/merllm/myday").json()
+    for key in _SITE_KEYS:
+        assert body[key]["ok"] is True, key
+        assert body[key]["url"].startswith("https://"), key
+        assert isinstance(body[key]["latency_ms"], int), key
+
+
+def test_myday_soonstone_reports_feed_status(client):
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(soonstone_status="stale")):
+        body = client.get("/api/merllm/myday").json()
+    s = body["soonstone"]
+    assert s["ok"] is True            # reachable even when data is stale
+    assert s["data_status"] == "stale"
+
+
+def test_myday_sites_offline_when_unreachable(client):
+    with patch("httpx.AsyncClient",
+               return_value=_mock_httpx(probe_exc=Exception("connection refused"))):
+        resp = client.get("/api/merllm/myday")
+    assert resp.status_code == 200    # a down site never fails the whole panel
+    body = resp.json()
+    for key in _SITE_KEYS:
+        assert body[key]["ok"] is False, key
+        assert body[key]["latency_ms"] is None, key
 
 
 # ── Endpoint registration ─────────────────────────────────────────────────────

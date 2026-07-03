@@ -1196,90 +1196,102 @@ async function refreshMyDay() {
   }
 }
 
+// One stat row inside a tile.
+function mydayRow(label, value, highlight = false) {
+  return `<div class="myday-row">
+    <span class="myday-label">${esc(label)}</span>
+    <span class="myday-val${highlight ? ' myday-highlight' : ''}">${esc(String(value))}</span>
+  </div>`;
+}
+
+// One ecosystem tile. `href` omitted → not a link (used for merLLM's own tile).
+// `cls` overrides the default ok/offline border (e.g. attention yellow).
+function mydayTile({ name, href, online, cls, rows = [], latencyMs = null, note = "" }) {
+  const dot     = `<span class="myday-dot ${online ? 'up' : 'down'}"></span>`;
+  const latHtml = (online && latencyMs != null)
+    ? `<span class="myday-latency">${latencyMs} ms</span>` : "";
+  const head    = `<div class="myday-app">${dot}${esc(name)}${latHtml}</div>`;
+  const body    = online
+    ? `<div class="myday-rows">${rows.join("")}${note ? `<div class="myday-hint">${esc(note)}</div>` : ""}</div>`
+    : `<div class="myday-offline-msg">offline</div>`;
+  const cardCls = cls || (online ? "myday-card myday-ok" : "myday-card myday-offline");
+  const inner   = `<div class="${cardCls}">${head}${body}</div>`;
+  return href
+    ? `<a class="myday-link" href="${esc(href)}" target="_blank" rel="noopener">${inner}</a>`
+    : inner;
+}
+
 function renderMyDay(data) {
   const cards = [];
 
-  // Parsival card
-  if (!data.parsival.ok) {
-    cards.push(`<div class="myday-card myday-offline">
-      <div class="myday-app">Parsival</div>
-      <div class="myday-offline-msg">offline</div>
-    </div>`);
-  } else {
+  // ── Parsival ──
+  {
     const p = data.parsival;
-    const hasSituations = p.active_situations > 0;
-    const hasOverdue    = p.overdue_followups > 0;
-    const cls = (hasSituations || hasOverdue) ? "myday-card myday-attention" : "myday-card myday-ok";
-    cards.push(`<a class="myday-link" href="/page/index.html" target="_blank" rel="noopener">
-      <div class="${cls}">
-        <div class="myday-app">Parsival</div>
-        <div class="myday-rows">
-          <div class="myday-row">
-            <span class="myday-label">Active situations</span>
-            <span class="myday-val${hasSituations ? ' myday-highlight' : ''}">${p.active_situations}</span>
-          </div>
-          <div class="myday-row">
-            <span class="myday-label">New / investigating</span>
-            <span class="myday-val">${p.new_investigating}</span>
-          </div>
-          <div class="myday-row">
-            <span class="myday-label">Overdue follow-ups</span>
-            <span class="myday-val${hasOverdue ? ' myday-highlight' : ''}">${p.overdue_followups}</span>
-          </div>
-          ${p.cold_start ? '<div class="myday-hint">Learning attention patterns…</div>' : ''}
-        </div>
-      </div>
-    </a>`);
+    const attn = p.ok && (p.active_situations > 0 || p.overdue_followups > 0);
+    cards.push(mydayTile({
+      name: "Parsival", href: p.url, online: p.ok,
+      cls: p.ok ? (attn ? "myday-card myday-attention" : "myday-card myday-ok") : null,
+      rows: p.ok ? [
+        mydayRow("Active situations", p.active_situations, p.active_situations > 0),
+        mydayRow("New / investigating", p.new_investigating),
+        mydayRow("Overdue follow-ups", p.overdue_followups, p.overdue_followups > 0),
+      ] : [],
+      note: p.ok && p.cold_start ? "Learning attention patterns…" : "",
+    }));
   }
 
-  // LanceLLMot card
-  if (!data.lancellmot.ok) {
-    cards.push(`<div class="myday-card myday-offline">
-      <div class="myday-app">LanceLLMot</div>
-      <div class="myday-offline-msg">offline</div>
-    </div>`);
-  } else {
+  // ── LanceLLMot ──
+  {
     const l = data.lancellmot;
-    const hasPending = l.total_pending > 0;
-    const cls = hasPending ? "myday-card myday-attention" : "myday-card myday-ok";
-    cards.push(`<a class="myday-link" href="/web/index.html" target="_blank" rel="noopener">
-      <div class="${cls}">
-        <div class="myday-app">LanceLLMot</div>
-        <div class="myday-rows">
-          <div class="myday-row">
-            <span class="myday-label">Acquisition pending</span>
-            <span class="myday-val${l.acquisition_pending > 0 ? ' myday-highlight' : ''}">${l.acquisition_pending}</span>
-          </div>
-          <div class="myday-row">
-            <span class="myday-label">Escalation pending</span>
-            <span class="myday-val${l.escalation_pending > 0 ? ' myday-highlight' : ''}">${l.escalation_pending}</span>
-          </div>
-        </div>
-      </div>
-    </a>`);
+    const attn = l.ok && l.total_pending > 0;
+    cards.push(mydayTile({
+      name: "LanceLLMot", href: l.url, online: l.ok,
+      cls: l.ok ? (attn ? "myday-card myday-attention" : "myday-card myday-ok") : null,
+      rows: l.ok ? [
+        mydayRow("Acquisition pending", l.acquisition_pending, l.acquisition_pending > 0),
+        mydayRow("Escalation pending", l.escalation_pending, l.escalation_pending > 0),
+      ] : [],
+    }));
   }
 
-  // merLLM card
-  const m = data.merllm;
-  const hasJobs = m.queued_jobs > 0 || m.failed_jobs > 0;
-  const mCls = hasJobs ? "myday-card myday-attention" : "myday-card myday-ok";
-  cards.push(`<div class="${mCls}">
-    <div class="myday-app">merLLM</div>
-    <div class="myday-rows">
-      <div class="myday-row">
-        <span class="myday-label">Queued batch jobs</span>
-        <span class="myday-val${m.queued_jobs > 0 ? ' myday-highlight' : ''}">${m.queued_jobs}</span>
-      </div>
-      <div class="myday-row">
-        <span class="myday-label">Completed (unreviewed)</span>
-        <span class="myday-val">${m.completed_jobs}</span>
-      </div>
-      <div class="myday-row">
-        <span class="myday-label">Failed jobs</span>
-        <span class="myday-val${m.failed_jobs > 0 ? ' myday-highlight' : ''}">${m.failed_jobs}</span>
-      </div>
-    </div>
-  </div>`);
+  // ── Soonstone (freshness-aware) ──
+  {
+    const s = data.soonstone;
+    const stale = s.ok && s.data_status && s.data_status !== "ok";
+    cards.push(mydayTile({
+      name: "Soonstone", href: s.url, online: s.ok, latencyMs: s.latency_ms,
+      cls: s.ok ? (stale ? "myday-card myday-attention" : "myday-card myday-ok") : null,
+      rows: s.ok ? [mydayRow("Feed status", s.data_status || "unknown", stale)] : [],
+    }));
+  }
+
+  // ── Link + heartbeat tiles (reference / instruction sites) ──
+  for (const [name, key] of [
+    ["Havelock", "havelock"],
+    ["Scrivener", "scrivener"],
+    ["Codex", "codex"],
+    ["Warden", "warden"],
+  ]) {
+    const site = data[key];
+    cards.push(mydayTile({
+      name, href: site.url, online: site.ok, latencyMs: site.latency_ms,
+    }));
+  }
+
+  // ── merLLM (self — not a link) ──
+  {
+    const m = data.merllm;
+    const attn = m.queued_jobs > 0 || m.failed_jobs > 0;
+    cards.push(mydayTile({
+      name: "merLLM", online: true,
+      cls: attn ? "myday-card myday-attention" : "myday-card myday-ok",
+      rows: [
+        mydayRow("Queued batch jobs", m.queued_jobs, m.queued_jobs > 0),
+        mydayRow("Completed (unreviewed)", m.completed_jobs),
+        mydayRow("Failed jobs", m.failed_jobs, m.failed_jobs > 0),
+      ],
+    }));
+  }
 
   document.getElementById("myday-cards").innerHTML = cards.join("");
 }
