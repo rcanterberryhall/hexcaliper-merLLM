@@ -2,15 +2,35 @@
 
 // ── Navigation ────────────────────────────────────────────────────────────────
 
+// Activate a tab by name (the button's data-tab). Unknown names fall back to
+// "overview" so a stale/garbage hash never leaves the UI with no tab showing.
+function activateTab(name) {
+  const btn = document.querySelector(`nav button[data-tab="${name}"]`);
+  if (!btn) { if (name !== "overview") activateTab("overview"); return; }
+
+  document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  btn.classList.add("active");
+  document.getElementById("tab-" + name).classList.add("active");
+  if (name === "metrics") loadMetricsCharts().catch(() => {});
+}
+
 document.querySelectorAll("nav button").forEach(btn => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
-    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-    btn.classList.add("active");
-    document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
-    if (btn.dataset.tab === "metrics") loadMetricsCharts().catch(() => {});
+    const tab = btn.dataset.tab;
+    activateTab(tab);
+    // URL hash is the source of truth for the current view, so a refresh (or a
+    // shared link, or the Back button) lands on the same tab.
+    if (location.hash.slice(1) !== tab) location.hash = tab;
   });
 });
+
+// Restore the tab from the URL hash on load, and follow Back/forward + deep links.
+function initTabFromHash() {
+  activateTab(location.hash.slice(1) || "overview");
+}
+window.addEventListener("hashchange", initTabFromHash);
+initTabFromHash();
 
 document.querySelectorAll(".range-btn").forEach(btn => {
   btn.addEventListener("click", () => {
