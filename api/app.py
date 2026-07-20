@@ -522,6 +522,7 @@ async def _stream_and_accumulate(target: str, path: str, body: dict) -> dict:
     """
     wire_body = {**body, "stream": True}
     text, thinking = "", ""
+    tool_calls: list = []
     final: dict = {}
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
@@ -547,6 +548,9 @@ async def _stream_and_accumulate(target: str, path: str, body: dict) -> dict:
                         msg = obj.get("message") or {}
                         text     += msg.get("content", "")  or ""
                         thinking += msg.get("thinking", "") or ""
+                        # Tool calls ride mid-stream chunks, never the done
+                        # chunk — accumulate or they vanish from the rebuild.
+                        tool_calls.extend(msg.get("tool_calls") or [])
                     if obj.get("done"):
                         final = obj
     if path == "/api/generate":
@@ -556,6 +560,8 @@ async def _stream_and_accumulate(target: str, path: str, body: dict) -> dict:
         msg["content"] = text
         if thinking:
             msg["thinking"] = thinking
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
         final["message"] = msg
     return final
 

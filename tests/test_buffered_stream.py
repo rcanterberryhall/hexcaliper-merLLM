@@ -181,3 +181,49 @@ def test_buffered_stream_proxy_returns_json_response(app_mod, monkeypatch):
     assert body["done"] is True
     # _activity_clear ran in finally → card shows idle.
     assert app_mod._activity[app_mod._gpu_label("http://fake:11434")] is None
+
+
+def test_accumulate_chat_preserves_tool_calls(app_mod, monkeypatch):
+    """/api/chat: tool_calls arrive on mid-stream chunks, never on the done
+    chunk — the accumulator must carry them into the rebuilt message.
+    (Found live 2026-07-20: revelmaster's attended browse got content-only
+    replies; raw Ollama on :11434 returned the tool call, merLLM dropped it.)"""
+    call_a = {"id": "call_1", "function": {"index": 0, "name": "seen.list", "arguments": {}}}
+    call_b = {"id": "call_2", "function": {"index": 1, "name": "taste.get", "arguments": {}}}
+    lines = [
+        json.dumps({"message": {"role": "assistant", "content": "", "tool_calls": [call_a]}}).encode(),
+        json.dumps({"message": {"role": "assistant", "content": "", "tool_calls": [call_b]}}).encode(),
+        json.dumps({
+            "message":     {"role": "assistant", "content": ""},
+            "done":        True,
+            "done_reason": "stop",
+        }).encode(),
+    ]
+    fake = _FakeClient(lines)
+    monkeypatch.setattr(app_mod.httpx, "AsyncClient", lambda **kw: fake)
+
+    payload = _run(app_mod._stream_and_accumulate(
+        "http://fake:11434", "/api/chat",
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+    ))
+
+    assert payload["message"]["tool_calls"] == [call_a, call_b]
+    assert payload["message"]["content"] == ""
+
+
+def test_accumulate_chat_no_tool_calls_key_when_none(app_mod, monkeypatch):
+    """A plain text reply must not grow an empty tool_calls key (wire parity
+    with Ollama's stream=False response)."""
+    lines = [
+        json.dumps({"message": {"role": "assistant", "content": "hi"}}).encode(),
+        json.dumps({"message": {"role": "assistant", "content": ""}, "done": True}).encode(),
+    ]
+    fake = _FakeClient(lines)
+    monkeypatch.setattr(app_mod.httpx, "AsyncClient", lambda **kw: fake)
+
+    payload = _run(app_mod._stream_and_accumulate(
+        "http://fake:11434", "/api/chat",
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+    ))
+
+    assert "tool_calls" not in payload["message"]
