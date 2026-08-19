@@ -21,6 +21,7 @@
   <!-- GPU Queue merged into Overview -->
   <button data-tab="metrics">Metrics</button>
   <button data-tab="logs">Logs</button>
+  <button data-tab="plans">Plans</button>
   <button data-tab="terminal">SSH</button>
   <button data-tab="vnc">VNC</button>
   <button data-tab="fans">Fans</button>
@@ -247,6 +248,30 @@
         <button class="btn primary" onclick="fetchLogs()">Fetch</button>
       </div>
       <pre id="log-output" class="log-output">Select a service and click Fetch.</pre>
+    </div>
+  </div>
+
+  <!-- ── Plans ── -->
+  <div id="tab-plans" class="tab">
+    <div class="plans-grid">
+      <aside class="plans-side">
+        <input id="plans-search" type="search" placeholder="Search titles…" autocomplete="off" />
+        <div id="plans-chips" class="plans-chips">
+          <button class="chip active" data-type="design">design</button>
+          <button class="chip active" data-type="plan">plan</button>
+          <button class="chip active" data-type="requirements">req</button>
+          <button class="chip active" data-type="other">other</button>
+        </div>
+        <div id="plans-tree"></div>
+      </aside>
+      <article id="plans-doc" class="plans-doc">
+        <header class="plans-doc-head">
+          <h2 id="plans-title">Select a document</h2>
+          <div id="plans-meta" class="plans-doc-meta"></div>
+        </header>
+        <div id="plans-body" class="plans-body"></div>
+      </article>
+      <nav id="plans-toc" class="plans-toc"></nav>
     </div>
   </div>
 

@@ -4,7 +4,9 @@
 
 // Activate a tab by name (the button's data-tab). Unknown names fall back to
 // "overview" so a stale/garbage hash never leaves the UI with no tab showing.
-function activateTab(name) {
+// `rest` carries any remaining hash segments — the Plans tab uses it to deep
+// link a specific document; every other tab ignores it.
+function activateTab(name, rest) {
   const btn = document.querySelector(`nav button[data-tab="${name}"]`);
   if (!btn) { if (name !== "overview") activateTab("overview"); return; }
 
@@ -13,6 +15,7 @@ function activateTab(name) {
   btn.classList.add("active");
   document.getElementById("tab-" + name).classList.add("active");
   if (name === "metrics") loadMetricsCharts().catch(() => {});
+  if (name === "plans")   initPlans(rest);
 }
 
 document.querySelectorAll("nav button").forEach(btn => {
@@ -20,14 +23,17 @@ document.querySelectorAll("nav button").forEach(btn => {
     const tab = btn.dataset.tab;
     activateTab(tab);
     // URL hash is the source of truth for the current view, so a refresh (or a
-    // shared link, or the Back button) lands on the same tab.
+    // shared link, or the Back button) lands on the same tab. Clicking a tab
+    // you are already on drops any deep-link segments and resets the view.
     if (location.hash.slice(1) !== tab) location.hash = tab;
   });
 });
 
-// Restore the tab from the URL hash on load, and follow Back/forward + deep links.
+// Restore the tab from the URL hash on load, and follow Back/forward + deep
+// links. The first "/" segment is the tab; the remainder is tab-specific.
 function initTabFromHash() {
-  activateTab(location.hash.slice(1) || "overview");
+  const parts = location.hash.slice(1).split("/");
+  activateTab(parts[0] || "overview", parts.slice(1).join("/"));
 }
 window.addEventListener("hashchange", initTabFromHash);
 initTabFromHash();
@@ -1616,3 +1622,121 @@ loadQueue();
 loadBatchJobs();
 loadFans().catch(() => {});
 startPolling();
+
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+// `var`, not `let`, is load-bearing here. initTabFromHash() runs inline during
+// script evaluation — before this section is reached — so on a "#plans" deep
+// link activateTab calls initPlans while these declarations are still ahead of
+// the interpreter. `var` hoists to undefined; `let` would throw a TDZ
+// ReferenceError and leave the page blank.
+var _plansLibrary = null;   // [{app, dir, count, docs}]
+var _plansIndex   = {};     // rel -> meta, for deep links and cross-doc links
+var _plansOpen    = null;   // rel of the document currently displayed
+
+const PLANS_GLYPH = { design: "◆", plan: "▸", requirements: "■", other: "·" };
+
+// Load the library once per page load, then honour any deep-linked document.
+async function initPlans(rest) {
+  if (!_plansLibrary) {
+    const tree = document.getElementById("plans-tree");
+    try {
+      const resp = await fetch("/api/merllm/docs");
+      if (resp.status === 503) {
+        tree.innerHTML = '<p class="plans-empty">Plans directory not mounted. ' +
+                         'Add the <code>/plans</code> bind mount and recreate ' +
+                         'the API container.</p>';
+        return;
+      }
+      const body = await resp.json();
+      _plansLibrary = body.apps;
+      _plansIndex = {};
+      body.apps.forEach(a => a.docs.forEach(d => { _plansIndex[d.rel] = d; }));
+    } catch (err) {
+      tree.innerHTML = '<p class="plans-empty">Could not load the plans library.</p>';
+      return;
+    }
+    renderPlansTree();
+  }
+  if (rest && rest !== _plansOpen) openDoc(rest);
+}
+
+// Which type chips are currently on.
+function activePlanTypes() {
+  return Array.from(document.querySelectorAll("#plans-chips .chip.active"))
+              .map(c => c.dataset.type);
+}
+
+// Rebuild the sidebar from the library, applying the search text and chips.
+// Only the app holding the newest document is expanded on first paint.
+function renderPlansTree() {
+  const query = document.getElementById("plans-search").value.trim().toLowerCase();
+  const types = activePlanTypes();
+  const tree  = document.getElementById("plans-tree");
+  const newestApp = _plansLibrary
+        .map(a => ({ app: a.app, date: (a.docs[0] || {}).date || "" }))
+        .sort((x, y) => y.date.localeCompare(x.date))[0] || {};
+
+  tree.innerHTML = "";
+  _plansLibrary.forEach(entry => {
+    const docs = entry.docs.filter(d =>
+      types.includes(d.type) && (!query || d.title.toLowerCase().includes(query)));
+    if (!docs.length) return;
+
+    const group = document.createElement("details");
+    // Searching expands everything, so matches are never hidden in a collapsed group.
+    group.open = !!query || entry.app === newestApp.app;
+
+    const summary = document.createElement("summary");
+    summary.innerHTML = `<span>${entry.app}</span><span class="plans-count">${docs.length}</span>`;
+    group.appendChild(summary);
+
+    docs.forEach(doc => {
+      const row = document.createElement("button");
+      row.className = "plans-row" + (doc.rel === _plansOpen ? " active" : "");
+      row.dataset.rel = doc.rel;
+      row.title = doc.title;
+      const when = doc.date ? doc.date.slice(5) : "  —  ";
+      row.innerHTML = `<span class="plans-date">${when}</span>` +
+                      `<span class="plans-glyph">${PLANS_GLYPH[doc.type]}</span>` +
+                      `<span class="plans-row-title">${doc.title}</span>`;
+      row.addEventListener("click", () => { location.hash = "plans/" + doc.rel; });
+      group.appendChild(row);
+    });
+    tree.appendChild(group);
+  });
+
+  if (!tree.children.length) {
+    tree.innerHTML = '<p class="plans-empty">No documents match.</p>';
+  }
+}
+
+document.getElementById("plans-search")
+        .addEventListener("input", () => renderPlansTree());
+
+document.querySelectorAll("#plans-chips .chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    chip.classList.toggle("active");
+    renderPlansTree();
+  });
+});
+
+// Fetch and display one document. Task 6 replaces the body rendering.
+async function openDoc(rel) {
+  const bodyEl = document.getElementById("plans-body");
+  const resp = await fetch("/api/merllm/docs/content?rel=" + encodeURIComponent(rel));
+  if (!resp.ok) {
+    document.getElementById("plans-title").textContent = "Document not found";
+    document.getElementById("plans-meta").textContent = rel;
+    bodyEl.textContent = "";
+    return;
+  }
+  const doc = await resp.json();
+  _plansOpen = rel;
+  document.getElementById("plans-title").textContent = doc.title;
+  document.getElementById("plans-meta").textContent =
+    `${doc.app} · ${doc.type}${doc.date ? " · " + doc.date : ""} · ${Math.round(doc.size / 1024)} KB`;
+  bodyEl.textContent = doc.markdown;      // replaced by the renderer in Task 6
+  document.getElementById("plans-doc").scrollTop = 0;
+  renderPlansTree();                       // repaint so the active row highlights
+}
