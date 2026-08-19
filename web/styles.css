@@ -783,6 +783,14 @@ tr:hover td { background: #1c2330; }
   margin-bottom: 14px;
 }
 .plans-body pre code { background: none; padding: 0; font-size: 12.5px; }
+/* highlight.js's github-dark stylesheet ships `pre code.hljs { padding: 1em }`
+   at the same specificity (0,1,2) as the rule above, and it loads AFTER
+   styles.css, so on that tie it wins and double-pads every fenced block on
+   top of the 12px already on .plans-body pre. This rule's extra class
+   (0,2,2) outranks it regardless of load order. github-dark's background
+   lives on the lower-specificity `.hljs` selector (0,1,0), so the rule above
+   already beats it outright — no background override needed here. */
+.plans-body pre code.hljs { padding: 0; }
 
 .plans-body table {
   border-collapse: collapse;

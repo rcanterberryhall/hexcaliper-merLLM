@@ -1633,13 +1633,24 @@ startPolling();
 var _plansLibrary = null;   // [{app, dir, count, docs}]
 var _plansIndex   = {};     // rel -> meta, for deep links and cross-doc links
 var _plansOpen    = null;   // rel of the document currently displayed
-var _plansRaw     = "";     // markdown source of the doc currently displayed; Task 7's raw toggle reads it
+var _plansRaw     = "";     // markdown source of the doc currently displayed; the raw toggle reads it
+var _plansLoading = false;  // true while the initial library fetch is in flight — guards
+                             // against a single Plans-tab click running initPlans twice
+                             // (once via the direct activateTab call, once via the
+                             // hashchange it queues) and firing two concurrent fetches.
+var _plansPendingRest;      // rest segment from a call that arrived while a load was
+                             // already in flight, honoured once that load resolves so a
+                             // deep link is never silently dropped by the guard above.
 
 const PLANS_GLYPH = { design: "◆", plan: "▸", requirements: "■", other: "·" };
 
 // Load the library once per page load, then honour any deep-linked document.
 async function initPlans(rest) {
   if (!_plansLibrary) {
+    if (rest) _plansPendingRest = rest;
+    if (_plansLoading) return;   // a fetch is already in flight; the pending rest
+                                  // above (if any) is honoured when it resolves
+    _plansLoading = true;
     const tree = document.getElementById("plans-tree");
     try {
       const resp = await fetch("/api/merllm/docs");
@@ -1653,14 +1664,41 @@ async function initPlans(rest) {
       _plansLibrary = body.apps;
       _plansIndex = {};
       body.apps.forEach(a => a.docs.forEach(d => { _plansIndex[d.rel] = d; }));
+      renderPlansTree();
+      interceptDocLinks();   // delegated listener on #plans-body — attach exactly once
     } catch (err) {
       tree.innerHTML = '<p class="plans-empty">Could not load the plans library.</p>';
       return;
+    } finally {
+      _plansLoading = false;
     }
-    renderPlansTree();
-    interceptDocLinks();   // delegated listener on #plans-body — attach exactly once
+    rest = _plansPendingRest;
+    _plansPendingRest = undefined;
   }
-  if (rest && rest !== _plansOpen) openDoc(rest);
+  if (!_plansLibrary) return;   // library never loaded — nothing to open
+  if (rest && rest !== _plansOpen) {
+    openDoc(rest);
+  } else if (!rest && _plansOpen) {
+    // Clicking the Plans nav button while already on it resets the hash to
+    // #plans; honour that by returning to the library view with nothing open.
+    resetPlansView();
+  }
+}
+
+// Return the reading pane to its initial "nothing selected" state.
+function resetPlansView() {
+  document.getElementById("plans-title").textContent = "Select a document";
+  document.getElementById("plans-meta").textContent = "";
+  document.getElementById("plans-progress").textContent = "";
+  document.getElementById("plans-raw-toggle").textContent = "Raw";
+  const body = document.getElementById("plans-body");
+  body.textContent = "";
+  body.classList.remove("raw");
+  document.getElementById("plans-toc").innerHTML = "";
+  if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
+  _plansOpen = null;
+  _plansRaw = "";
+  renderPlansTree();   // repaint so no sidebar row stays highlighted
 }
 
 // Which type chips are currently on.
@@ -1672,6 +1710,9 @@ function activePlanTypes() {
 // Rebuild the sidebar from the library, applying the search text and chips.
 // Only the app holding the newest document is expanded on first paint.
 function renderPlansTree() {
+  if (!_plansLibrary) return;   // library never loaded (503 or fetch failure) — the
+                                 // search input and chips are bound at script eval,
+                                 // independent of load success, so this can fire early
   const query = document.getElementById("plans-search").value.trim().toLowerCase();
   const types = activePlanTypes();
   const tree  = document.getElementById("plans-tree");
@@ -1702,7 +1743,14 @@ function renderPlansTree() {
       row.innerHTML = `<span class="plans-date">${esc(when)}</span>` +
                       `<span class="plans-glyph">${esc(PLANS_GLYPH[doc.type])}</span>` +
                       `<span class="plans-row-title">${esc(doc.title)}</span>`;
-      row.addEventListener("click", () => { location.hash = "plans/" + doc.rel; });
+      row.addEventListener("click", () => {
+        const target = "plans/" + doc.rel;
+        // A failed open leaves the hash already pointing at this document, so
+        // re-assigning it fires no hashchange — call openDoc directly so a
+        // retry click on the same row actually does something.
+        if (location.hash.slice(1) === target) openDoc(doc.rel);
+        else location.hash = target;
+      });
       group.appendChild(row);
     });
     tree.appendChild(group);
@@ -1727,11 +1775,18 @@ document.querySelectorAll("#plans-chips .chip").forEach(chip => {
 // documents are written by agent sessions and pasted from many sources.
 // marked 12.0.2 removed the headerIds/mangle options (they're silently
 // ignored, not warned on, if passed — verified empirically) so headings never
-// get an id here; Task 7's TOC supplies its own "sec-N" fallback for that.
+// get an id here; the TOC below supplies its own "sec-N" fallback for that.
 function renderMarkdown(md, el) {
   marked.setOptions({ gfm: true, breaks: false });
   el.innerHTML = DOMPurify.sanitize(marked.parse(md));
-  el.querySelectorAll("pre code").forEach(block => hljs.highlightElement(block));
+  try {
+    // Highlighting is cosmetic. A broken/missing hljs must not throw here and
+    // discard an already-successful parse + sanitise into the CDN-failure
+    // fallback — that fallback is for when rendering itself is unavailable.
+    el.querySelectorAll("pre code").forEach(block => hljs.highlightElement(block));
+  } catch (err) {
+    // Leave the unhighlighted-but-otherwise-correct render in place.
+  }
 }
 
 // Fetch and display one document.
@@ -1761,14 +1816,18 @@ async function openDoc(rel) {
   _plansRaw = doc.markdown;
   try {
     renderMarkdown(doc.markdown, bodyEl);
+    bodyEl.classList.remove("raw");
+    document.getElementById("plans-raw-toggle").textContent = "Raw";
   } catch (err) {
-    // marked/DOMPurify/hljs unavailable (CDN blocked or offline) — the document is
-    // still worth reading, so fall back to plain source rather than a stale pane.
+    // marked/DOMPurify unavailable (CDN blocked or offline) — the document is
+    // still worth reading, so fall back to plain source rather than a stale
+    // pane. Add "raw" so .plans-body.raw's pre-wrap/monospace CSS applies —
+    // without it every newline collapses into one run-on paragraph.
     bodyEl.textContent = doc.markdown;
+    bodyEl.classList.add("raw");
+    document.getElementById("plans-raw-toggle").textContent = "Rendered";
     document.getElementById("plans-meta").textContent += " — rendering unavailable";
   }
-  bodyEl.classList.remove("raw");
-  document.getElementById("plans-raw-toggle").textContent = "Raw";
   decorateDoc();                           // safe on the plain-text fallback too:
                                             // no headings/checkboxes/<pre> to find
   document.getElementById("plans-doc").scrollTop = 0;
@@ -1832,11 +1891,15 @@ function markTaskProgress() {
 function attachCopyButtons() {
   document.querySelectorAll("#plans-body pre").forEach(pre => {
     if (pre.querySelector(".plans-copy")) return;
+    const code = pre.querySelector("code");
+    if (!code) return;   // a <pre> with no <code> child has nothing to copy;
+                          // attaching a button here would throw synchronously
+                          // outside the promise chain and leave it inert
     const btn = document.createElement("button");
     btn.className = "plans-copy";
     btn.textContent = "copy";
     btn.addEventListener("click", () => {
-      navigator.clipboard.writeText(pre.querySelector("code").textContent).then(() => {
+      navigator.clipboard.writeText(code.textContent).then(() => {
         btn.textContent = "copied";
         setTimeout(() => { btn.textContent = "copy"; }, 1200);
       }).catch(() => {
@@ -1901,11 +1964,17 @@ document.getElementById("plans-raw-toggle").addEventListener("click", () => {
       body.textContent = _plansRaw;
       body.classList.add("raw");
       document.getElementById("plans-raw-toggle").textContent = "Rendered";
+      // The headings this TOC pointed at are now detached (body.textContent
+      // wiped them out), so drop it and stop the scroll-spy observing them —
+      // the same cleanup buildToc performs on its own early-return path.
+      document.getElementById("plans-toc").innerHTML = "";
+      if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
     }
   }
 });
 
 document.getElementById("plans-copy-all").addEventListener("click", () => {
+  if (!_plansOpen) return;   // nothing open — don't overwrite the clipboard with ""
   const btn = document.getElementById("plans-copy-all");
   navigator.clipboard.writeText(_plansRaw).then(() => {
     btn.textContent = "Copied";
