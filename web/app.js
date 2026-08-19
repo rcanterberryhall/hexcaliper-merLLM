@@ -1658,6 +1658,7 @@ async function initPlans(rest) {
       return;
     }
     renderPlansTree();
+    interceptDocLinks();   // delegated listener on #plans-body — attach exactly once
   }
   if (rest && rest !== _plansOpen) openDoc(rest);
 }
@@ -1766,6 +1767,147 @@ async function openDoc(rel) {
     bodyEl.textContent = doc.markdown;
     document.getElementById("plans-meta").textContent += " — rendering unavailable";
   }
+  bodyEl.classList.remove("raw");
+  document.getElementById("plans-raw-toggle").textContent = "Raw";
+  decorateDoc();                           // safe on the plain-text fallback too:
+                                            // no headings/checkboxes/<pre> to find
   document.getElementById("plans-doc").scrollTop = 0;
   renderPlansTree();                       // repaint so the active row highlights
+}
+
+var _plansSpy = null;   // IntersectionObserver for the current document; `var` for
+                         // the same hoisting reason as the other _plans* state above.
+
+// Build the contents rail from the rendered h2/h3 headings.
+function buildToc() {
+  const body = document.getElementById("plans-body");
+  const toc  = document.getElementById("plans-toc");
+  const heads = Array.from(body.querySelectorAll("h2, h3"));
+  toc.innerHTML = "";
+  if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
+  if (!heads.length) return;
+
+  toc.innerHTML = '<div class="plans-toc-head">Contents</div>';
+  heads.forEach((head, i) => {
+    if (!head.id) head.id = "sec-" + i;      // marked emits no heading ids at all
+    const link = document.createElement("a");
+    link.href = "#";
+    link.className = "plans-toc-link lvl-" + head.tagName.toLowerCase();
+    link.dataset.target = head.id;
+    link.textContent = head.textContent;
+    link.addEventListener("click", ev => {
+      ev.preventDefault();                    // never let it touch location.hash
+      head.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    toc.appendChild(link);
+  });
+
+  // Highlight the heading nearest the top of the reading pane.
+  _plansSpy = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      toc.querySelectorAll(".plans-toc-link").forEach(a =>
+        a.classList.toggle("active", a.dataset.target === entry.target.id));
+    });
+  }, { root: document.getElementById("plans-doc"), rootMargin: "0px 0px -80% 0px" });
+  heads.forEach(head => _plansSpy.observe(head));
+}
+
+// marked's GFM rendering already emits disabled checkboxes for "- [ ]"; this
+// only adds the per-document tally. Verify the markup rather than assuming it.
+function markTaskProgress() {
+  const body  = document.getElementById("plans-body");
+  const boxes = body.querySelectorAll('input[type="checkbox"]');
+  const label = document.getElementById("plans-progress");
+  if (!boxes.length) { label.textContent = ""; return; }
+  boxes.forEach(box => {
+    box.disabled = true;                       // read-only surface, always
+    box.closest("li")?.classList.add("plans-task");
+  });
+  const done = body.querySelectorAll('input[type="checkbox"]:checked').length;
+  label.textContent = `${done} of ${boxes.length} steps done`;
+}
+
+// A copy button per fenced block, revealed on hover.
+function attachCopyButtons() {
+  document.querySelectorAll("#plans-body pre").forEach(pre => {
+    if (pre.querySelector(".plans-copy")) return;
+    const btn = document.createElement("button");
+    btn.className = "plans-copy";
+    btn.textContent = "copy";
+    btn.addEventListener("click", () => {
+      navigator.clipboard.writeText(pre.querySelector("code").textContent).then(() => {
+        btn.textContent = "copied";
+        setTimeout(() => { btn.textContent = "copy"; }, 1200);
+      }).catch(() => {
+        // Not a secure context (plain HTTP to a LAN IP) or permission denied —
+        // say so rather than claiming success on a clipboard write that failed.
+        btn.textContent = "failed";
+        setTimeout(() => { btn.textContent = "copy"; }, 1200);
+      });
+    });
+    pre.appendChild(btn);
+  });
+}
+
+// Open a linked .md inside the reader when it resolves to an indexed document;
+// otherwise say so rather than letting the link 404 the whole SPA.
+function interceptDocLinks() {
+  document.getElementById("plans-body").addEventListener("click", ev => {
+    const link = ev.target.closest("a");
+    if (!link) return;
+    const href = link.getAttribute("href") || "";
+    if (!href.toLowerCase().split("#")[0].endsWith(".md")) return;
+    ev.preventDefault();
+
+    // Resolve relative to the open document's directory.
+    const base = _plansOpen.slice(0, _plansOpen.lastIndexOf("/") + 1);
+    const parts = (base + href.split("#")[0]).split("/");
+    const stack = [];
+    parts.forEach(part => {
+      if (part === "..") stack.pop();
+      else if (part && part !== ".") stack.push(part);
+    });
+    const target = stack.join("/");
+
+    if (_plansIndex[target]) location.hash = "plans/" + target;
+    else link.insertAdjacentHTML("afterend",
+      '<em class="plans-note"> (outside the plans library)</em>');
+  }, { once: false });
+}
+
+document.getElementById("plans-raw-toggle").addEventListener("click", () => {
+  if (!_plansOpen) return;   // nothing open — don't toggle into a "raw view of nothing"
+  const body = document.getElementById("plans-body");
+  const raw  = body.classList.toggle("raw");
+  document.getElementById("plans-raw-toggle").textContent = raw ? "Rendered" : "Raw";
+  if (raw) {
+    body.textContent = _plansRaw;
+    document.getElementById("plans-toc").innerHTML = "";
+  } else {
+    try {
+      renderMarkdown(_plansRaw, body);
+      decorateDoc();
+    } catch (err) {
+      body.textContent = _plansRaw;   // CDN unavailable — still readable as source
+    }
+  }
+});
+
+document.getElementById("plans-copy-all").addEventListener("click", () => {
+  const btn = document.getElementById("plans-copy-all");
+  navigator.clipboard.writeText(_plansRaw).then(() => {
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = "Copy document"; }, 1200);
+  }).catch(() => {
+    btn.textContent = "failed";
+    setTimeout(() => { btn.textContent = "Copy document"; }, 1200);
+  });
+});
+
+// Everything that decorates a freshly rendered document.
+function decorateDoc() {
+  buildToc();
+  markTaskProgress();
+  attachCopyButtons();
 }

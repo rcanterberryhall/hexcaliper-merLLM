@@ -809,3 +809,78 @@ tr:hover td { background: #1c2330; }
   .plans-side { border-right: none; border-bottom: 1px solid var(--border);
                 padding-right: 0; padding-bottom: 12px; max-height: 40vh; }
 }
+
+.plans-doc-tools { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+
+.plans-progress {
+  color: var(--green);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+}
+
+.plans-tool {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.plans-tool:hover { color: var(--text); background: var(--surface); }
+
+.plans-body.raw {
+  white-space: pre-wrap;
+  font-family: monospace;
+  font-size: 12.5px;
+  max-width: none;
+}
+
+.plans-body li.plans-task { list-style: none; margin-left: -18px; }
+.plans-body li.plans-task input { margin-right: 7px; }
+
+#plans-body pre { position: relative; }
+.plans-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s;
+}
+#plans-body pre:hover .plans-copy { opacity: 1; }
+.plans-copy:hover { color: var(--text); }
+
+.plans-note { color: var(--yellow); font-size: 12px; }
+
+.plans-toc {
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+  font-size: 12px;
+}
+.plans-toc-head {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.plans-toc-link {
+  display: block;
+  padding: 2px 0;
+  color: var(--muted);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plans-toc-link.lvl-h3 { padding-left: 10px; font-size: 11.5px; }
+.plans-toc-link:hover  { color: var(--text); }
+.plans-toc-link.active { color: var(--accent); }
