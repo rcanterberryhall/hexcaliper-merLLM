@@ -308,3 +308,59 @@ def test_title_short_file_with_trailing_newline_control(monkeypatch, plans):
     title = index["havelock-plans/2026-03-03-short-h1-with-newline-design.md"]["title"]
     # Must find the H1
     assert title == "Real Title"
+
+
+@pytest.fixture
+def client(plans, tmp_path, monkeypatch):
+    """TestClient with PLANS_ROOT and DB_PATH pointed at throwaway paths."""
+    monkeypatch.setenv("PLANS_ROOT", str(plans))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                "metrics", "notifications", "docs_index", "scheduler"):
+        sys.modules.pop(mod, None)
+    from fastapi.testclient import TestClient
+    import app as app_mod
+    import docs_index
+    docs_index.reset_cache()
+    return TestClient(app_mod.app, raise_server_exceptions=True)
+
+
+def test_docs_library_endpoint(client):
+    body = client.get("/api/merllm/docs").json()
+    assert body["total"] == 5
+    assert body["apps"][0]["app"] == "havelock"
+    assert body["apps"][0]["count"] == 2
+    titles = [d["title"] for d in body["apps"][0]["docs"]]
+    assert "Parser Extract/Build Decoupling — Plan 56" in titles
+
+
+def test_docs_content_endpoint(client):
+    resp = client.get("/api/merllm/docs/content",
+                      params={"rel": "soonstone-plans/soonstone_roadmap.md"})
+    assert resp.status_code == 200
+    assert resp.json()["markdown"] == "# Soonstone Roadmap\n"
+
+
+@pytest.mark.parametrize("rel", [
+    "../../etc/passwd",
+    "havelock-plans/../../etc/passwd",
+    "hexcaliper-havelock/README.md",
+    "havelock-plans/nope.md",
+])
+def test_docs_content_rejects_traversal(client, rel):
+    resp = client.get("/api/merllm/docs/content", params={"rel": rel})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Unknown document"
+
+
+def test_docs_library_503_when_not_mounted(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLANS_ROOT", str(tmp_path / "absent"))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    for mod in ("app", "db", "config", "queue_manager", "gpu_router",
+                "metrics", "notifications", "docs_index", "scheduler"):
+        sys.modules.pop(mod, None)
+    from fastapi.testclient import TestClient
+    import app as app_mod
+    resp = TestClient(app_mod.app).get("/api/merllm/docs")
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Plans directory not mounted"
