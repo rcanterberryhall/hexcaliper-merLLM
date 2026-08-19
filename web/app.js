@@ -4,7 +4,9 @@
 
 // Activate a tab by name (the button's data-tab). Unknown names fall back to
 // "overview" so a stale/garbage hash never leaves the UI with no tab showing.
-function activateTab(name) {
+// `rest` carries any remaining hash segments — the Plans tab uses it to deep
+// link a specific document; every other tab ignores it.
+function activateTab(name, rest) {
   const btn = document.querySelector(`nav button[data-tab="${name}"]`);
   if (!btn) { if (name !== "overview") activateTab("overview"); return; }
 
@@ -13,6 +15,7 @@ function activateTab(name) {
   btn.classList.add("active");
   document.getElementById("tab-" + name).classList.add("active");
   if (name === "metrics") loadMetricsCharts().catch(() => {});
+  if (name === "plans")   initPlans(rest);
 }
 
 document.querySelectorAll("nav button").forEach(btn => {
@@ -20,14 +23,17 @@ document.querySelectorAll("nav button").forEach(btn => {
     const tab = btn.dataset.tab;
     activateTab(tab);
     // URL hash is the source of truth for the current view, so a refresh (or a
-    // shared link, or the Back button) lands on the same tab.
+    // shared link, or the Back button) lands on the same tab. Clicking a tab
+    // you are already on drops any deep-link segments and resets the view.
     if (location.hash.slice(1) !== tab) location.hash = tab;
   });
 });
 
-// Restore the tab from the URL hash on load, and follow Back/forward + deep links.
+// Restore the tab from the URL hash on load, and follow Back/forward + deep
+// links. The first "/" segment is the tab; the remainder is tab-specific.
 function initTabFromHash() {
-  activateTab(location.hash.slice(1) || "overview");
+  const parts = location.hash.slice(1).split("/");
+  activateTab(parts[0] || "overview", parts.slice(1).join("/"));
 }
 window.addEventListener("hashchange", initTabFromHash);
 initTabFromHash();
@@ -1616,3 +1622,372 @@ loadQueue();
 loadBatchJobs();
 loadFans().catch(() => {});
 startPolling();
+
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+// `var`, not `let`, is load-bearing here. initTabFromHash() runs inline during
+// script evaluation — before this section is reached — so on a "#plans" deep
+// link activateTab calls initPlans while these declarations are still ahead of
+// the interpreter. `var` hoists to undefined; `let` would throw a TDZ
+// ReferenceError and leave the page blank.
+var _plansLibrary = null;   // [{app, dir, count, docs}]
+var _plansIndex   = {};     // rel -> meta, for deep links and cross-doc links
+var _plansOpen    = null;   // rel of the document currently displayed
+var _plansRaw     = "";     // markdown source of the doc currently displayed; the raw toggle reads it
+var _plansLoading = false;  // true while the initial library fetch is in flight — guards
+                             // against a single Plans-tab click running initPlans twice
+                             // (once via the direct activateTab call, once via the
+                             // hashchange it queues) and firing two concurrent fetches.
+var _plansPendingRest;      // rest segment from a call that arrived while a load was
+                             // already in flight, honoured once that load resolves so a
+                             // deep link is never silently dropped by the guard above.
+
+const PLANS_GLYPH = { design: "◆", plan: "▸", requirements: "■", other: "·" };
+
+// Load the library once per page load, then honour any deep-linked document.
+async function initPlans(rest) {
+  if (!_plansLibrary) {
+    if (rest) _plansPendingRest = rest;
+    if (_plansLoading) return;   // a fetch is already in flight; the pending rest
+                                  // above (if any) is honoured when it resolves
+    _plansLoading = true;
+    const tree = document.getElementById("plans-tree");
+    try {
+      const resp = await fetch("/api/merllm/docs");
+      if (resp.status === 503) {
+        tree.innerHTML = '<p class="plans-empty">Plans directory not mounted. ' +
+                         'Add the <code>/plans</code> bind mount and recreate ' +
+                         'the API container.</p>';
+        return;
+      }
+      const body = await resp.json();
+      _plansLibrary = body.apps;
+      _plansIndex = {};
+      body.apps.forEach(a => a.docs.forEach(d => { _plansIndex[d.rel] = d; }));
+      renderPlansTree();
+      interceptDocLinks();   // delegated listener on #plans-body — attach exactly once
+    } catch (err) {
+      tree.innerHTML = '<p class="plans-empty">Could not load the plans library.</p>';
+      return;
+    } finally {
+      _plansLoading = false;
+    }
+    rest = _plansPendingRest;
+    _plansPendingRest = undefined;
+  }
+  if (!_plansLibrary) return;   // library never loaded — nothing to open
+  if (rest && rest !== _plansOpen) {
+    openDoc(rest);
+  } else if (!rest && _plansOpen) {
+    // Clicking the Plans nav button while already on it resets the hash to
+    // #plans; honour that by returning to the library view with nothing open.
+    resetPlansView();
+  }
+}
+
+// Return the reading pane to its initial "nothing selected" state.
+function resetPlansView() {
+  document.getElementById("plans-title").textContent = "Select a document";
+  document.getElementById("plans-meta").textContent = "";
+  document.getElementById("plans-progress").textContent = "";
+  document.getElementById("plans-raw-toggle").textContent = "Raw";
+  const body = document.getElementById("plans-body");
+  body.textContent = "";
+  body.classList.remove("raw");
+  document.getElementById("plans-toc").innerHTML = "";
+  if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
+  _plansOpen = null;
+  _plansRaw = "";
+  renderPlansTree();   // repaint so no sidebar row stays highlighted
+}
+
+// Which type chips are currently on.
+function activePlanTypes() {
+  return Array.from(document.querySelectorAll("#plans-chips .chip.active"))
+              .map(c => c.dataset.type);
+}
+
+// Rebuild the sidebar from the library, applying the search text and chips.
+// Only the app holding the newest document is expanded on first paint.
+function renderPlansTree() {
+  if (!_plansLibrary) return;   // library never loaded (503 or fetch failure) — the
+                                 // search input and chips are bound at script eval,
+                                 // independent of load success, so this can fire early
+  const query = document.getElementById("plans-search").value.trim().toLowerCase();
+  const types = activePlanTypes();
+  const tree  = document.getElementById("plans-tree");
+  const newestApp = _plansLibrary
+        .map(a => ({ app: a.app, date: (a.docs[0] || {}).date || "" }))
+        .sort((x, y) => y.date.localeCompare(x.date))[0] || {};
+
+  tree.innerHTML = "";
+  _plansLibrary.forEach(entry => {
+    const docs = entry.docs.filter(d =>
+      types.includes(d.type) && (!query || d.title.toLowerCase().includes(query)));
+    if (!docs.length) return;
+
+    const group = document.createElement("details");
+    // Searching expands everything, so matches are never hidden in a collapsed group.
+    group.open = !!query || entry.app === newestApp.app;
+
+    const summary = document.createElement("summary");
+    summary.innerHTML = `<span>${esc(entry.app)}</span><span class="plans-count">${docs.length}</span>`;
+    group.appendChild(summary);
+
+    docs.forEach(doc => {
+      const row = document.createElement("button");
+      row.className = "plans-row" + (doc.rel === _plansOpen ? " active" : "");
+      row.dataset.rel = doc.rel;
+      row.title = doc.title;
+      const when = doc.date ? doc.date.slice(5) : "  —  ";
+      row.innerHTML = `<span class="plans-date">${esc(when)}</span>` +
+                      `<span class="plans-glyph">${esc(PLANS_GLYPH[doc.type])}</span>` +
+                      `<span class="plans-row-title">${esc(doc.title)}</span>`;
+      row.addEventListener("click", () => {
+        const target = "plans/" + doc.rel;
+        // A failed open leaves the hash already pointing at this document, so
+        // re-assigning it fires no hashchange — call openDoc directly so a
+        // retry click on the same row actually does something.
+        if (location.hash.slice(1) === target) openDoc(doc.rel);
+        else location.hash = target;
+      });
+      group.appendChild(row);
+    });
+    tree.appendChild(group);
+  });
+
+  if (!tree.children.length) {
+    tree.innerHTML = '<p class="plans-empty">No documents match.</p>';
+  }
+}
+
+document.getElementById("plans-search")
+        .addEventListener("input", () => renderPlansTree());
+
+document.querySelectorAll("#plans-chips .chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    chip.classList.toggle("active");
+    renderPlansTree();
+  });
+});
+
+// Parse → sanitise → inject → highlight. Sanitising is not optional: these
+// documents are written by agent sessions and pasted from many sources.
+// marked 12.0.2 removed the headerIds/mangle options (they're silently
+// ignored, not warned on, if passed — verified empirically) so headings never
+// get an id here; the TOC below supplies its own "sec-N" fallback for that.
+function renderMarkdown(md, el) {
+  marked.setOptions({ gfm: true, breaks: false });
+  el.innerHTML = DOMPurify.sanitize(marked.parse(md));
+  try {
+    // Highlighting is cosmetic. A broken/missing hljs must not throw here and
+    // discard an already-successful parse + sanitise into the CDN-failure
+    // fallback — that fallback is for when rendering itself is unavailable.
+    el.querySelectorAll("pre code").forEach(block => hljs.highlightElement(block));
+  } catch (err) {
+    // Leave the unhighlighted-but-otherwise-correct render in place.
+  }
+}
+
+// Fetch and display one document.
+async function openDoc(rel) {
+  const bodyEl = document.getElementById("plans-body");
+  let doc;
+  try {
+    const resp = await fetch("/api/merllm/docs/content?rel=" + encodeURIComponent(rel));
+    if (!resp.ok) {
+      throw new Error(resp.status === 404 ? "not found" : "request failed (" + resp.status + ")");
+    }
+    doc = await resp.json();
+  } catch (err) {
+    document.getElementById("plans-title").textContent = "Could not open document";
+    document.getElementById("plans-meta").textContent = rel + " — " + err.message;
+    bodyEl.textContent = "";
+    _plansOpen = null;   // nothing is displayed, so a retry must be possible
+    _plansRaw = "";      // clear the previous document's source too, or a raw
+                          // toggle would show stale content for a failed request
+    renderPlansTree();   // drop any stale row highlight
+    return;
+  }
+  _plansOpen = rel;
+  document.getElementById("plans-title").textContent = doc.title;
+  document.getElementById("plans-meta").textContent =
+    `${doc.app} · ${doc.type}${doc.date ? " · " + doc.date : ""} · ${Math.round(doc.size / 1024)} KB`;
+  _plansRaw = doc.markdown;
+  try {
+    renderMarkdown(doc.markdown, bodyEl);
+    bodyEl.classList.remove("raw");
+    document.getElementById("plans-raw-toggle").textContent = "Raw";
+  } catch (err) {
+    // marked/DOMPurify unavailable (CDN blocked or offline) — the document is
+    // still worth reading, so fall back to plain source rather than a stale
+    // pane. Add "raw" so .plans-body.raw's pre-wrap/monospace CSS applies —
+    // without it every newline collapses into one run-on paragraph.
+    bodyEl.textContent = doc.markdown;
+    bodyEl.classList.add("raw");
+    document.getElementById("plans-raw-toggle").textContent = "Rendered";
+    document.getElementById("plans-meta").textContent += " — rendering unavailable";
+  }
+  decorateDoc();                           // safe on the plain-text fallback too:
+                                            // no headings/checkboxes/<pre> to find
+  document.getElementById("plans-doc").scrollTop = 0;
+  renderPlansTree();                       // repaint so the active row highlights
+}
+
+var _plansSpy = null;   // IntersectionObserver for the current document; `var` for
+                         // the same hoisting reason as the other _plans* state above.
+
+// Build the contents rail from the rendered h2/h3 headings.
+function buildToc() {
+  const body = document.getElementById("plans-body");
+  const toc  = document.getElementById("plans-toc");
+  const heads = Array.from(body.querySelectorAll("h2, h3"));
+  toc.innerHTML = "";
+  if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
+  if (!heads.length) return;
+
+  toc.innerHTML = '<div class="plans-toc-head">Contents</div>';
+  heads.forEach((head, i) => {
+    if (!head.id) head.id = "sec-" + i;      // marked emits no heading ids at all
+    const link = document.createElement("a");
+    link.href = "#";
+    link.className = "plans-toc-link lvl-" + head.tagName.toLowerCase();
+    link.dataset.target = head.id;
+    link.textContent = head.textContent;
+    link.addEventListener("click", ev => {
+      ev.preventDefault();                    // never let it touch location.hash
+      head.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    toc.appendChild(link);
+  });
+
+  // Highlight the heading nearest the top of the reading pane.
+  _plansSpy = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      toc.querySelectorAll(".plans-toc-link").forEach(a =>
+        a.classList.toggle("active", a.dataset.target === entry.target.id));
+    });
+  }, { root: document.getElementById("plans-doc"), rootMargin: "0px 0px -80% 0px" });
+  heads.forEach(head => _plansSpy.observe(head));
+}
+
+// marked's GFM rendering already emits disabled checkboxes for "- [ ]"; this
+// only adds the per-document tally. Verify the markup rather than assuming it.
+function markTaskProgress() {
+  const body  = document.getElementById("plans-body");
+  const boxes = body.querySelectorAll('input[type="checkbox"]');
+  const label = document.getElementById("plans-progress");
+  if (!boxes.length) { label.textContent = ""; return; }
+  boxes.forEach(box => {
+    box.disabled = true;                       // read-only surface, always
+    box.closest("li")?.classList.add("plans-task");
+  });
+  const done = body.querySelectorAll('input[type="checkbox"]:checked').length;
+  label.textContent = `${done} of ${boxes.length} steps done`;
+}
+
+// A copy button per fenced block, revealed on hover.
+function attachCopyButtons() {
+  document.querySelectorAll("#plans-body pre").forEach(pre => {
+    if (pre.querySelector(".plans-copy")) return;
+    const code = pre.querySelector("code");
+    if (!code) return;   // a <pre> with no <code> child has nothing to copy;
+                          // attaching a button here would throw synchronously
+                          // outside the promise chain and leave it inert
+    const btn = document.createElement("button");
+    btn.className = "plans-copy";
+    btn.textContent = "copy";
+    btn.addEventListener("click", () => {
+      navigator.clipboard.writeText(code.textContent).then(() => {
+        btn.textContent = "copied";
+        setTimeout(() => { btn.textContent = "copy"; }, 1200);
+      }).catch(() => {
+        // Not a secure context (plain HTTP to a LAN IP) or permission denied —
+        // say so rather than claiming success on a clipboard write that failed.
+        btn.textContent = "failed";
+        setTimeout(() => { btn.textContent = "copy"; }, 1200);
+      });
+    });
+    pre.appendChild(btn);
+  });
+}
+
+// Open a linked .md inside the reader when it resolves to an indexed document;
+// otherwise say so rather than letting the link 404 the whole SPA.
+function interceptDocLinks() {
+  document.getElementById("plans-body").addEventListener("click", ev => {
+    const link = ev.target.closest("a");
+    if (!link) return;
+    const href = link.getAttribute("href") || "";
+    // Absolute and protocol-relative links belong to the browser, not the reader.
+    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(href)) return;
+    if (!href.toLowerCase().split("#")[0].endsWith(".md")) return;
+    ev.preventDefault();
+
+    // Resolve relative to the open document's directory.
+    const base = _plansOpen.slice(0, _plansOpen.lastIndexOf("/") + 1);
+    const parts = (base + href.split("#")[0]).split("/");
+    const stack = [];
+    parts.forEach(part => {
+      if (part === "..") stack.pop();
+      else if (part && part !== ".") stack.push(part);
+    });
+    const target = stack.join("/");
+
+    if (_plansIndex[target]) {
+      location.hash = "plans/" + target;
+    } else if (!link.nextElementSibling ||
+               !link.nextElementSibling.classList.contains("plans-note")) {
+      link.insertAdjacentHTML("afterend",
+        '<em class="plans-note"> (outside the plans library)</em>');
+    }
+  }, { once: false });
+}
+
+document.getElementById("plans-raw-toggle").addEventListener("click", () => {
+  if (!_plansOpen) return;   // nothing open — don't toggle into a "raw view of nothing"
+  const body = document.getElementById("plans-body");
+  const raw  = body.classList.toggle("raw");
+  document.getElementById("plans-raw-toggle").textContent = raw ? "Rendered" : "Raw";
+  if (raw) {
+    body.textContent = _plansRaw;
+    document.getElementById("plans-toc").innerHTML = "";
+  } else {
+    try {
+      renderMarkdown(_plansRaw, body);
+      decorateDoc();
+    } catch (err) {
+      // CDN unavailable — still readable as source, but classList.toggle()
+      // already flipped "raw" off and the button already reads "Raw" by this
+      // point, so put both back in sync with the raw content actually shown.
+      body.textContent = _plansRaw;
+      body.classList.add("raw");
+      document.getElementById("plans-raw-toggle").textContent = "Rendered";
+      // The headings this TOC pointed at are now detached (body.textContent
+      // wiped them out), so drop it and stop the scroll-spy observing them —
+      // the same cleanup buildToc performs on its own early-return path.
+      document.getElementById("plans-toc").innerHTML = "";
+      if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
+    }
+  }
+});
+
+document.getElementById("plans-copy-all").addEventListener("click", () => {
+  if (!_plansOpen) return;   // nothing open — don't overwrite the clipboard with ""
+  const btn = document.getElementById("plans-copy-all");
+  navigator.clipboard.writeText(_plansRaw).then(() => {
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = "Copy document"; }, 1200);
+  }).catch(() => {
+    btn.textContent = "failed";
+    setTimeout(() => { btn.textContent = "Copy document"; }, 1200);
+  });
+});
+
+// Everything that decorates a freshly rendered document.
+function decorateDoc() {
+  buildToc();
+  markTaskProgress();
+  attachCopyButtons();
+}

@@ -53,6 +53,7 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
+import docs_index
 import db
 import gpu_router
 import metrics
@@ -1514,6 +1515,40 @@ async def fans_reset_settings():
 async def fans_faults(limit: int = 100):
     """Fault history stored in merLLM DB (does not proxy to fan controller)."""
     return db.list_fan_faults(limit=min(limit, 500))
+
+
+# ── Planning docs ─────────────────────────────────────────────────────────────
+
+
+@app.get("/api/merllm/docs")
+async def docs_library():
+    """List every Markdown document in the mounted <app>-plans directories."""
+    try:
+        index = await asyncio.to_thread(docs_index.build_index)
+    except docs_index.PlansUnavailable:
+        raise HTTPException(status_code=503, detail="Plans directory not mounted")
+    return {
+        "root":         config.PLANS_ROOT,
+        "total":        len(index),
+        "generated_at": time.time(),
+        "apps":         docs_index.as_library(index),
+    }
+
+
+@app.get("/api/merllm/docs/content")
+async def docs_content(rel: str):
+    """Return one document's metadata and raw Markdown.
+
+    ``rel`` is honoured only if it is a key in the current index, so a
+    traversal attempt is indistinguishable from a typo: both are 404.
+    """
+    try:
+        doc = await asyncio.to_thread(docs_index.get_document, rel)
+    except docs_index.PlansUnavailable:
+        raise HTTPException(status_code=503, detail="Plans directory not mounted")
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Unknown document")
+    return doc
 
 
 # ── WebSocket: SSH terminal ───────────────────────────────────────────────────

@@ -24,3 +24,6 @@ data/
 # SSH keys
 *.pem
 *.key
+
+# Superpowers SDD scratch (ledger, briefs, review packages)
+.superpowers/

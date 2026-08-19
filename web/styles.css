@@ -666,3 +666,229 @@ tr:hover td { background: #1c2330; }
 .collapsible-toggle.is-collapsed .collapse-icon {
   transform: rotate(-90deg);
 }
+
+
+/* ── Plans tab ─────────────────────────────────────────────────────────────── */
+
+.plans-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr 220px;
+  gap: 16px;
+  height: calc(100vh - 150px);
+}
+
+.plans-side, .plans-doc, .plans-toc { overflow-y: auto; }
+
+.plans-side {
+  border-right: 1px solid var(--border);
+  padding-right: 12px;
+}
+
+#plans-search {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.plans-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
+
+.plans-chips .chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.plans-chips .chip.active { color: var(--text); border-color: var(--accent); }
+
+.plans-side details       { margin-bottom: 6px; }
+.plans-side summary       { display: flex; justify-content: space-between;
+                            padding: 4px 6px; cursor: pointer; font-weight: 600;
+                            font-size: 13px; }
+.plans-count              { color: var(--muted); font-weight: 400; }
+
+.plans-row {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 6px 3px 14px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.plans-row:hover  { background: var(--surface); color: var(--text); }
+.plans-row.active { background: var(--surface); color: var(--accent); }
+.plans-date       { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.plans-glyph      { flex-shrink: 0; }
+.plans-row-title  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.plans-empty { color: var(--muted); font-size: 12px; padding: 8px 6px; }
+
+.plans-doc-head  { border-bottom: 1px solid var(--border); padding-bottom: 10px;
+                   margin-bottom: 16px; }
+.plans-doc-meta  { color: var(--muted); font-size: 12px; margin-top: 4px; }
+/* Reading typography: the dashboard's 14px/1.5 is tuned for dense tables and
+   is too tight for a 162 KB spec. */
+.plans-body {
+  font-size: 15px;
+  line-height: 1.65;
+  max-width: 78ch;
+  padding-bottom: 40vh;              /* let the last heading scroll to the top */
+}
+
+.plans-body h1, .plans-body h2, .plans-body h3 {
+  margin: 28px 0 10px;
+  line-height: 1.3;
+  scroll-margin-top: 12px;
+}
+.plans-body h1 { font-size: 22px; }
+.plans-body h2 { font-size: 18px; border-bottom: 1px solid var(--border);
+                 padding-bottom: 5px; }
+.plans-body h3 { font-size: 15px; color: var(--muted); }
+
+.plans-body p, .plans-body ul, .plans-body ol { margin-bottom: 14px; }
+.plans-body ul, .plans-body ol { padding-left: 22px; }
+.plans-body li { margin-bottom: 4px; }
+.plans-body a  { color: var(--accent); }
+
+.plans-body blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  margin: 0 0 14px;
+  color: var(--muted);
+}
+
+.plans-body code {
+  background: var(--surface);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13px;
+}
+.plans-body pre {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+  margin-bottom: 14px;
+}
+.plans-body pre code { background: none; padding: 0; font-size: 12.5px; }
+/* highlight.js's github-dark stylesheet ships `pre code.hljs { padding: 1em }`
+   at the same specificity (0,1,2) as the rule above, and it loads AFTER
+   styles.css, so on that tie it wins and double-pads every fenced block on
+   top of the 12px already on .plans-body pre. This rule's extra class
+   (0,2,2) outranks it regardless of load order. github-dark's background
+   lives on the lower-specificity `.hljs` selector (0,1,0), so the rule above
+   already beats it outright — no background override needed here. */
+.plans-body pre code.hljs { padding: 0; }
+
+.plans-body table {
+  border-collapse: collapse;
+  margin-bottom: 14px;
+  display: block;
+  overflow-x: auto;                  /* 251 docs have tables; some are wide */
+}
+.plans-body th, .plans-body td {
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  font-size: 13px;
+  text-align: left;
+}
+.plans-body th { background: var(--surface); }
+.plans-body hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+
+@media (max-width: 1100px) {
+  .plans-grid { grid-template-columns: 260px 1fr; }
+  .plans-toc  { display: none; }
+}
+
+@media (max-width: 800px) {
+  .plans-grid { grid-template-columns: 1fr; height: auto; }
+  .plans-side { border-right: none; border-bottom: 1px solid var(--border);
+                padding-right: 0; padding-bottom: 12px; max-height: 40vh; }
+}
+
+.plans-doc-tools { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+
+.plans-progress {
+  color: var(--green);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+}
+
+.plans-tool {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.plans-tool:hover { color: var(--text); background: var(--surface); }
+
+.plans-body.raw {
+  white-space: pre-wrap;
+  font-family: monospace;
+  font-size: 12.5px;
+  max-width: none;
+}
+
+.plans-body li.plans-task { list-style: none; margin-left: -18px; }
+.plans-body li.plans-task input { margin-right: 7px; }
+
+#plans-body pre { position: relative; }
+.plans-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s;
+}
+#plans-body pre:hover .plans-copy { opacity: 1; }
+.plans-copy:hover { color: var(--text); }
+
+.plans-note { color: var(--yellow); font-size: 12px; }
+
+.plans-toc {
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+  font-size: 12px;
+}
+.plans-toc-head {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.plans-toc-link {
+  display: block;
+  padding: 2px 0;
+  color: var(--muted);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plans-toc-link.lvl-h3 { padding-left: 10px; font-size: 11.5px; }
+.plans-toc-link:hover  { color: var(--text); }
+.plans-toc-link.active { color: var(--accent); }

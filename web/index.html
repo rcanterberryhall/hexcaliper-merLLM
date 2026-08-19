@@ -21,6 +21,7 @@
   <!-- GPU Queue merged into Overview -->
   <button data-tab="metrics">Metrics</button>
   <button data-tab="logs">Logs</button>
+  <button data-tab="plans">Plans</button>
   <button data-tab="terminal">SSH</button>
   <button data-tab="vnc">VNC</button>
   <button data-tab="fans">Fans</button>
@@ -247,6 +248,35 @@
         <button class="btn primary" onclick="fetchLogs()">Fetch</button>
       </div>
       <pre id="log-output" class="log-output">Select a service and click Fetch.</pre>
+    </div>
+  </div>
+
+  <!-- ── Plans ── -->
+  <div id="tab-plans" class="tab">
+    <div class="plans-grid">
+      <aside class="plans-side">
+        <input id="plans-search" type="search" placeholder="Search titles…" autocomplete="off" />
+        <div id="plans-chips" class="plans-chips">
+          <button class="chip active" data-type="design">design</button>
+          <button class="chip active" data-type="plan">plan</button>
+          <button class="chip active" data-type="requirements">req</button>
+          <button class="chip active" data-type="other">other</button>
+        </div>
+        <div id="plans-tree"></div>
+      </aside>
+      <article id="plans-doc" class="plans-doc">
+        <header class="plans-doc-head">
+          <h2 id="plans-title">Select a document</h2>
+          <div id="plans-meta" class="plans-doc-meta"></div>
+          <div class="plans-doc-tools">
+            <span id="plans-progress" class="plans-progress"></span>
+            <button id="plans-raw-toggle" class="plans-tool">Raw</button>
+            <button id="plans-copy-all" class="plans-tool">Copy document</button>
+          </div>
+        </header>
+        <div id="plans-body" class="plans-body"></div>
+      </article>
+      <nav id="plans-toc" class="plans-toc"></nav>
     </div>
   </div>
 
@@ -611,6 +641,12 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
 <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
+<!-- Plans tab: Markdown rendering (pinned; verified 200 on 2026-08-19) -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
 
 <!-- noVNC git source (ES modules) bundled into nginx image at build time -->
 <script type="module">

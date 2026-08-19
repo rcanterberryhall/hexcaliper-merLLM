@@ -42,8 +42,13 @@ services:
       # Comma-separated label=path pairs for additional disks to monitor
       EXTRA_DISK_PATHS: "archive=/mnt/archive"
 
+      # ── Planning docs ────────────────────────────────────────────────────
+      # Read-only view of the workspace; only *-plans dirs are ever indexed.
+      PLANS_ROOT: "/plans"
+
     volumes:
       - merllm-data:/data
+      - /home/lobulus/GitHub:/plans:ro
       - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/local/lib/libnvidia-ml.so.1:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /media/lobulus/Archive:/mnt/archive:ro
