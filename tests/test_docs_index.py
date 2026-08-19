@@ -266,3 +266,45 @@ def test_title_truncated_line_at_boundary_falls_back(monkeypatch, plans):
     # The fallback will be the de-slugged filename, not the truncated H1.
     assert title == "Boundary"
     assert not title.startswith("# This is a very long")
+
+
+def test_title_short_file_no_trailing_newline_case_a(monkeypatch, plans):
+    """Finding 5 case (a): short file, only H1, no trailing newline → must return complete title."""
+    di = _mod(monkeypatch, plans)
+    # Write without trailing newline: pathlib.write_text does not add one by default
+    path = plans / "havelock-plans" / "2026-03-03-short-no-newline-design.md"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Real Title")  # No trailing newline
+
+    index = di.build_index()
+    title = index["havelock-plans/2026-03-03-short-no-newline-design.md"]["title"]
+    # Must not be truncated to "Real Titl"
+    assert title == "Real Title"
+
+
+def test_title_short_file_h1_last_line_no_newline_case_b(monkeypatch, plans):
+    """Finding 5 case (b): short file, H1 as last line, no trailing newline → must find H1, not fallback."""
+    di = _mod(monkeypatch, plans)
+    # Intro text followed by H1 as last line, no trailing newline
+    path = plans / "havelock-plans" / "2026-03-03-short-h1-last-design.md"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Some intro text.\n\n# Real Title")  # No trailing newline after H1
+
+    index = di.build_index()
+    title = index["havelock-plans/2026-03-03-short-h1-last-design.md"]["title"]
+    # Must not fall back to slug; must find the H1
+    assert title == "Real Title"
+
+
+def test_title_short_file_with_trailing_newline_control(monkeypatch, plans):
+    """Finding 5 control: same content but WITH trailing newline should also work."""
+    di = _mod(monkeypatch, plans)
+    # Same as case (b) but WITH trailing newline
+    path = plans / "havelock-plans" / "2026-03-03-short-h1-with-newline-design.md"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Some intro text.\n\n# Real Title\n")  # WITH trailing newline
+
+    index = di.build_index()
+    title = index["havelock-plans/2026-03-03-short-h1-with-newline-design.md"]["title"]
+    # Must find the H1
+    assert title == "Real Title"

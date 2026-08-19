@@ -132,8 +132,9 @@ def read_title(abs_path: str, stem: str) -> str:
     except OSError:
         return fallback_title(stem)
 
-    # Discard any partial final line to avoid truncated titles at the 4096-byte boundary.
-    if head and head[-1] != '\n':
+    # Discard any partial final line only when the read hit the 4096-byte cap.
+    # A short file with no trailing newline is complete and should not be truncated.
+    if len(head) == _TITLE_BYTES and head[-1] != '\n':
         head = head[:head.rfind('\n')]
 
     fence_marker = None
