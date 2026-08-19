@@ -1633,6 +1633,7 @@ startPolling();
 var _plansLibrary = null;   // [{app, dir, count, docs}]
 var _plansIndex   = {};     // rel -> meta, for deep links and cross-doc links
 var _plansOpen    = null;   // rel of the document currently displayed
+var _plansRaw     = "";     // markdown source of the doc currently displayed; Task 7's raw toggle reads it
 
 const PLANS_GLYPH = { design: "◆", plan: "▸", requirements: "■", other: "·" };
 
@@ -1721,7 +1722,18 @@ document.querySelectorAll("#plans-chips .chip").forEach(chip => {
   });
 });
 
-// Fetch and display one document. Task 6 replaces the body rendering.
+// Parse → sanitise → inject → highlight. Sanitising is not optional: these
+// documents are written by agent sessions and pasted from many sources.
+// marked 12.0.2 removed the headerIds/mangle options (they're silently
+// ignored, not warned on, if passed — verified empirically) so headings never
+// get an id here; Task 7's TOC supplies its own "sec-N" fallback for that.
+function renderMarkdown(md, el) {
+  marked.setOptions({ gfm: true, breaks: false });
+  el.innerHTML = DOMPurify.sanitize(marked.parse(md));
+  el.querySelectorAll("pre code").forEach(block => hljs.highlightElement(block));
+}
+
+// Fetch and display one document.
 async function openDoc(rel) {
   const bodyEl = document.getElementById("plans-body");
   let doc;
@@ -1743,7 +1755,8 @@ async function openDoc(rel) {
   document.getElementById("plans-title").textContent = doc.title;
   document.getElementById("plans-meta").textContent =
     `${doc.app} · ${doc.type}${doc.date ? " · " + doc.date : ""} · ${Math.round(doc.size / 1024)} KB`;
-  bodyEl.textContent = doc.markdown;      // replaced by the renderer in Task 6
+  _plansRaw = doc.markdown;
+  renderMarkdown(doc.markdown, bodyEl);
   document.getElementById("plans-doc").scrollTop = 0;
   renderPlansTree();                       // repaint so the active row highlights
 }
