@@ -1524,7 +1524,7 @@ async def fans_faults(limit: int = 100):
 async def docs_library():
     """List every Markdown document in the mounted <app>-plans directories."""
     try:
-        index = docs_index.build_index()
+        index = await asyncio.to_thread(docs_index.build_index)
     except docs_index.PlansUnavailable:
         raise HTTPException(status_code=503, detail="Plans directory not mounted")
     return {
@@ -1543,7 +1543,7 @@ async def docs_content(rel: str):
     traversal attempt is indistinguishable from a typo: both are 404.
     """
     try:
-        doc = docs_index.get_document(rel)
+        doc = await asyncio.to_thread(docs_index.get_document, rel)
     except docs_index.PlansUnavailable:
         raise HTTPException(status_code=503, detail="Plans directory not mounted")
     if doc is None:
