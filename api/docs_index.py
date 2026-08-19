@@ -11,6 +11,7 @@ a temporary directory tree.
 import fnmatch
 import os
 import re
+import threading
 from typing import Optional
 
 import config
@@ -81,9 +82,14 @@ def _walk(base: str, dir_name: str) -> list:
     """Collect indexable Markdown files under one plans directory."""
     found = []
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        # Dot-directories (.git, .pytest_cache, …) are never plans content —
+        # prune them before os.walk descends so nothing under them is indexed.
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         if dirpath[len(base):].count(os.sep) >= config.PLANS_MAX_DEPTH:
             dirnames[:] = []
         for name in sorted(filenames):
+            if name.startswith("."):
+                continue
             if not name.lower().endswith(".md"):
                 continue
             abs_path = os.path.join(dirpath, name)
@@ -103,19 +109,32 @@ def _walk(base: str, dir_name: str) -> list:
     return found
 
 
-# abs_path -> (mtime, size, metadata). Populated by build_index in Task 3.
+# (root, abs_path) -> (mtime, size, metadata). Keying on the root as well as
+# the path keeps two different roots (e.g. a nested test fixture inside a
+# parent fixture) from purging each other's entries. Populated by build_index.
 _CACHE: dict = {}
+
+# Serialises build_index so concurrent callers (both /api/merllm/docs routes
+# run it inside asyncio.to_thread, and the dashboard can fire both at once on
+# a single Plans-tab entry) never mutate _CACHE while another thread iterates
+# it. Held only around build_index's own body — never around the file read in
+# get_document, which does not touch _CACHE at all.
+_CACHE_LOCK = threading.Lock()
 
 
 def reset_cache() -> None:
     """Drop every cached entry. Used by tests to isolate fixture trees."""
-    _CACHE.clear()
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
-# Bytes read from the head of a document when hunting for its H1. Reading a
-# prefix rather than the whole file keeps a full index build cheap even though
-# the largest document in the corpus is 162 KB.
-_TITLE_BYTES = 4096
+# Characters read from the head of a document when hunting for its H1. The
+# file is opened in text mode, so handle.read(n) counts characters, not
+# bytes — this corpus is full of multi-byte em-dashes and box-drawing
+# characters, so the two differ substantially. Reading a prefix rather than
+# the whole file keeps a full index build cheap even though the largest
+# document in the corpus is 162 KB.
+_TITLE_CHARS = 4096
 
 
 def read_title(abs_path: str, stem: str) -> str:
@@ -128,13 +147,13 @@ def read_title(abs_path: str, stem: str) -> str:
     """
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as handle:
-            head = handle.read(_TITLE_BYTES)
+            head = handle.read(_TITLE_CHARS)
     except OSError:
         return fallback_title(stem)
 
-    # Discard any partial final line only when the read hit the 4096-byte cap.
+    # Discard any partial final line only when the read hit the character cap.
     # A short file with no trailing newline is complete and should not be truncated.
-    if len(head) == _TITLE_BYTES and head[-1] != '\n':
+    if len(head) == _TITLE_CHARS and head[-1] != '\n':
         head = head[:head.rfind('\n')]
 
     fence_marker = None
@@ -154,39 +173,49 @@ def read_title(abs_path: str, stem: str) -> str:
 
 
 def build_index(root: Optional[str] = None) -> dict:
-    """Return ``{rel: metadata}``, re-reading only files whose stat changed."""
+    """Return ``{rel: metadata}``, re-reading only files whose stat changed.
+
+    The whole body runs under ``_CACHE_LOCK`` so concurrent callers (both
+    ``/api/merllm/docs`` routes dispatch this onto a worker thread) serialise
+    rather than racing to mutate ``_CACHE`` — including the purge loop below,
+    which iterates ``_CACHE`` and would otherwise be able to observe another
+    thread's concurrent write mid-iteration. The event loop is not blocked by
+    holding the lock here, since callers only ever take it from inside
+    ``asyncio.to_thread``.
+    """
     root = os.path.realpath(root or config.PLANS_ROOT)
-    index, seen = {}, set()
+    with _CACHE_LOCK:
+        index, seen = {}, set()
 
-    for rel, dir_name, abs_path, stat in discover(root):
-        seen.add(abs_path)
-        cache_key = (root, abs_path)
-        cached = _CACHE.get(cache_key)
-        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        for rel, dir_name, abs_path, stat in discover(root):
+            seen.add(abs_path)
+            cache_key = (root, abs_path)
+            cached = _CACHE.get(cache_key)
+            if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+                # Return a shallow copy to prevent caller mutation of the canonical cache.
+                index[rel] = dict(cached[2])
+                continue
+
+            stem = os.path.basename(rel)[: -len(".md")]
+            app = dir_name[: -len(_PLANS_SUFFIX)] if dir_name.endswith(_PLANS_SUFFIX) else dir_name
+            meta = {
+                "rel": rel,
+                "app": app,
+                "dir": dir_name,
+                "title": read_title(abs_path, stem),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                **parse_filename(stem),
+            }
+            _CACHE[cache_key] = (stat.st_mtime, stat.st_size, meta)
             # Return a shallow copy to prevent caller mutation of the canonical cache.
-            index[rel] = dict(cached[2])
-            continue
+            index[rel] = dict(meta)
 
-        stem = os.path.basename(rel)[: -len(".md")]
-        app = dir_name[: -len(_PLANS_SUFFIX)] if dir_name.endswith(_PLANS_SUFFIX) else dir_name
-        meta = {
-            "rel": rel,
-            "app": app,
-            "dir": dir_name,
-            "title": read_title(abs_path, stem),
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-            **parse_filename(stem),
-        }
-        _CACHE[cache_key] = (stat.st_mtime, stat.st_size, meta)
-        # Return a shallow copy to prevent caller mutation of the canonical cache.
-        index[rel] = dict(meta)
-
-    # Drop entries for files that have disappeared from this root, without touching
-    # entries cached under a different root (which is what test fixtures use).
-    for cache_key in [k for k in _CACHE if k[0] == root and k[1] not in seen]:
-        _CACHE.pop(cache_key, None)
-    return index
+        # Drop entries for files that have disappeared from this root, without touching
+        # entries cached under a different root (which is what test fixtures use).
+        for cache_key in [k for k in _CACHE if k[0] == root and k[1] not in seen]:
+            _CACHE.pop(cache_key, None)
+        return index
 
 
 def get_document(rel: str, root: Optional[str] = None) -> Optional[dict]:

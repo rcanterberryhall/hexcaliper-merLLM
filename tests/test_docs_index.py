@@ -85,6 +85,24 @@ def test_discover_excludes_oversized_files(monkeypatch, plans):
     assert not any(r.endswith("huge.md") for r, _d, _p, _s in di.discover())
 
 
+def test_discover_excludes_dot_directories(monkeypatch, plans):
+    """Finding 13: dot-directories (.git, .pytest_cache, …) must never be walked."""
+    cache_dir = plans / "parsival-plans" / ".pytest_cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "README.md").write_text("# Cache Readme\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    rels = [r for r, _d, _p, _s in di.discover()]
+    assert not any(".pytest_cache" in r for r in rels)
+
+
+def test_discover_excludes_dot_files(monkeypatch, plans):
+    """Finding 13: a dot-prefixed Markdown file itself must not be indexed."""
+    (plans / "havelock-plans" / ".hidden.md").write_text("# Hidden\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    rels = [r for r, _d, _p, _s in di.discover()]
+    assert not any(r.endswith(".hidden.md") for r in rels)
+
+
 def test_discover_skips_escaping_symlink(monkeypatch, plans, tmp_path):
     outside = tmp_path.parent / "outside-secret.md"
     outside.write_text("# Secret\n")
@@ -190,6 +208,34 @@ def test_as_library_sorts_undated_last(monkeypatch, plans):
     library = di.as_library(di.build_index())
     soonstone = next(a for a in library if a["app"] == "soonstone")
     assert [d["date"] for d in soonstone["docs"]] == ["2026-09-09", None]
+
+
+def test_multi_hyphen_dir_name_maps_to_full_app_name(monkeypatch, tmp_path):
+    """Finding 14a: `hexcaliper-commons-plans` -> app `hexcaliper-commons`, not `hexcaliper`."""
+    (tmp_path / "hexcaliper-commons-plans").mkdir()
+    (tmp_path / "hexcaliper-commons-plans" / "2026-01-01-test-design.md").write_text(
+        "# Commons Doc\n", encoding="utf-8")
+    di = _mod(monkeypatch, tmp_path)
+    index = di.build_index()
+    meta = index["hexcaliper-commons-plans/2026-01-01-test-design.md"]
+    assert meta["app"] == "hexcaliper-commons"
+    assert meta["dir"] == "hexcaliper-commons-plans"
+
+
+def test_discover_excludes_content_beyond_max_depth(monkeypatch, plans):
+    """Finding 14b: PLANS_MAX_DEPTH must actually bound recursion, not just be
+    satisfied by content sitting within it (the pre-existing depth-2 test proves
+    inclusion, never that the limit excludes anything)."""
+    monkeypatch.setenv("PLANS_MAX_DEPTH", "1")
+    deep_dir = plans / "havelock-plans" / "level1" / "level2"
+    deep_dir.mkdir(parents=True)
+    (deep_dir / "too-deep.md").write_text("# Too Deep\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    rels = [r for r, _d, _p, _s in di.discover()]
+    assert not any(r.endswith("too-deep.md") for r in rels)
+    # Sanity check the fixture's ordinary top-level docs still come through,
+    # so the exclusion above is the depth limit and not a broken fixture.
+    assert any(r.endswith("parser-extract-build.md") for r in rels)
 
 
 def test_build_index_returns_copies_not_cached_objects(monkeypatch, plans):
