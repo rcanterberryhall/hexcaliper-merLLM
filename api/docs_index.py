@@ -123,7 +123,8 @@ def read_title(abs_path: str, stem: str) -> str:
 
     Fenced blocks are tracked because ``# comment`` is ordinary bash, and the
     corpus contains 2,645 bash fences — a naive regex would title documents
-    after a shell comment.
+    after a shell comment. Recognizes both ``` and ~~~ as fence delimiters,
+    tracking which marker opened the fence so they do not cross-close.
     """
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as handle:
@@ -131,12 +132,22 @@ def read_title(abs_path: str, stem: str) -> str:
     except OSError:
         return fallback_title(stem)
 
-    in_fence = False
+    # Discard any partial final line to avoid truncated titles at the 4096-byte boundary.
+    if head and head[-1] != '\n':
+        head = head[:head.rfind('\n')]
+
+    fence_marker = None
     for line in head.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        stripped = line.lstrip()
+        # Track both ``` and ~~~ fence markers, remembering which one opened the fence.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if fence_marker == marker:
+                fence_marker = None
+            elif fence_marker is None:
+                fence_marker = marker
             continue
-        if not in_fence and line.startswith("# "):
+        if not fence_marker and line.startswith("# "):
             return line[2:].strip()
     return fallback_title(stem)
 
@@ -148,9 +159,11 @@ def build_index(root: Optional[str] = None) -> dict:
 
     for rel, dir_name, abs_path, stat in discover(root):
         seen.add(abs_path)
-        cached = _CACHE.get(abs_path)
+        cache_key = (root, abs_path)
+        cached = _CACHE.get(cache_key)
         if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-            index[rel] = cached[2]
+            # Return a shallow copy to prevent caller mutation of the canonical cache.
+            index[rel] = dict(cached[2])
             continue
 
         stem = os.path.basename(rel)[: -len(".md")]
@@ -164,13 +177,14 @@ def build_index(root: Optional[str] = None) -> dict:
             "mtime": stat.st_mtime,
             **parse_filename(stem),
         }
-        _CACHE[abs_path] = (stat.st_mtime, stat.st_size, meta)
-        index[rel] = meta
+        _CACHE[cache_key] = (stat.st_mtime, stat.st_size, meta)
+        # Return a shallow copy to prevent caller mutation of the canonical cache.
+        index[rel] = dict(meta)
 
-    # Drop entries for files that have disappeared, without touching entries
-    # cached under a different root (which is what test fixtures use).
-    for gone in [p for p in _CACHE if p.startswith(root + os.sep) and p not in seen]:
-        _CACHE.pop(gone, None)
+    # Drop entries for files that have disappeared from this root, without touching
+    # entries cached under a different root (which is what test fixtures use).
+    for cache_key in [k for k in _CACHE if k[0] == root and k[1] not in seen]:
+        _CACHE.pop(cache_key, None)
     return index
 
 

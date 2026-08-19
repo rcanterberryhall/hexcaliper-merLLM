@@ -190,3 +190,79 @@ def test_as_library_sorts_undated_last(monkeypatch, plans):
     library = di.as_library(di.build_index())
     soonstone = next(a for a in library if a["app"] == "soonstone")
     assert [d["date"] for d in soonstone["docs"]] == ["2026-09-09", None]
+
+
+def test_build_index_returns_copies_not_cached_objects(monkeypatch, plans):
+    """Finding 1: mutation of returned dict must not poison the cache."""
+    di = _mod(monkeypatch, plans)
+    idx1 = di.build_index()
+    key = "havelock-plans/2026-07-06-plan-56-parser-extract-build.md"
+    original_title = idx1[key]["title"]
+
+    # Mutate the returned dict.
+    idx1[key]["title"] = "HACKED"
+
+    # The cache should be unaffected.
+    idx2 = di.build_index()
+    assert idx2[key]["title"] == original_title
+
+
+def test_cache_keys_by_root_not_just_path(monkeypatch, plans, tmp_path):
+    """Finding 2: nested roots must not purge each other's cache entries."""
+    # Create a nested structure: parent contains child-plans.
+    child_root = plans / "child"
+    child_root.mkdir()
+    (child_root / "child-plans").mkdir()
+    (child_root / "child-plans" / "2026-01-01-test-design.md").write_text(
+        "# Child Doc\n", encoding="utf-8")
+
+    di = _mod(monkeypatch, child_root)
+    idx_child = di.build_index()
+    assert "child-plans/2026-01-01-test-design.md" in idx_child
+
+    # Now build with parent root.
+    di2 = _mod(monkeypatch, plans)
+    idx_parent = di2.build_index()
+
+    # Child's cache should not be purged.
+    di3 = _mod(monkeypatch, child_root)
+    idx_child_again = di3.build_index()
+    assert "child-plans/2026-01-01-test-design.md" in idx_child_again
+
+
+def test_title_respects_tilde_fences(monkeypatch, plans):
+    """Finding 3a: ~~~ fences are recognized like ``` fences."""
+    (plans / "havelock-plans" / "2026-03-03-tilde-fenced-design.md").write_text(
+        "~~~bash\n# not the title\n~~~\n\n# Real Title\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    index = di.build_index()
+    assert index["havelock-plans/2026-03-03-tilde-fenced-design.md"]["title"] == "Real Title"
+
+
+def test_title_tilde_inside_backtick_fence_does_not_close(monkeypatch, plans):
+    """Finding 3b: ~~~ inside ``` does not close the ``` fence."""
+    (plans / "havelock-plans" / "2026-03-03-mixed-fences-design.md").write_text(
+        "```\n~~~\n# not the title\n~~~\n```\n\n# Real Title\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    index = di.build_index()
+    assert index["havelock-plans/2026-03-03-mixed-fences-design.md"]["title"] == "Real Title"
+
+
+def test_title_truncated_line_at_boundary_falls_back(monkeypatch, plans):
+    """Finding 4: H1 straddling the 4096-byte boundary is discarded, not truncated."""
+    # Create a file where line 1 fills most of 4096 bytes, and line 2 is an H1 that spans the cutoff.
+    # We want the H1 to be truncated by the read boundary.
+    di = _mod(monkeypatch, plans)
+    # Create a file with ~4095 bytes of content before an H1 that will be cut off.
+    prefix = "x" * 4090  # leaves ~6 bytes in the 4096-byte window
+    h1_line = "# This is a very long heading that will be cut off at the boundary"
+    content = prefix + "\n" + h1_line + "\n\n# Real Fallback Title\n"
+
+    (plans / "havelock-plans" / "2026-03-03-boundary-design.md").write_text(
+        content, encoding="utf-8")
+    index = di.build_index()
+    # The truncated H1 should not be used; should fall back.
+    title = index["havelock-plans/2026-03-03-boundary-design.md"]["title"]
+    # The fallback will be the de-slugged filename, not the truncated H1.
+    assert title == "Boundary"
+    assert not title.startswith("# This is a very long")
