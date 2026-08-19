@@ -1857,6 +1857,8 @@ function interceptDocLinks() {
     const link = ev.target.closest("a");
     if (!link) return;
     const href = link.getAttribute("href") || "";
+    // Absolute and protocol-relative links belong to the browser, not the reader.
+    if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(href)) return;
     if (!href.toLowerCase().split("#")[0].endsWith(".md")) return;
     ev.preventDefault();
 
@@ -1870,9 +1872,13 @@ function interceptDocLinks() {
     });
     const target = stack.join("/");
 
-    if (_plansIndex[target]) location.hash = "plans/" + target;
-    else link.insertAdjacentHTML("afterend",
-      '<em class="plans-note"> (outside the plans library)</em>');
+    if (_plansIndex[target]) {
+      location.hash = "plans/" + target;
+    } else if (!link.nextElementSibling ||
+               !link.nextElementSibling.classList.contains("plans-note")) {
+      link.insertAdjacentHTML("afterend",
+        '<em class="plans-note"> (outside the plans library)</em>');
+    }
   }, { once: false });
 }
 
@@ -1889,7 +1895,12 @@ document.getElementById("plans-raw-toggle").addEventListener("click", () => {
       renderMarkdown(_plansRaw, body);
       decorateDoc();
     } catch (err) {
-      body.textContent = _plansRaw;   // CDN unavailable — still readable as source
+      // CDN unavailable — still readable as source, but classList.toggle()
+      // already flipped "raw" off and the button already reads "Raw" by this
+      // point, so put both back in sync with the raw content actually shown.
+      body.textContent = _plansRaw;
+      body.classList.add("raw");
+      document.getElementById("plans-raw-toggle").textContent = "Rendered";
     }
   }
 });
