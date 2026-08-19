@@ -1688,7 +1688,7 @@ function renderPlansTree() {
     group.open = !!query || entry.app === newestApp.app;
 
     const summary = document.createElement("summary");
-    summary.innerHTML = `<span>${entry.app}</span><span class="plans-count">${docs.length}</span>`;
+    summary.innerHTML = `<span>${esc(entry.app)}</span><span class="plans-count">${docs.length}</span>`;
     group.appendChild(summary);
 
     docs.forEach(doc => {
@@ -1697,9 +1697,9 @@ function renderPlansTree() {
       row.dataset.rel = doc.rel;
       row.title = doc.title;
       const when = doc.date ? doc.date.slice(5) : "  —  ";
-      row.innerHTML = `<span class="plans-date">${when}</span>` +
-                      `<span class="plans-glyph">${PLANS_GLYPH[doc.type]}</span>` +
-                      `<span class="plans-row-title">${doc.title}</span>`;
+      row.innerHTML = `<span class="plans-date">${esc(when)}</span>` +
+                      `<span class="plans-glyph">${esc(PLANS_GLYPH[doc.type])}</span>` +
+                      `<span class="plans-row-title">${esc(doc.title)}</span>`;
       row.addEventListener("click", () => { location.hash = "plans/" + doc.rel; });
       group.appendChild(row);
     });
@@ -1724,14 +1724,21 @@ document.querySelectorAll("#plans-chips .chip").forEach(chip => {
 // Fetch and display one document. Task 6 replaces the body rendering.
 async function openDoc(rel) {
   const bodyEl = document.getElementById("plans-body");
-  const resp = await fetch("/api/merllm/docs/content?rel=" + encodeURIComponent(rel));
-  if (!resp.ok) {
-    document.getElementById("plans-title").textContent = "Document not found";
-    document.getElementById("plans-meta").textContent = rel;
+  let doc;
+  try {
+    const resp = await fetch("/api/merllm/docs/content?rel=" + encodeURIComponent(rel));
+    if (!resp.ok) {
+      throw new Error(resp.status === 404 ? "not found" : "request failed (" + resp.status + ")");
+    }
+    doc = await resp.json();
+  } catch (err) {
+    document.getElementById("plans-title").textContent = "Could not open document";
+    document.getElementById("plans-meta").textContent = rel + " — " + err.message;
     bodyEl.textContent = "";
+    _plansOpen = null;   // nothing is displayed, so a retry must be possible
+    renderPlansTree();   // drop any stale row highlight
     return;
   }
-  const doc = await resp.json();
   _plansOpen = rel;
   document.getElementById("plans-title").textContent = doc.title;
   document.getElementById("plans-meta").textContent =
