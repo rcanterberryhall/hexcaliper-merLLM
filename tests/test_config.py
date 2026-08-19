@@ -79,3 +79,17 @@ def test_apply_overrides_none_value():
     original = cfg.OLLAMA_0_URL
     cfg.apply_overrides({"ollama_0_url": None})
     assert cfg.OLLAMA_0_URL == original
+
+
+def test_plans_defaults():
+    cfg = _fresh_config()
+    assert cfg.PLANS_ROOT == "/plans"
+    assert cfg.PLANS_DIR_GLOB == "*-plans"
+    assert cfg.PLANS_MAX_BYTES == 2097152
+    assert cfg.PLANS_MAX_DEPTH == 3
+
+
+def test_plans_env_overrides():
+    cfg = _fresh_config(PLANS_ROOT="/mnt/docs", PLANS_MAX_BYTES="4096")
+    assert cfg.PLANS_ROOT == "/mnt/docs"
+    assert cfg.PLANS_MAX_BYTES == 4096

@@ -122,6 +122,16 @@ VNC_PORT = int(_get("VNC_PORT", "5900"))
 # URL of the iDRAC fan controller REST API (api_server.py on port 8080).
 FAN_CONTROLLER_URL = _get("FAN_CONTROLLER_URL", "http://host.docker.internal:8080")
 
+# ── Planning docs ─────────────────────────────────────────────────────────────
+
+# Host directory (mounted read-only) holding the sibling <app>-plans/ dirs.
+# Not hot-reloadable: changing it cannot take effect without a new bind mount,
+# so it is deliberately absent from the apply_overrides map.
+PLANS_ROOT      = _get("PLANS_ROOT", "/plans")
+PLANS_DIR_GLOB  = _get("PLANS_DIR_GLOB", "*-plans")
+PLANS_MAX_BYTES = int(_get("PLANS_MAX_BYTES", "2097152"))   # 2 MB per document
+PLANS_MAX_DEPTH = int(_get("PLANS_MAX_DEPTH", "3"))
+
 # ── Notifications ─────────────────────────────────────────────────────────────
 
 # Webhook URL to POST batch job completion payloads to.  Leave empty to disable.
