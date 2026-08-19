@@ -110,3 +110,105 @@ _CACHE: dict = {}
 def reset_cache() -> None:
     """Drop every cached entry. Used by tests to isolate fixture trees."""
     _CACHE.clear()
+
+
+# Bytes read from the head of a document when hunting for its H1. Reading a
+# prefix rather than the whole file keeps a full index build cheap even though
+# the largest document in the corpus is 162 KB.
+_TITLE_BYTES = 4096
+
+
+def read_title(abs_path: str, stem: str) -> str:
+    """Return the document's first H1, or a de-slugged filename if it has none.
+
+    Fenced blocks are tracked because ``# comment`` is ordinary bash, and the
+    corpus contains 2,645 bash fences — a naive regex would title documents
+    after a shell comment.
+    """
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as handle:
+            head = handle.read(_TITLE_BYTES)
+    except OSError:
+        return fallback_title(stem)
+
+    in_fence = False
+    for line in head.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and line.startswith("# "):
+            return line[2:].strip()
+    return fallback_title(stem)
+
+
+def build_index(root: Optional[str] = None) -> dict:
+    """Return ``{rel: metadata}``, re-reading only files whose stat changed."""
+    root = os.path.realpath(root or config.PLANS_ROOT)
+    index, seen = {}, set()
+
+    for rel, dir_name, abs_path, stat in discover(root):
+        seen.add(abs_path)
+        cached = _CACHE.get(abs_path)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            index[rel] = cached[2]
+            continue
+
+        stem = os.path.basename(rel)[: -len(".md")]
+        app = dir_name[: -len(_PLANS_SUFFIX)] if dir_name.endswith(_PLANS_SUFFIX) else dir_name
+        meta = {
+            "rel": rel,
+            "app": app,
+            "dir": dir_name,
+            "title": read_title(abs_path, stem),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            **parse_filename(stem),
+        }
+        _CACHE[abs_path] = (stat.st_mtime, stat.st_size, meta)
+        index[rel] = meta
+
+    # Drop entries for files that have disappeared, without touching entries
+    # cached under a different root (which is what test fixtures use).
+    for gone in [p for p in _CACHE if p.startswith(root + os.sep) and p not in seen]:
+        _CACHE.pop(gone, None)
+    return index
+
+
+def get_document(rel: str, root: Optional[str] = None) -> Optional[dict]:
+    """Return metadata plus raw Markdown, or None when ``rel`` is not indexed.
+
+    ``rel`` is used to touch the filesystem only after it is confirmed to be a
+    key in the freshly built index, so traversal is structurally impossible
+    rather than filtered: ``../../etc/passwd`` is not a key, so it is a miss.
+    """
+    meta = build_index(root).get(rel)
+    if meta is None:
+        return None
+
+    root = os.path.realpath(root or config.PLANS_ROOT)
+    abs_path = os.path.join(root, rel)
+    if not os.path.realpath(abs_path).startswith(root + os.sep):
+        return None
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    return {**meta, "markdown": text}
+
+
+def as_library(index: dict) -> list:
+    """Group the index per app: apps by document count, documents newest first."""
+    apps: dict = {}
+    for meta in index.values():
+        apps.setdefault(meta["app"], []).append(meta)
+
+    library = []
+    for app, docs in apps.items():
+        docs.sort(key=lambda m: m["rel"])
+        # Stable, so the rel ordering above survives as the final tiebreak.
+        docs.sort(key=lambda m: (m["date"] or "", m["plan_no"] or 0), reverse=True)
+        library.append({"app": app, "dir": docs[0]["dir"], "count": len(docs), "docs": docs})
+
+    library.sort(key=lambda entry: (-entry["count"], entry["app"]))
+    return library

@@ -97,3 +97,96 @@ def test_discover_raises_when_root_missing(monkeypatch, tmp_path):
     di = _mod(monkeypatch, tmp_path / "does-not-exist")
     with pytest.raises(di.PlansUnavailable):
         di.discover()
+
+
+def test_title_comes_from_first_h1(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    index = di.build_index()
+    meta = index["havelock-plans/2026-07-06-plan-56-parser-extract-build.md"]
+    assert meta["title"] == "Parser Extract/Build Decoupling — Plan 56"
+    assert meta["app"] == "havelock"
+    assert meta["dir"] == "havelock-plans"
+    assert meta["type"] == "plan"
+    assert meta["plan_no"] == 56
+
+
+def test_title_falls_back_when_no_h1(monkeypatch, plans):
+    (plans / "havelock-plans" / "2026-02-02-no-heading-design.md").write_text(
+        "Just prose, no heading at all.\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    index = di.build_index()
+    assert index["havelock-plans/2026-02-02-no-heading-design.md"]["title"] == "No heading"
+
+
+def test_title_ignores_hash_inside_code_fence(monkeypatch, plans):
+    (plans / "havelock-plans" / "2026-03-03-fenced-design.md").write_text(
+        "```bash\n# not the title\n```\n\n# Real Title\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    index = di.build_index()
+    assert index["havelock-plans/2026-03-03-fenced-design.md"]["title"] == "Real Title"
+
+
+def test_get_document_returns_markdown(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    doc = di.get_document("soonstone-plans/soonstone_roadmap.md")
+    assert doc["markdown"] == "# Soonstone Roadmap\n"
+    assert doc["app"] == "soonstone"
+
+
+@pytest.mark.parametrize("rel", [
+    "../../etc/passwd",
+    "havelock-plans/../../etc/passwd",
+    "havelock-plans/does-not-exist.md",
+    "hexcaliper-havelock/README.md",
+])
+def test_get_document_rejects_unindexed_paths(monkeypatch, plans, rel):
+    di = _mod(monkeypatch, plans)
+    assert di.get_document(rel) is None
+
+
+def test_cache_avoids_rereading_unchanged_files(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    di.build_index()
+    calls = []
+    real_read_title = di.read_title
+    monkeypatch.setattr(di, "read_title",
+                        lambda p, s: (calls.append(p), real_read_title(p, s))[1])
+    di.build_index()
+    assert calls == []
+
+
+def test_cache_refreshes_changed_file(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    di.build_index()
+    target = plans / "soonstone-plans" / "soonstone_roadmap.md"
+    target.write_text("# Renamed Roadmap\n", encoding="utf-8")
+    os.utime(target, (target.stat().st_atime + 10, target.stat().st_mtime + 10))
+    index = di.build_index()
+    assert index["soonstone-plans/soonstone_roadmap.md"]["title"] == "Renamed Roadmap"
+
+
+def test_deleted_file_leaves_the_index(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    assert "soonstone-plans/soonstone_roadmap.md" in di.build_index()
+    (plans / "soonstone-plans" / "soonstone_roadmap.md").unlink()
+    assert "soonstone-plans/soonstone_roadmap.md" not in di.build_index()
+
+
+def test_as_library_orders_apps_by_count_and_docs_newest_first(monkeypatch, plans):
+    di = _mod(monkeypatch, plans)
+    library = di.as_library(di.build_index())
+    assert [a["app"] for a in library][0] == "havelock"      # 2 docs, the most
+    assert library[0]["count"] == 2
+    dates = [d["date"] for d in library[0]["docs"]]
+    assert dates == ["2026-07-06", "2026-07-05"]             # newest first
+    soonstone = next(a for a in library if a["app"] == "soonstone")
+    assert soonstone["docs"][0]["date"] is None              # undated docs still listed
+
+
+def test_as_library_sorts_undated_last(monkeypatch, plans):
+    (plans / "soonstone-plans" / "2026-09-09-late-design.md").write_text(
+        "# Late\n", encoding="utf-8")
+    di = _mod(monkeypatch, plans)
+    library = di.as_library(di.build_index())
+    soonstone = next(a for a in library if a["app"] == "soonstone")
+    assert [d["date"] for d in soonstone["docs"]] == ["2026-09-09", None]
