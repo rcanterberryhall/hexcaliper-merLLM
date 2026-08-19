@@ -1748,6 +1748,8 @@ async function openDoc(rel) {
     document.getElementById("plans-meta").textContent = rel + " — " + err.message;
     bodyEl.textContent = "";
     _plansOpen = null;   // nothing is displayed, so a retry must be possible
+    _plansRaw = "";      // clear the previous document's source too, or a raw
+                          // toggle would show stale content for a failed request
     renderPlansTree();   // drop any stale row highlight
     return;
   }
@@ -1756,7 +1758,14 @@ async function openDoc(rel) {
   document.getElementById("plans-meta").textContent =
     `${doc.app} · ${doc.type}${doc.date ? " · " + doc.date : ""} · ${Math.round(doc.size / 1024)} KB`;
   _plansRaw = doc.markdown;
-  renderMarkdown(doc.markdown, bodyEl);
+  try {
+    renderMarkdown(doc.markdown, bodyEl);
+  } catch (err) {
+    // marked/DOMPurify/hljs unavailable (CDN blocked or offline) — the document is
+    // still worth reading, so fall back to plain source rather than a stale pane.
+    bodyEl.textContent = doc.markdown;
+    document.getElementById("plans-meta").textContent += " — rendering unavailable";
+  }
   document.getElementById("plans-doc").scrollTop = 0;
   renderPlansTree();                       // repaint so the active row highlights
 }
