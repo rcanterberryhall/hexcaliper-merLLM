@@ -758,6 +758,153 @@ async def proxy_ps():
     return results
 
 
+# ── OpenAI-compatible proxy (/v1) ─────────────────────────────────────────────
+# hermes-agent speaks the OpenAI Chat Completions wire format and nothing
+# else, so agent traffic can only stay behind this dispatcher if merLLM
+# answers /v1. Ollama serves /v1 natively on both instances; these routes
+# add queueing, not translation. OpenAI SSE frames are relayed as opaque
+# bytes — the per-line token ticker speaks NDJSON and deliberately does
+# not learn a second framing (lancellmot-plans, plan 1).
+
+
+def _openai_timeout_response() -> JSONResponse:
+    """503 in the OpenAI error-body shape for a CHAT queue timeout."""
+    return JSONResponse(
+        status_code=503,
+        content={"error": {
+            "message": "GPU busy — timed out waiting for a slot",
+            "type": "server_error",
+            "code": "gpu_queue_timeout",
+        }},
+        headers={"Retry-After": str(config.INTERACTIVE_QUEUE_TIMEOUT)},
+    )
+
+
+async def _generate_sse_stream(target: str, body: dict, on_done=None):
+    """Relay ``{target}/v1/chat/completions`` bytes verbatim.
+
+    Same shape as ``_generate_stream`` minus the NDJSON line parsing:
+    activity shows model+endpoint for the call duration, but the tok
+    counter does not tick on this path.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(config.PROXY_READ_TIMEOUT_SECONDS),
+        ) as client:
+            async with client.stream("POST", f"{target}/v1/chat/completions",
+                                     json=body) as resp:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+    finally:
+        _activity_clear(target)
+        if on_done:
+            on_done()
+
+
+async def _queued_sse_stream(body: dict,
+                             tracking_id: str) -> StreamingResponse:
+    """Streaming /v1 proxy backed by the FSM dispatcher.
+
+    Mirrors ``_queued_stream``'s lifecycle exactly, with SSE-legal
+    framing: pre-dispatch keepalive is an SSE comment line (clients
+    ignore ``:``-prefixed lines per the SSE spec), and a queue timeout
+    becomes an error data frame followed by ``[DONE]`` since the
+    response headers are already on the wire.
+    """
+    async def generate():
+        dispatch_task = asyncio.create_task(
+            queue_manager.wait_for_dispatch(tracking_id)
+        )
+        waiting_since = time.time()
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {dispatch_task},
+                    timeout=config.QUEUE_HEARTBEAT_INTERVAL_SECONDS,
+                )
+                if dispatch_task in done:
+                    break
+                yield (f": queued {int(time.time() - waiting_since)}s\n\n"
+                       ).encode()
+            target = dispatch_task.result()
+        except queue_manager.DispatchTimeout:
+            err = {"error": {
+                "message": "GPU busy — timed out waiting for a slot",
+                "type": "server_error",
+                "code": "gpu_queue_timeout",
+            }}
+            yield f"data: {json.dumps(err)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+            return
+        except BaseException:
+            if not dispatch_task.done():
+                dispatch_task.cancel()
+            raise
+
+        _activity_set(target, body.get("model", ""), "/v1/chat/completions")
+        released = False
+        try:
+            def _on_done():
+                nonlocal released
+                _activity_clear(target)
+                queue_manager.release(tracking_id)
+                released = True
+
+            async for chunk in _generate_sse_stream(target, body, _on_done):
+                yield chunk
+        except BaseException as exc:
+            _activity_clear(target)
+            if not released:
+                queue_manager.fail_request(tracking_id, str(exc))
+            raise
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/v1/chat/completions")
+async def proxy_v1_chat_completions(request: Request):
+    """OpenAI-compatible chat completions through the late-binding dispatcher.
+
+    Priority is parsed strictly by ``priority_from_name``: a missing or
+    unknown ``X-Priority`` falls to BACKGROUND. This intentionally skips
+    ``_priority``'s missing→CHAT compatibility default — that exists for
+    native-route clients that predate the header, and this route has no
+    such clients (hermes always sends ``X-Priority: chat``).
+
+    ``stream`` defaults to False per the OpenAI contract (the native
+    Ollama routes default it to True).
+    """
+    body = await request.json()
+    model = body.get("model", "")
+    priority = queue_manager.priority_from_name(
+        request.headers.get("x-priority"))
+    source = _source(request)
+    stream = bool(body.get("stream", False))
+
+    tid = queue_manager.track_request(source, "chat_completions", model,
+                                      priority)
+
+    if stream:
+        return await _queued_sse_stream(body, tid)
+    try:
+        async with queue_manager.dispatched(tid) as target:
+            resp = await _proxy(target, "/v1/chat/completions", body)
+            gpu_router.record_activity(target)
+            return resp
+    except queue_manager.DispatchTimeout:
+        return _openai_timeout_response()
+
+
+@app.get("/v1/models")
+async def proxy_v1_models():
+    """Relay Ollama-0's OpenAI-format model list (shared model store).
+
+    hermes's provider layer lists models at startup; same single-instance
+    convention as ``proxy_tags``.
+    """
+    return await _proxy_get(config.OLLAMA_0_URL, "/v1/models")
+
+
 # ── merLLM status and control ─────────────────────────────────────────────────
 
 
