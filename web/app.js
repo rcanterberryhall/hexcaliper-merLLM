@@ -598,9 +598,24 @@ const _sortState = {};
 let _lastQueueData = [];
 let _lastBatchData = [];
 
+// A header's sort key is not always the key the row stores its value under.
+// active_queue() gives a running request `elapsed_sec` and a queued one
+// `waiting_sec`, never both, and renderQueueTable shows whichever is present in
+// the one Elapsed cell — so the comparator has to resolve it the same way, or
+// every queued row arrives with no value, compares equal to every other queued
+// row, and clumps together regardless of how long it has actually been waiting.
+const _SORT_VALUE = {
+  elapsed_sec: r => (r.elapsed_sec != null ? r.elapsed_sec : r.waiting_sec),
+};
+
+function _sortValue(row, key) {
+  const resolve = _SORT_VALUE[key];
+  return resolve ? resolve(row) : row[key];
+}
+
 function _sortRows(rows, key, dir) {
   return [...rows].sort((a, b) => {
-    let va = a[key], vb = b[key];
+    let va = _sortValue(a, key), vb = _sortValue(b, key);
     if (va == null) va = "";
     if (vb == null) vb = "";
     if (typeof va === "number" && typeof vb === "number") return dir * (va - vb);
