@@ -367,7 +367,21 @@
 
       <div class="card">
         <h2>Fan Control</h2>
+        <!-- Only the override banner and the input fields are rendered by
+             renderFansControl(); everything below stays put so a repaint cannot
+             discard a save result before it has been read. -->
         <div id="fans-control-content"><span class="muted">Loading&hellip;</span></div>
+        <div class="settings-actions" style="margin-top:12px">
+          <button class="btn primary" onclick="saveFanSettings()">Save</button>
+          <button class="btn" onclick="resetFanSettings()">Reset to Defaults</button>
+          <span id="fan-settings-msg" class="muted" style="font-size:12px;align-self:center"></span>
+        </div>
+        <div style="margin-top:16px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--muted);line-height:1.8">
+          <strong style="color:var(--text)">How the ramp works</strong><br>
+          Below (threshold &minus; range): fans hold at min %<br>
+          Within range of threshold: linear ramp &rarr; max %<br>
+          At or above threshold: Dell default control (safety)
+        </div>
       </div>
 
     </div>
