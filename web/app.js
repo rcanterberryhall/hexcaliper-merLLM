@@ -15,6 +15,7 @@ function activateTab(name, rest) {
   btn.classList.add("active");
   document.getElementById("tab-" + name).classList.add("active");
   if (name === "metrics") loadMetricsCharts().catch(() => {});
+  if (name === "fans")    loadFans().catch(() => {});
   if (name === "plans")   initPlans(rest);
 }
 
@@ -224,9 +225,11 @@ async function refresh() {
     renderMetrics(metrics);
   } catch (_) {}
 
-  // Refresh fans tab if it is active (avoid background polling when not viewed)
+  // Refresh fans tab if it is active (avoid background polling when not viewed).
+  // Status only: the control pane is a form, and rebuilding it every 10s reverts
+  // whatever the operator is part-way through typing.
   if (document.getElementById("tab-fans").classList.contains("active")) {
-    loadFans().catch(() => {});
+    refreshFansStatus().catch(() => {});
   }
 
   // Fault history is always refreshed — it lives on Overview
@@ -1378,6 +1381,12 @@ async function loadFans() {
   renderFansControl(fanStatus, fanSettings);
 }
 
+// Poll path. Temperatures and fan speed are pure output, so repainting them on a
+// timer costs nothing; the control pane is left alone because it holds input.
+async function refreshFansStatus() {
+  renderFansStatus(await api("/api/merllm/fans/status").catch(() => null));
+}
+
 async function loadFaultHistory() {
   const el = document.getElementById("fans-fault-content");
   try {
@@ -1522,20 +1531,12 @@ function renderFansControl(status, settings) {
       <input id="fan-${f.key}" type="number" min="${f.min}" max="${f.max}" value="${esc(String(current[f.key]))}" />
     </div>`).join("");
 
+  // Replacing innerHTML discards every node inside, so the buttons, the
+  // #fan-settings-msg span and the ramp help live in index.html instead — a
+  // repaint here must not take a save result with it.
   el.innerHTML = `
     ${overrideBanner}
-    ${fields}
-    <div class="settings-actions" style="margin-top:12px">
-      <button class="btn primary" onclick="saveFanSettings()">Save</button>
-      <button class="btn" onclick="resetFanSettings()">Reset to Defaults</button>
-      <span id="fan-settings-msg" class="muted" style="font-size:12px;align-self:center"></span>
-    </div>
-    <div style="margin-top:16px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--muted);line-height:1.8">
-      <strong style="color:var(--text)">How the ramp works</strong><br>
-      Below (threshold &minus; range): fans hold at min %<br>
-      Within range of threshold: linear ramp → max %<br>
-      At or above threshold: Dell default control (safety)
-    </div>`;
+    ${fields}`;
 }
 
 async function saveFanSettings() {
