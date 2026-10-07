@@ -1136,10 +1136,29 @@ window.addEventListener("resize", _sshFitAll);
 
 // ── VNC ───────────────────────────────────────────────────────────────────────
 
-let _vncWs = null;
-let _vncSocket = null;
+// The live noVNC session, or null. Held so Disconnect can close the connection
+// instead of only painting over it, and so Connect replaces a session rather
+// than opening a second one beside it. Same slot-per-session shape as
+// `_sshPanes` above.
+let _vncRfb = null;
+
+// Close the live session, if any. Clearing the pane is not closing the session:
+// noVNC appends its own canvas to the target and never checks whether that
+// target is still attached, so a repainted container leaves the WebSocket — and
+// the API's TCP connection to the VNC server behind it — open.
+function _vncTeardown() {
+  const rfb = _vncRfb;
+  // Cleared before disconnect(), so the "disconnect" event that call dispatches
+  // already reads as a stale session's and repaints nothing.
+  _vncRfb = null;
+  if (rfb) {
+    try { rfb.disconnect(); } catch (_) {}
+  }
+}
 
 async function connectVNC() {
+  _vncTeardown();
+
   const container = document.getElementById("vnc-container");
   container.innerHTML = '<span class="muted">Loading noVNC…</span>';
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1156,9 +1175,18 @@ async function connectVNC() {
 
   container.innerHTML = '<canvas id="vnc-canvas"></canvas>';
   try {
+    // A second Connect during the import above can have installed a session
+    // while this one was loading, so tear down again here; at most one session
+    // is live whatever order the clicks resolve in.
+    _vncTeardown();
     const rfb = new RFB(container, url);
+    _vncRfb = rfb;
     rfb.scaleViewport = true;
     rfb.addEventListener("disconnect", () => {
+      // A session that has been replaced or already closed must not repaint the
+      // pane the current one is drawing into.
+      if (_vncRfb !== rfb) return;
+      _vncRfb = null;
       container.innerHTML = '<span class="muted">VNC disconnected.</span>';
     });
   } catch (err) {
@@ -1167,6 +1195,7 @@ async function connectVNC() {
 }
 
 function disconnectVNC() {
+  _vncTeardown();
   document.getElementById("vnc-container").innerHTML =
     '<span class="muted">VNC not connected.</span>';
 }
