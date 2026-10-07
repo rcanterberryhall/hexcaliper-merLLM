@@ -1685,20 +1685,31 @@ async function initPlans(rest) {
   }
 }
 
-// Return the reading pane to its initial "nothing selected" state.
-function resetPlansView() {
-  document.getElementById("plans-title").textContent = "Select a document";
-  document.getElementById("plans-meta").textContent = "";
+// Empty the reading pane and everything derived from the document that was in
+// it: body text, contents rail, scroll-spy, step tally and any raw-mode state.
+// The caller owns the title and meta, which say different things after a
+// deliberate reset than after a failed open; every other element is cleared
+// the same way on both paths, so it is cleared in one place.
+function clearPlansPane() {
   document.getElementById("plans-progress").textContent = "";
   document.getElementById("plans-raw-toggle").textContent = "Raw";
   const body = document.getElementById("plans-body");
   body.textContent = "";
   body.classList.remove("raw");
+  // The headings the rail points at were just detached by the line above, so
+  // the links would be inert; drop them and stop the spy observing them.
   document.getElementById("plans-toc").innerHTML = "";
   if (_plansSpy) { _plansSpy.disconnect(); _plansSpy = null; }
   _plansOpen = null;
   _plansRaw = "";
   renderPlansTree();   // repaint so no sidebar row stays highlighted
+}
+
+// Return the reading pane to its initial "nothing selected" state.
+function resetPlansView() {
+  document.getElementById("plans-title").textContent = "Select a document";
+  document.getElementById("plans-meta").textContent = "";
+  clearPlansPane();
 }
 
 // Which type chips are currently on.
@@ -1802,11 +1813,11 @@ async function openDoc(rel) {
   } catch (err) {
     document.getElementById("plans-title").textContent = "Could not open document";
     document.getElementById("plans-meta").textContent = rel + " — " + err.message;
-    bodyEl.textContent = "";
-    _plansOpen = null;   // nothing is displayed, so a retry must be possible
-    _plansRaw = "";      // clear the previous document's source too, or a raw
-                          // toggle would show stale content for a failed request
-    renderPlansTree();   // drop any stale row highlight
+    // Nothing is displayed, so nothing derived from the previous document may
+    // stay: its contents rail would navigate to detached headings, its step
+    // tally would be read as this document's, and _plansOpen must go back to
+    // null so a retry click on the same row still fires.
+    clearPlansPane();
     return;
   }
   _plansOpen = rel;
