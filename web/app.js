@@ -1154,7 +1154,10 @@ async function connectVNC() {
     return;
   }
 
-  container.innerHTML = '<canvas id="vnc-canvas"></canvas>';
+  // Empty the pane for this session: noVNC appends its own screen and canvas to
+  // the target, so a surface supplied here is never drawn into — it only sits
+  // beside the viewer as a second flex item, shrinking what the viewer fits into.
+  container.innerHTML = "";
   try {
     const rfb = new RFB(container, url);
     rfb.scaleViewport = true;

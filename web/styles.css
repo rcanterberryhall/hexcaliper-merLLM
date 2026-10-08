@@ -375,7 +375,8 @@ tr:hover td { background: #1c2330; }
   align-items: center;
   justify-content: center;
 }
-#vnc-canvas { max-width: 100%; max-height: 100%; }
+/* noVNC creates the canvas itself, inside the target element — size that one. */
+#vnc-container canvas { max-width: 100%; max-height: 100%; }
 
 /* Logs */
 #log-output {
