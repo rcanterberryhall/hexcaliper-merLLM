@@ -585,6 +585,19 @@ tr:hover td { background: #1c2330; }
   margin-top: 12px;
 }
 
+/* Why a chart card is blank, over the space the curve would have taken.
+ * .chart-wrap is the positioning context. */
+.chart-note {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
 /* Priority buckets — badges and lane summary on the GPU Queue tab.
  * Colors grade from green (highest, always runs) to grey (idle).
  * Matches the five-bucket Priority IntEnum in queue_manager.py. */

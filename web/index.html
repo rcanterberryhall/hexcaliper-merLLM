@@ -608,6 +608,9 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           network throughput.<br><br>
           Data is polled from <code>/api/merllm/metrics/history</code> on tab activation and on range change.
           Default view: last 1 hour. Range selector buttons: 1h / 6h / 24h / 7d.
+          Every chart matches the highlighted range or is blank with the reason in its place —
+          no data for that range, or the history request failed. A chart never carries data from a
+          range other than the one selected.
         </p>
       </div>
 

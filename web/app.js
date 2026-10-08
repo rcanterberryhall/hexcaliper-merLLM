@@ -888,6 +888,8 @@ function renderMetrics(m) {
 
 const _charts = {};
 let _metricsRange = "1h";
+// Bumped per load so a superseded one can tell it has been overtaken.
+let _metricsLoadSeq = 0;
 
 function _chartScaleDefaults() {
   return {
@@ -947,6 +949,7 @@ function _fmtTs(ts) {
 function _setChart(id, labels, datasets, extraScales) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
+  _setChartNote(canvas, "");
   if (_charts[id]) {
     _charts[id].data.labels = labels;
     _charts[id].data.datasets = datasets;
@@ -960,87 +963,152 @@ function _setChart(id, labels, datasets, extraScales) {
   }
 }
 
-async function _hist(metric) {
+// Blank one card and say why. Destroying the instance is the point: leaving it
+// in _charts keeps the previous range's curve on the canvas under a range bar
+// that has already moved on.
+function _clearChart(id, note) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (_charts[id]) {
+    try { _charts[id].destroy(); } catch (_) {}
+    delete _charts[id];
+  }
+  _setChartNote(canvas, note);
+}
+
+// The note goes in .chart-wrap, which is position:relative, so it lands over
+// the space the curve would have occupied rather than somewhere else on the card.
+function _setChartNote(canvas, note) {
+  const wrap = canvas.parentElement;
+  if (!wrap) return;
+  let el = wrap.querySelector(".chart-note");
+  if (!note) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "chart-note muted";
+    wrap.appendChild(el);
+  }
+  el.textContent = note;
+}
+
+// Resolve one card from the series it needs: draw it, or blank it with a
+// reason. Every card is resolved on every load — a card skipped because its
+// series came back empty would go on showing whichever range last succeeded.
+// `build` is only called once there is something to draw, and its throw is
+// caught here so one card cannot take the remaining five with it.
+function _renderChart(id, range, series, build) {
+  const failed = series.filter(s => !s.ok);
+  if (failed.length) {
+    _clearChart(id, `history unavailable (${failed.map(s => s.metric).join(", ")})`);
+    return;
+  }
+  if (!series.some(s => s.points.length)) {
+    _clearChart(id, `no data for the last ${range}`);
+    return;
+  }
   try {
-    return await api(`/api/merllm/metrics/history?metric=${encodeURIComponent(metric)}&range=${_metricsRange}`);
+    const spec = build();
+    _setChart(id, spec.labels, spec.datasets, spec.extraScales);
+  } catch (err) {
+    console.error(`Chart ${id} failed to draw:`, err);
+    _clearChart(id, typeof Chart === "undefined"
+      ? "charts unavailable — Chart.js did not load"
+      : "chart failed to draw");
+  }
+}
+
+// `ok` separates a failed request from a range that genuinely holds no points:
+// the first is a fault to report, the second is a fact about the data, and
+// collapsing both to an empty array is what let a stale curve stand in for either.
+async function _hist(metric, range) {
+  try {
+    const points = await api(
+      `/api/merllm/metrics/history?metric=${encodeURIComponent(metric)}&range=${encodeURIComponent(range)}`);
+    return { metric, ok: true, points };
   } catch (_) {
-    return [];
+    return { metric, ok: false, points: [] };
   }
 }
 
 async function loadMetricsCharts() {
+  const seq   = ++_metricsLoadSeq;
+  const range = _metricsRange;
   const [cpu, ramUsed, diskPct, diskArchivePct, g0util, g0mem, g0temp, g1util, g1mem, g1temp, tx, rx] =
     await Promise.all([
-      _hist("cpu.total"),
-      _hist("ram.used"),
-      _hist("disk.root.pct"),
-      _hist("disk.archive.pct"),
-      _hist("gpu0.util_pct"),
-      _hist("gpu0.mem_used_mb"),
-      _hist("gpu0.temp_c"),
-      _hist("gpu1.util_pct"),
-      _hist("gpu1.mem_used_mb"),
-      _hist("gpu1.temp_c"),
-      _hist("net.tx_bps"),
-      _hist("net.rx_bps"),
+      _hist("cpu.total", range),
+      _hist("ram.used", range),
+      _hist("disk.root.pct", range),
+      _hist("disk.archive.pct", range),
+      _hist("gpu0.util_pct", range),
+      _hist("gpu0.mem_used_mb", range),
+      _hist("gpu0.temp_c", range),
+      _hist("gpu1.util_pct", range),
+      _hist("gpu1.mem_used_mb", range),
+      _hist("gpu1.temp_c", range),
+      _hist("net.tx_bps", range),
+      _hist("net.rx_bps", range),
     ]);
 
-  if (cpu.length) {
-    _setChart("chart-cpu",
-      cpu.map(p => _fmtTs(p.ts)),
-      [_mkDs("CPU %", cpu.map(p => p.value.toFixed(1)), "#58a6ff")]
-    );
-  }
+  // A 7d query outlives a 1h one started after it, so without this the slower
+  // load renders last and the charts show a range the bar is no longer
+  // highlighting.
+  if (seq !== _metricsLoadSeq) return;
 
-  if (ramUsed.length) {
-    _setChart("chart-mem",
-      ramUsed.map(p => _fmtTs(p.ts)),
-      [_mkDs("RAM GB", ramUsed.map(p => (p.value / 1073741824).toFixed(2)), "#3fb950")]
-    );
-  }
+  _renderChart("chart-cpu", range, [cpu], () => ({
+    labels: cpu.points.map(p => _fmtTs(p.ts)),
+    datasets: [_mkDs("CPU %", cpu.points.map(p => p.value.toFixed(1)), "#58a6ff")],
+  }));
 
-  if (diskPct.length || diskArchivePct.length) {
-    const base = diskPct.length ? diskPct : diskArchivePct;
+  _renderChart("chart-mem", range, [ramUsed], () => ({
+    labels: ramUsed.points.map(p => _fmtTs(p.ts)),
+    datasets: [_mkDs("RAM GB", ramUsed.points.map(p => (p.value / 1073741824).toFixed(2)), "#3fb950")],
+  }));
+
+  // The archive disk only reports when EXTRA_DISK_PATHS names it, so either
+  // series on its own is a complete card.
+  _renderChart("chart-disk", range, [diskPct, diskArchivePct], () => {
+    const base = diskPct.points.length ? diskPct.points : diskArchivePct.points;
     const datasets = [];
-    if (diskPct.length) datasets.push(_mkDs("OS Disk %", diskPct.map(p => p.value.toFixed(1)), "#d29922"));
-    if (diskArchivePct.length) datasets.push(_mkDs("Archive %", diskArchivePct.map(p => p.value.toFixed(1)), "#58a6ff"));
-    _setChart("chart-disk",
-      base.map(p => _fmtTs(p.ts)),
-      datasets
-    );
-  }
+    if (diskPct.points.length) datasets.push(_mkDs("OS Disk %", diskPct.points.map(p => p.value.toFixed(1)), "#d29922"));
+    if (diskArchivePct.points.length) datasets.push(_mkDs("Archive %", diskArchivePct.points.map(p => p.value.toFixed(1)), "#58a6ff"));
+    return { labels: base.map(p => _fmtTs(p.ts)), datasets };
+  });
 
   // GPU charts: util+temp on left y, VRAM MB on right y
   for (const [idx, util, mem, temp] of [
     [0, g0util, g0mem, g0temp],
     [1, g1util, g1mem, g1temp],
   ]) {
-    const base = util.length ? util : mem.length ? mem : temp;
-    if (!base.length) continue;
-    _setChart(`chart-gpu${idx}`,
-      base.map(p => _fmtTs(p.ts)),
-      [
-        _mkDs("Util %",  util.map(p => p.value.toFixed(1)), "#58a6ff", "y"),
-        _mkDs("Temp °C", temp.map(p => p.value.toFixed(1)), "#f85149", "y"),
-        _mkDs("VRAM MB", mem.map(p  => Math.round(p.value)), "#a78bfa", "yMem"),
-      ],
-      {
-        y:    { type: "linear", position: "left",  ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
-        yMem: { type: "linear", position: "right", ticks: { color: "#a78bfa", font: { size: 10 } }, grid: { drawOnChartArea: false } },
-      }
-    );
+    _renderChart(`chart-gpu${idx}`, range, [util, mem, temp], () => {
+      const base = util.points.length ? util.points : mem.points.length ? mem.points : temp.points;
+      return {
+        labels: base.map(p => _fmtTs(p.ts)),
+        datasets: [
+          _mkDs("Util %",  util.points.map(p => p.value.toFixed(1)), "#58a6ff", "y"),
+          _mkDs("Temp °C", temp.points.map(p => p.value.toFixed(1)), "#f85149", "y"),
+          _mkDs("VRAM MB", mem.points.map(p  => Math.round(p.value)), "#a78bfa", "yMem"),
+        ],
+        extraScales: {
+          y:    { type: "linear", position: "left",  ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
+          yMem: { type: "linear", position: "right", ticks: { color: "#a78bfa", font: { size: 10 } }, grid: { drawOnChartArea: false } },
+        },
+      };
+    });
   }
 
-  const netBase = tx.length ? tx : rx;
-  if (netBase.length) {
-    _setChart("chart-net",
-      netBase.map(p => _fmtTs(p.ts)),
-      [
-        _mkDs("TX MB/s", tx.map(p => (p.value / 1048576).toFixed(3)), "#58a6ff"),
-        _mkDs("RX MB/s", rx.map(p => (p.value / 1048576).toFixed(3)), "#3fb950"),
-      ]
-    );
-  }
+  _renderChart("chart-net", range, [tx, rx], () => {
+    const base = tx.points.length ? tx.points : rx.points;
+    return {
+      labels: base.map(p => _fmtTs(p.ts)),
+      datasets: [
+        _mkDs("TX MB/s", tx.points.map(p => (p.value / 1048576).toFixed(3)), "#58a6ff"),
+        _mkDs("RX MB/s", rx.points.map(p => (p.value / 1048576).toFixed(3)), "#3fb950"),
+      ],
+    };
+  });
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────────────
