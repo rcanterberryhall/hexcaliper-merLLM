@@ -209,6 +209,8 @@ The `/api/merllm/logs/{service}` endpoint maps logical service names to Docker c
 | `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-parsival-parsival-nginx-1` |
 | `LOG_CONTAINER_MERLLM_API` | `merllm-api` |
 
+The Logs tab's service dropdown offers exactly these five names, and `tests/test_logs_service_vocabulary.py` asserts the two sets stay equal. The GPU-pinned `ollama-gpu0` and `ollama-gpu1` are systemd units on the host, so this endpoint has no way to read them; their logs come from `journalctl -u ollama-gpu0` on the host.
+
 ## My Day panel
 
 The dashboard landing page includes a "My Day" panel that aggregates attention items from across the ecosystem:

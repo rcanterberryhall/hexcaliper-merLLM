@@ -1045,17 +1045,26 @@ async function loadMetricsCharts() {
 
 // ── Logs ──────────────────────────────────────────────────────────────────────
 
+// Bumped per Fetch. The <select> stops naming what the pane holds the moment
+// the operator moves it, so a request that has been overtaken must not render
+// and whatever does render has to identify its own subject.
+let _logsSeq = 0;
+
 async function fetchLogs() {
   const service = document.getElementById("log-service").value;
   const lines = document.getElementById("log-lines").value || 100;
   const el = document.getElementById("log-output");
-  el.textContent = "Fetching…";
+  const seq = ++_logsSeq;
+  el.textContent = `Fetching ${service}…`;
   try {
     const r = await api(`/api/merllm/logs/${service}?lines=${lines}`);
-    el.textContent = r.lines.join("\n") || "(no output)";
+    if (seq !== _logsSeq) return;
+    el.textContent = `── ${r.service} (${r.container}) — ${r.lines.length} lines ──\n`
+      + (r.lines.join("\n") || "(no output)");
     el.scrollTop = el.scrollHeight;
   } catch (err) {
-    el.textContent = "Error: " + err.message;
+    if (seq !== _logsSeq) return;
+    el.textContent = `${service}: ${err.message}`;
   }
 }
 
