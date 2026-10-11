@@ -179,10 +179,25 @@ function _startActivityStream() {
 
 // Per-GPU cache so SSE updates (which carry only active state) can still
 // show loaded models and the instance URL from the last full poll.
+//
+// `known` is the health of the cache, not of the instance. `loaded: null` is
+// the endpoint's sentinel for an unreachable instance, so an unseeded cache
+// holding it would claim an outage the dashboard has not observed — the stream
+// opens before the seeding poll answers, and pushes on any token or queue
+// change, so that render really happens.
 const _instCache = {
-  gpu0: { url: "", loaded: null },
-  gpu1: { url: "", loaded: null },
+  gpu0: { url: "", loaded: null, known: false },
+  gpu1: { url: "", loaded: null, known: false },
 };
+
+function _cacheInstances(a) {
+  _instCache.gpu0 = { url: a.gpu0.url, loaded: a.gpu0.loaded, known: true };
+  _instCache.gpu1 = { url: a.gpu1.url, loaded: a.gpu1.loaded, known: true };
+}
+
+function _instCacheKnown() {
+  return _instCache.gpu0.known && _instCache.gpu1.known;
+}
 
 function _mergeAndRenderInstance(elId, label, activeSnapshot) {
   // activeSnapshot is the raw _activity entry (or null) with elapsed_sec added.
@@ -190,9 +205,10 @@ function _mergeAndRenderInstance(elId, label, activeSnapshot) {
   const gpuKey = elId === "ollama-gpu0" ? "gpu0" : "gpu1";
   const cached = _instCache[gpuKey];
   renderInstanceCard(elId, label, {
-    url:    cached.url,
-    loaded: cached.loaded,
-    active: activeSnapshot,
+    url:         cached.url,
+    loaded:      cached.loaded,
+    loadedKnown: cached.known,
+    active:      activeSnapshot,
   });
 }
 
@@ -201,8 +217,7 @@ async function refreshActivity() {
   if (!document.getElementById("tab-overview").classList.contains("active")) return;
   try {
     const a = await api("/api/merllm/activity");
-    _instCache.gpu0 = { url: a.gpu0.url, loaded: a.gpu0.loaded };
-    _instCache.gpu1 = { url: a.gpu1.url, loaded: a.gpu1.loaded };
+    _cacheInstances(a);
     renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
     renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
   } catch (_) {}
@@ -239,10 +254,13 @@ async function refresh() {
   // Refresh loaded models periodically (SSE only carries active state)
   try {
     const a = await api("/api/merllm/activity");
-    _instCache.gpu0 = { url: a.gpu0.url, loaded: a.gpu0.loaded };
-    _instCache.gpu1 = { url: a.gpu1.url, loaded: a.gpu1.loaded };
-    // Only re-render if SSE is not driving updates (avoid fighting the stream)
-    if (!_activityEventSrc) {
+    // A stream render made before this landed could only say "health unknown",
+    // and the next push may be minutes away on an idle system — so the first
+    // seed repaints even while the stream is driving. After that, only re-render
+    // if SSE is not driving updates (avoid fighting the stream).
+    const wasUnknown = !_instCacheKnown();
+    _cacheInstances(a);
+    if (!_activityEventSrc || wasUnknown) {
       renderInstanceCard("ollama-gpu0", "GPU 0", a.gpu0);
       renderInstanceCard("ollama-gpu1", "GPU 1", a.gpu1);
     }
@@ -425,14 +443,26 @@ function gpuCard(i, g) {
 function renderInstanceCard(elId, label, inst) {
   const el = document.getElementById(elId);
   if (!el) return;
-  el.dataset.activityReady = "1";
 
-  const reachable = inst.loaded !== null && inst.loaded !== undefined;
-  const dot = reachable ? "dot-ok" : "dot-fail";
+  // Only an explicit `loadedKnown: false` means "not observed yet", so the two
+  // full-poll callers keep their meaning: for them `loaded` came from the
+  // endpoint and null really is an outage.
+  const known     = inst.loadedKnown !== false;
+  const reachable = known && inst.loaded !== null && inst.loaded !== undefined;
+
+  // renderOverview() paints an up/down header here from /api/merllm/status, but
+  // only while no activity render has claimed the element. A render that cannot
+  // state the instance's health must not claim it, because that header is the
+  // accurate signal until the first full poll lands.
+  if (known) el.dataset.activityReady = "1";
+
+  const dot = !known ? "dot-unknown" : reachable ? "dot-ok" : "dot-fail";
 
   // Loaded models section
   let loadedHtml = "";
-  if (!reachable) {
+  if (!known) {
+    loadedHtml = `<span class="muted instance-idle">checking&hellip;</span>`;
+  } else if (!reachable) {
     loadedHtml = `<span class="muted instance-idle">unreachable</span>`;
   } else if (inst.loaded && inst.loaded.length) {
     loadedHtml = inst.loaded.map(m =>

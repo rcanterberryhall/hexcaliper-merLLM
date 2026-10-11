@@ -178,6 +178,9 @@ main { padding: 20px; }
 .dot-ok   { background: var(--green); }
 .dot-warn { background: var(--yellow); }
 .dot-fail { background: var(--red); }
+/* Health not observed yet. A hollow ring so it cannot be read as any of the
+   three states above; inset rather than a border, to keep the 8px box. */
+.dot-unknown { background: transparent; box-shadow: inset 0 0 0 1px var(--muted); }
 
 /* Instance activity cards */
 .instance-card { font-size: 13px; }
