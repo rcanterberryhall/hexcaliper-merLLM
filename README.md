@@ -195,6 +195,8 @@ The overview dashboard subscribes to `GET /api/merllm/activity/stream` (Server-S
 
 `null` means the GPU is idle. Events are pushed immediately on request start/end and rate-limited to 10/sec during streaming. A keepalive comment (`: keepalive`) is sent every 5 s when idle to keep the connection alive through proxies.
 
+The snapshot carries **activity only** — no `url` and no `loaded`, and no snapshot is sent on connect. A consumer that shows instance health has to merge the stream with the last `GET /api/merllm/activity` response, and must not report health it has not yet fetched: `null` means *idle* here, while `loaded: null` from that endpoint means *the instance could not be probed*. Conflating the two is merLLM#89, where the dashboard reported both instances unreachable while their tokens were streaming in.
+
 LanceLLMot and Parsival dashboards consume this stream to show live token output without polling.
 
 ## Log container name mapping
