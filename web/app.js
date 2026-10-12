@@ -308,6 +308,16 @@ function renderOverview(s) {
   // GPU Router card
   set("ov-routing", s.routing || "round_robin");
   renderSchedulerStatus(s.scheduler_status);
+
+  // /api/merllm/status serves the same queue_manager.is_paused()/paused_since()
+  // that /api/merllm/queue does, as queue_paused/queue_paused_since. Painting
+  // the banner and the Pause/Resume button from here too means the control
+  // survives either endpoint failing, and the routing badge set by updateBadge()
+  // can no longer read "paused" beside a button offering to pause.
+  if (s.queue_paused != null) {
+    renderQueuePauseState(!!s.queue_paused, s.queue_paused_since || null);
+    _pauseKnown = true;
+  }
   set("ov-default-model", s.default_model || "—");
   const q = s.queue || {};
   set("ov-queue", s.queue ? `${q.running || 0} / ${q.queued || 0}` : "—");
@@ -498,28 +508,100 @@ async function resetGpu(gpu) {
 
 // ── GPU Queue ─────────────────────────────────────────────────────────────────
 
+// Load state for the two tables the 10s poll fills. `ok: null` means the
+// endpoint has never answered, which is a different fact from "it answered with
+// nothing": the renderers below must not spend an empty-state message on a
+// query nothing asked, and the pause control must not read "not paused" on the
+// strength of a request that failed.
+let _queueLoad   = { ever: false, ok: null, reason: "" };
+let _batchLoad   = { ever: false, ok: null, reason: "" };
+let _lastBuckets = null;
+
+// True once either /api/merllm/queue or /api/merllm/status has reported the
+// pause flag. Both serve the same queue_manager.is_paused(), so one of them
+// failing does not make the state unknown.
+let _pauseKnown = false;
+
+// A failed load is stated where the data would have been, with the endpoint's
+// own reason and a control to retry — the shape loadFaultHistory() and
+// refreshMyDay() already use. Silence is not neutral here: the static markup
+// ships an unpaused button and empty tables, so saying nothing leaves an
+// assertion on screen that nothing measured.
+function _renderLoadMsg(elId, label, load, retryCall) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (load.ok !== false) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  const stale = load.ever ? " Showing the last values received." : "";
+  el.style.display = "block";
+  el.innerHTML =
+    `${esc(label)} could not be refreshed: ${esc(load.reason)}.${stale}` +
+    `<button class="btn load-retry-btn" onclick="${retryCall}">Retry</button>`;
+}
+
+// Single paint site for everything /api/merllm/queue fills, so the table, the
+// five bucket lanes, the pause control and the failure message cannot end up
+// describing different attempts.
+function paintQueuePanes() {
+  renderQueueTable(_lastQueueData, true);
+  renderBucketLanes(_lastBuckets);
+  if (!_pauseKnown) renderQueuePauseState(null, null);
+  _renderLoadMsg("queue-load-msg", "Active requests and bucket depths",
+                 _queueLoad, "loadQueue()");
+}
+
+function paintBatchPanes() {
+  renderBatchTable(_lastBatchData, true);
+  _renderLoadMsg("batch-load-msg", "Batch history", _batchLoad, "loadBatchJobs()");
+}
+
 async function loadQueue() {
   try {
     const data = await api("/api/merllm/queue");
+    _queueLoad   = { ever: true, ok: true, reason: "" };
+    _lastBuckets = data.buckets || {};
     renderQueueTable(data.queue || []);
-    renderBucketLanes(data.buckets || {});
+    renderBucketLanes(_lastBuckets);
     renderQueuePauseState(!!data.paused, data.paused_since || null);
+    _pauseKnown = true;
+    _renderLoadMsg("queue-load-msg", "Active requests and bucket depths",
+                   _queueLoad, "loadQueue()");
   } catch (err) {
+    _queueLoad = { ever: _queueLoad.ever, ok: false,
+                   reason: err.message || String(err) };
     console.error("Queue load error:", err);
+    paintQueuePanes();
   }
 }
 
 // Pause/resume UI state. Persisted server-side in the settings table, so a
 // restart mid-pause (power outage, rebuild) comes back still paused — this
 // function just mirrors that state into the DOM on every queue refresh.
+//
+// `paused === null` means no endpoint has reported the flag yet. That case has
+// to be visible rather than defaulted: the shipped markup reads "Pause Queue",
+// and toggleQueuePause() picks its verb from the data-paused attribute written
+// here, so defaulting to "not paused" both asserts a dispatching queue and
+// leaves Resume unreachable on a queue that is actually stopped.
 function renderQueuePauseState(paused, pausedSince) {
-  const btn    = document.getElementById("queue-pause-btn");
-  const banner = document.getElementById("queue-pause-banner");
-  const since  = document.getElementById("queue-paused-since");
+  const btn     = document.getElementById("queue-pause-btn");
+  const banner  = document.getElementById("queue-pause-banner");
+  const since   = document.getElementById("queue-paused-since");
+  const unknown = paused === null;
   if (btn) {
-    btn.textContent = paused ? "Resume Queue" : "Pause Queue";
-    btn.dataset.paused = paused ? "1" : "0";
-    btn.classList.toggle("primary", paused);
+    btn.textContent = unknown ? "Queue state unknown"
+      : paused ? "Resume Queue" : "Pause Queue";
+    if (unknown) delete btn.dataset.paused;
+    else btn.dataset.paused = paused ? "1" : "0";
+    btn.classList.toggle("primary", !unknown && !!paused);
+    btn.classList.toggle("queue-pause-unknown", unknown);
+    btn.disabled = unknown;
+    btn.title = unknown
+      ? "The pause flag could not be read — retry the queue load to restore this control"
+      : "";
   }
   if (banner) banner.style.display = paused ? "block" : "none";
   if (since && paused && pausedSince) {
@@ -538,9 +620,13 @@ async function toggleQueuePause() {
   const isPaused = btn && btn.dataset.paused === "1";
   const path = isPaused ? "/api/merllm/queue/resume" : "/api/merllm/queue/pause";
   try {
-    await post(path, {});
-    // Reflect the change immediately; the next status tick will confirm.
-    renderQueuePauseState(!isPaused, !isPaused ? Date.now() / 1000 : null);
+    const r = await post(path, {});
+    // Reflect the change immediately from the response's own flag and stamp.
+    // set_paused() is a no-op returning changed:false when the flag already
+    // matched, so an age invented here reads "(paused 0s ago)" for a queue that
+    // has been paused for hours.
+    renderQueuePauseState(!!r.paused, r.paused_since || null);
+    _pauseKnown = true;
     setTimeout(loadQueue, 200);
     setTimeout(refresh, 200);
   } catch (err) {
@@ -642,7 +728,14 @@ function renderQueueTable(queue, sortOnly) {
   if (!tbody) return;
   const data = _applySortIfSet(_lastQueueData, "queue-tbody");
   if (!data.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="muted">No active requests.</td></tr>';
+    // _lastQueueData is [] before any load succeeds, and _handleSortClick
+    // paints straight from it — so "No active requests." has to be reserved for
+    // a load that actually answered, or one click on a sortable header turns a
+    // never-answered query into a stated fact.
+    const msg = _queueLoad.ever ? "No active requests."
+      : _queueLoad.ok === false ? "Queue could not be read — nothing here has been measured."
+      : "Loading active requests…";
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">${esc(msg)}</td></tr>`;
     return;
   }
   tbody.innerHTML = data.map(r => {
@@ -667,6 +760,13 @@ function renderQueueTable(queue, sortOnly) {
 function renderBucketLanes(buckets) {
   const wrap = document.getElementById("bucket-lanes");
   if (!wrap) return;
+  if (!buckets) {
+    // Five lanes reading 0 is a depth measurement nothing has taken. An
+    // answered response with no depths is still {} here, and still renders.
+    wrap.innerHTML = '<div class="bucket-lanes-unknown muted">' +
+      "Bucket depths unavailable — the queue could not be read.</div>";
+    return;
+  }
   wrap.innerHTML = _BUCKET_ORDER.map((name, idx) => {
     const depth = buckets[name] || 0;
     const desc  = _BUCKET_DESCRIPTIONS[name] || "";
@@ -690,7 +790,10 @@ function renderBatchTable(jobs, sortOnly) {
   if (!tbody) return;
   const data = _applySortIfSet(_lastBatchData, "batch-tbody");
   if (!data.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">No jobs.</td></tr>';
+    const msg = _batchLoad.ever ? "No jobs."
+      : _batchLoad.ok === false ? "Batch history could not be read — nothing here has been measured."
+      : "Loading batch history…";
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">${esc(msg)}</td></tr>`;
     return;
   }
   tbody.innerHTML = data.map(j => `
@@ -711,9 +814,14 @@ function renderBatchTable(jobs, sortOnly) {
 async function loadBatchJobs() {
   try {
     const jobs = await api("/api/batch/status");
+    _batchLoad = { ever: true, ok: true, reason: "" };
     renderBatchTable(jobs);
+    _renderLoadMsg("batch-load-msg", "Batch history", _batchLoad, "loadBatchJobs()");
   } catch (err) {
+    _batchLoad = { ever: _batchLoad.ever, ok: false,
+                   reason: err.message || String(err) };
     console.error("Batch load error:", err);
+    paintBatchPanes();
   }
 }
 
