@@ -123,6 +123,7 @@
         Queue paused by operator. In-flight work continues; new requests wait until resumed.
         <span id="queue-paused-since" class="muted" style="margin-left:8px"></span>
       </div>
+      <div id="queue-load-msg" class="load-error" style="display:none"></div>
       <p class="muted" style="font-size:12px;margin-bottom:8px">
         Every GPU request (chat, short, feedback, background) is shown here while in-flight.
       </p>
@@ -164,6 +165,7 @@
             <button class="btn" style="color:var(--warning,#f0a030)" onclick="batchDrain()">Drain Queue</button>
             <button class="btn" onclick="batchClearCompleted()">Clear Completed</button>
           </div>
+          <div id="batch-load-msg" class="load-error" style="display:none"></div>
           <div id="batch-table-wrap">
             <table>
               <thead>
@@ -452,7 +454,10 @@
           has a Pause Queue button that stops the dispatcher from handing out new GPU slots. In-flight work
           finishes normally; new requests wait in their buckets until you press Resume. The pause flag is
           stored in the <code>settings</code> table so a power outage mid-pause does not silently resume bulk
-          work on reboot. <code>CHAT</code> requests still time out after <code>INTERACTIVE_QUEUE_TIMEOUT</code>
+          work on reboot. The button reads the flag from either <code>/api/merllm/queue</code> or
+          <code>/api/merllm/status</code>, whichever answered; if neither has, it reads
+          <strong>Queue state unknown</strong> and is disabled rather than guessing, because the verb it
+          would send is chosen from the state it is showing. <code>CHAT</code> requests still time out after <code>INTERACTIVE_QUEUE_TIMEOUT</code>
           while paused — they return 503 to the user rather than hanging forever.<br><br>
           <strong style="color:var(--text)">Restart resilience</strong> — batch jobs submitted via
           <code>/api/batch/submit</code> are persisted in SQLite and re-enqueued at startup. Jobs left in
