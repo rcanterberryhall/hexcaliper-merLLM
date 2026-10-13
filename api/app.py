@@ -1344,36 +1344,73 @@ async def merllm_myday():
     Aggregate 'My Day' attention summary from all Hexcaliper services.
 
     Fetches from Parsival (/page/api/attention/summary) and LanceLLMot
-    (/api/status/pending) concurrently.  If a service is unreachable,
-    its section is omitted and an error flag is set.
+    (/api/status/pending) concurrently, and reachability-probes the five
+    sites that expose only a liveness endpoint.
+
+    Every app section carries the same three health fields, because the
+    dashboard paints one dot from them and an app answers one of three
+    things: ``reachable`` is False only when no HTTP response arrived at all,
+    ``ok`` is True only when the response was healthy (a 2xx, and for the two
+    summary endpoints a readable body), and ``detail`` names what answered
+    when it was reachable but not healthy.  A reachable-but-failing app is
+    neither offline nor well, and conflating it with either states something
+    the probe did not observe.
 
     Also returns merLLM's own batch job queue counts.
 
-    :return: Dict with ``parsival``, ``lancellmot``, and ``merllm`` sections.
+    :return: Dict with ``parsival``, ``lancellmot``, ``merllm`` and one
+        section per ecosystem site.
     :rtype: dict
     """
     _myday_log = logging.getLogger("merllm.myday")
 
-    async def _fetch(url: str) -> dict | None:
-        """Fetch a JSON summary; None if unreachable or non-2xx."""
+    async def _fetch(url: str) -> dict:
+        """
+        Fetch a JSON summary, reporting which of three things happened.
+
+        Returns ``{data, status, detail}``.  ``status`` is None *only* when the
+        host could not be reached at all, so a live app whose summary endpoint
+        answers an error stays distinguishable from one that is not there —
+        collapsing both into a missing body is what made the panel report a
+        running app as offline.  ``detail`` is a phrase short enough for a tile.
+
+        :param url: Summary endpoint to fetch.
+        :type url: str
+        :return: Dict with ``data`` (parsed summary or None), ``status`` and
+            ``detail``.
+        :rtype: dict
+        """
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.get(url)
-                r.raise_for_status()
-                return r.json()
         except Exception as exc:
             _myday_log.warning("myday fetch failed for %s: %s", url, exc)
-            return None
+            return {"data": None, "status": None, "detail": None}
+        if r.status_code >= 400:
+            _myday_log.warning("myday fetch for %s answered HTTP %s", url, r.status_code)
+            return {"data": None, "status": r.status_code,
+                    "detail": f"HTTP {r.status_code}"}
+        try:
+            return {"data": r.json(), "status": r.status_code, "detail": None}
+        except Exception as exc:
+            # A 2xx whose body will not parse is a third outcome, and reporting
+            # it as unreachable would again blame the wrong thing.
+            _myday_log.warning("myday fetch for %s returned an unreadable body: %s", url, exc)
+            return {"data": None, "status": r.status_code,
+                    "detail": "unreadable response body"}
 
     async def _probe(url: str) -> dict:
         """
         Reachability probe for sites that expose only a liveness endpoint.
 
-        Returns ``{ok, latency_ms, status, body}``.  Tolerant of plain-text
-        bodies (codex/warden ``/healthz`` return ``"ok"``, not JSON) and of
-        error status codes (soonstone ``/health`` returns 503 when its data is
-        stale but the site is still reachable) — ``status`` is None only when
-        the host could not be reached at all.
+        Returns ``{ok, latency_ms, status, body, detail}``.  Tolerant of
+        plain-text bodies (codex/warden ``/healthz`` return ``"ok"``, not JSON)
+        and of error status codes (soonstone ``/health`` returns 503 when its
+        data is stale but the site is still reachable) — ``status`` is None only
+        when the host could not be reached at all, which is the distinction the
+        caller turns into ``reachable``.  ``ok`` stays a health verdict (a 2xx)
+        for every site, so tolerating an error status is the caller's decision
+        to make from ``status`` and the body, never a looser ``ok``.
         """
         start = time.perf_counter()
         try:
@@ -1381,19 +1418,41 @@ async def merllm_myday():
                 r = await client.get(url)
         except Exception as exc:
             _myday_log.warning("myday probe failed for %s: %s", url, exc)
-            return {"ok": False, "latency_ms": None, "status": None, "body": None}
+            return {"ok": False, "latency_ms": None, "status": None,
+                    "body": None, "detail": None}
         latency_ms = int((time.perf_counter() - start) * 1000)
         try:
             body = r.json()
         except Exception:
             body = None
         return {"ok": r.status_code < 400, "latency_ms": latency_ms,
-                "status": r.status_code, "body": body}
+                "status": r.status_code, "body": body,
+                "detail": None if r.status_code < 400 else f"HTTP {r.status_code}"}
+
+    def _site(probe: dict, public_url: str) -> dict:
+        """
+        The health fields every site tile is painted from.
+
+        :param probe: Result of :func:`_probe`.
+        :type probe: dict
+        :param public_url: Browser-reachable URL the tile links to.
+        :type public_url: str
+        :return: Dict with ``ok``, ``reachable``, ``detail``, ``url`` and
+            ``latency_ms``.
+        :rtype: dict
+        """
+        return {
+            "ok":         probe["ok"],
+            "reachable":  probe["status"] is not None,
+            "detail":     probe["detail"],
+            "url":        public_url,
+            "latency_ms": probe["latency_ms"],
+        }
 
     parsival_url    = f"{config.PARSIVAL_URL}/page/api/attention/summary"
     lancellmot_url  = f"{config.LANCELLMOT_URL}/api/status/pending"
 
-    (parsival_data, lancellmot_data, soonstone_p, havelock_p,
+    (parsival_res, lancellmot_res, soonstone_p, havelock_p,
      scrivener_p, codex_p, warden_p) = await asyncio.gather(
         _fetch(parsival_url),
         _fetch(lancellmot_url),
@@ -1404,13 +1463,21 @@ async def merllm_myday():
         _probe(f"{config.WARDEN_URL}/healthz"),
     )
 
+    parsival_data   = parsival_res["data"]
+    lancellmot_data = lancellmot_res["data"]
+
     queued_jobs    = db.list_batch_jobs(status="queued")
     completed_jobs = db.list_batch_jobs(status="completed")
     failed_jobs    = db.list_batch_jobs(status="failed")
 
     return {
         "parsival": {
+            # `ok` is the summary in hand; `reachable` is whether anything
+            # answered. A 500 from a running app is neither, and reporting it
+            # as offline sent the operator to restart a healthy service.
             "ok":               parsival_data is not None,
+            "reachable":        parsival_res["status"] is not None,
+            "detail":           parsival_res["detail"],
             "url":              config.PARSIVAL_PUBLIC_URL,
             "active_situations": parsival_data.get("active_situations", 0) if parsival_data else 0,
             "new_investigating": parsival_data.get("new_investigating", 0) if parsival_data else 0,
@@ -1419,40 +1486,32 @@ async def merllm_myday():
         },
         "lancellmot": {
             "ok":                   lancellmot_data is not None,
+            "reachable":            lancellmot_res["status"] is not None,
+            "detail":               lancellmot_res["detail"],
             "url":                  config.LANCELLMOT_PUBLIC_URL,
             "acquisition_pending":  lancellmot_data.get("acquisition_pending", 0) if lancellmot_data else 0,
             "escalation_pending":   lancellmot_data.get("escalation_pending", 0) if lancellmot_data else 0,
             "total_pending":        lancellmot_data.get("total_pending", 0) if lancellmot_data else 0,
         },
         "soonstone": {
-            # Reachable even when /health returns 503 (data stale but site up).
-            "ok":         soonstone_p["status"] is not None,
-            "url":        config.SOONSTONE_PUBLIC_URL,
-            "latency_ms": soonstone_p["latency_ms"],
+            # `ok` is a 2xx here as everywhere. The 503 this site answers when
+            # its feed is stale is reachable-but-not-well, and `data_status`
+            # carries the site's own verdict for the tile to show; the previous
+            # `status is not None` admitted the entire HTTP error space to `ok`,
+            # so a 404 or a 502 — with no feed verdict in the body to contradict
+            # it — read as online and green.
+            **_site(soonstone_p, config.SOONSTONE_PUBLIC_URL),
             "data_status": (soonstone_p["body"] or {}).get("status") if soonstone_p["body"] else None,
         },
-        "havelock": {
-            "ok":         havelock_p["ok"],
-            "url":        config.HAVELOCK_PUBLIC_URL,
-            "latency_ms": havelock_p["latency_ms"],
-        },
-        "scrivener": {
-            "ok":         scrivener_p["ok"],
-            "url":        config.SCRIVENER_PUBLIC_URL,
-            "latency_ms": scrivener_p["latency_ms"],
-        },
-        "codex": {
-            "ok":         codex_p["ok"],
-            "url":        config.CODEX_PUBLIC_URL,
-            "latency_ms": codex_p["latency_ms"],
-        },
-        "warden": {
-            "ok":         warden_p["ok"],
-            "url":        config.WARDEN_PUBLIC_URL,
-            "latency_ms": warden_p["latency_ms"],
-        },
+        "havelock":  _site(havelock_p,  config.HAVELOCK_PUBLIC_URL),
+        "scrivener": _site(scrivener_p, config.SCRIVENER_PUBLIC_URL),
+        "codex":     _site(codex_p,     config.CODEX_PUBLIC_URL),
+        "warden":    _site(warden_p,    config.WARDEN_PUBLIC_URL),
         "merllm": {
+            # Self: this response is the evidence, so there is nothing to probe.
             "ok":              True,
+            "reachable":       True,
+            "detail":          None,
             "queued_jobs":     len(queued_jobs),
             "completed_jobs":  len(completed_jobs),
             "failed_jobs":     len(failed_jobs),

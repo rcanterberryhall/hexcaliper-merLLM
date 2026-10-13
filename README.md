@@ -217,7 +217,15 @@ The dashboard landing page includes a "My Day" panel that aggregates attention i
 - **From LanceLLMot** — conversations with pending deep analysis results, escalation results awaiting review (via `GET {LANCELLMOT_URL}/api/status/pending`)
 - **From merLLM** — completed batch jobs not yet retrieved, active warnings (GPU temp, Ollama down, faulted GPUs)
 
-Each card links directly to the relevant item in the relevant app (opens in a new tab). If a companion app is unreachable, the panel shows "offline" instead of failing entirely.
+Each card links directly to the relevant item in the relevant app (opens in a new tab). A tile is a claim about another app's health, so the panel reports which of the three things a probe observed, and `/api/merllm/myday` gives every section the same `ok` / `reachable` / `detail` fields to say it with:
+
+| On screen | Section | Meaning |
+|---|---|---|
+| green dot, the app's figures | `ok: true` | a healthy reply |
+| amber dot, the status that answered | `reachable: true, ok: false`, `detail: "HTTP 502"` | reachable, but not well — the link and the latency are kept |
+| `offline` | `reachable: false` | no HTTP response arrived at all |
+
+Only the last is offline, and a sick companion never fails the whole panel. Soonstone is the one site whose own verdict leads: its `/health` answers `status: ok|stale` on both a 200 and the 503 it uses for a stale feed, so a verdict that was read is what the tile reports, rather than the status code it arrived on.
 
 Configure companion URLs via `PARSIVAL_URL` and `LANCELLMOT_URL` env vars.
 
