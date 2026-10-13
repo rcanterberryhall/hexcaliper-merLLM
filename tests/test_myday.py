@@ -1,4 +1,11 @@
-"""tests/test_myday.py — Tests for the /api/merllm/myday aggregation endpoint."""
+"""tests/test_myday.py — Tests for the /api/merllm/myday aggregation endpoint.
+
+The health semantics each section reports — ``ok`` meaning a healthy response,
+``reachable`` meaning one arrived at all, and ``detail`` naming what answered
+when it was neither — are covered in ``test_myday_health_identity.py``, along
+with the error-status paths this file's ``probe_status`` parameter never
+exercises.
+"""
 import os
 import sys
 import time
@@ -200,7 +207,7 @@ def test_myday_soonstone_reports_feed_status(client):
     with patch("httpx.AsyncClient", return_value=_mock_httpx(soonstone_status="stale")):
         body = client.get("/api/merllm/myday").json()
     s = body["soonstone"]
-    assert s["ok"] is True            # reachable even when data is stale
+    assert s["ok"] is True            # this mock answers 200; `ok` is a 2xx
     assert s["data_status"] == "stale"
 
 

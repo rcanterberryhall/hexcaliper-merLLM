@@ -516,8 +516,12 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           escalation results awaiting review.<br>
           <strong style="color:var(--text)">From merLLM</strong> — completed batch jobs not yet retrieved,
           active warnings (GPU temp, Ollama down, transition failures).<br><br>
-          Each card links to the relevant item in the relevant app. If an app is unreachable, that card
-          shows "offline" instead of failing the whole panel.<br><br>
+          Each card links to the relevant item in the relevant app, and reports one of the three things
+          a probe can observe: a <strong style="color:var(--text)">green</strong> dot for a healthy
+          reply, an <strong style="color:var(--yellow)">amber</strong> dot naming the status that
+          answered when an app is reachable but not well (<code>HTTP 502</code>), and
+          <strong style="color:var(--red)">"offline"</strong> only when no response arrived at all.
+          A sick companion never fails the whole panel.<br><br>
           Configure companion service URLs via <code>PARSIVAL_URL</code> and <code>LANCELLMOT_URL</code>
           in Settings.
         </p>

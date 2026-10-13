@@ -1265,17 +1265,53 @@ function mydayRow(label, value, highlight = false) {
   </div>`;
 }
 
+// The health state a tile is painted from. A probe answers one of three
+// things, so the panel has three states to say which: `down` (no HTTP response
+// at all — the only one that means offline), `degraded` (it answered, but not
+// healthily) and `up`.
+function mydayState(app) {
+  return app.ok ? "up" : (app.reachable ? "degraded" : "down");
+}
+
+const _MYDAY_DOT = { up: "up", degraded: "warn", down: "down" };
+const _MYDAY_CLS = {
+  up:       "myday-card myday-ok",
+  degraded: "myday-card myday-degraded",
+  down:     "myday-card myday-offline",
+};
+
 // One ecosystem tile. `href` omitted → not a link (used for merLLM's own tile).
-// `cls` overrides the default ok/offline border (e.g. attention yellow).
-function mydayTile({ name, href, online, cls, rows = [], latencyMs = null, note = "" }) {
-  const dot     = `<span class="myday-dot ${online ? 'up' : 'down'}"></span>`;
-  const latHtml = (online && latencyMs != null)
+// `state` comes from mydayState; `detail` names what answered on a degraded
+// tile. `cls` overrides the border for a healthy app that wants attention.
+function mydayTile({ name, href, state, cls, rows = [], latencyMs = null,
+                     note = "", detail = "" }) {
+  // An unrecognised state is a caller bug, not an observation: degrade to the
+  // state that claims least, rather than emitting a classless invisible dot.
+  const st      = _MYDAY_DOT[state] ? state : "degraded";
+  const dot     = `<span class="myday-dot ${_MYDAY_DOT[st]}"></span>`;
+  // Latency is a measurement, and a degraded app answered — so it is shown
+  // whenever one was taken, not only when the answer was the one we wanted.
+  const latHtml = (st !== "down" && latencyMs != null)
     ? `<span class="myday-latency">${latencyMs} ms</span>` : "";
   const head    = `<div class="myday-app">${dot}${esc(name)}${latHtml}</div>`;
-  const body    = online
-    ? `<div class="myday-rows">${rows.join("")}${note ? `<div class="myday-hint">${esc(note)}</div>` : ""}</div>`
-    : `<div class="myday-offline-msg">offline</div>`;
-  const cardCls = cls || (online ? "myday-card myday-ok" : "myday-card myday-offline");
+  const hint    = note ? `<div class="myday-hint">${esc(note)}</div>` : "";
+  const rowsDiv = rows.length
+    ? `<div class="myday-rows">${rows.join("")}${hint}</div>` : "";
+  let body;
+  if (st === "down") {
+    body = `<div class="myday-offline-msg">offline</div>`;
+  } else if (st === "degraded") {
+    // Any rows this tile has were read from the same reply that was not
+    // healthy (soonstone's stale-feed 503 carries its verdict), so they stay
+    // on screen; the generic line is only for a failure with nothing to say.
+    const msg = detail || (rows.length ? "" : "reachable, but not answering normally");
+    body = (msg ? `<div class="myday-degraded-msg">${esc(msg)}</div>` : "") + rowsDiv;
+  } else {
+    body = rowsDiv || `<div class="myday-rows">${hint}</div>`;
+  }
+  // The attention override applies to a healthy app with work waiting; it must
+  // not be able to repaint a degraded or offline tile as a well one.
+  const cardCls = (st === "up" && cls) || _MYDAY_CLS[st];
   const inner   = `<div class="${cardCls}">${head}${body}</div>`;
   return href
     ? `<a class="myday-link" href="${esc(href)}" target="_blank" rel="noopener">${inner}</a>`
@@ -1290,8 +1326,8 @@ function renderMyDay(data) {
     const p = data.parsival;
     const attn = p.ok && (p.active_situations > 0 || p.overdue_followups > 0);
     cards.push(mydayTile({
-      name: "Parsival", href: p.url, online: p.ok,
-      cls: p.ok ? (attn ? "myday-card myday-attention" : "myday-card myday-ok") : null,
+      name: "Parsival", href: p.url, state: mydayState(p), detail: p.detail,
+      cls: attn ? "myday-card myday-attention" : null,
       rows: p.ok ? [
         mydayRow("Active situations", p.active_situations, p.active_situations > 0),
         mydayRow("New / investigating", p.new_investigating),
@@ -1306,8 +1342,8 @@ function renderMyDay(data) {
     const l = data.lancellmot;
     const attn = l.ok && l.total_pending > 0;
     cards.push(mydayTile({
-      name: "LanceLLMot", href: l.url, online: l.ok,
-      cls: l.ok ? (attn ? "myday-card myday-attention" : "myday-card myday-ok") : null,
+      name: "LanceLLMot", href: l.url, state: mydayState(l), detail: l.detail,
+      cls: attn ? "myday-card myday-attention" : null,
       rows: l.ok ? [
         mydayRow("Acquisition pending", l.acquisition_pending, l.acquisition_pending > 0),
         mydayRow("Escalation pending", l.escalation_pending, l.escalation_pending > 0),
@@ -1318,11 +1354,19 @@ function renderMyDay(data) {
   // ── Soonstone (freshness-aware) ──
   {
     const s = data.soonstone;
-    const stale = s.ok && s.data_status && s.data_status !== "ok";
+    // /health answers `status: ok|stale` on a 200 *and* on the 503 it uses for
+    // a stale feed, so a verdict that was read is this tile's subject — `ok`
+    // alone would report a known-stale feed as a bare HTTP failure. With no
+    // verdict in the reply there is nothing to show but what answered, which
+    // is the case the old `status is not None` test painted green as "unknown".
+    const feed  = s.data_status;
+    const state = !s.reachable ? "down"
+                : feed         ? (feed === "ok" ? "up" : "degraded")
+                : s.ok         ? "up" : "degraded";
     cards.push(mydayTile({
-      name: "Soonstone", href: s.url, online: s.ok, latencyMs: s.latency_ms,
-      cls: s.ok ? (stale ? "myday-card myday-attention" : "myday-card myday-ok") : null,
-      rows: s.ok ? [mydayRow("Feed status", s.data_status || "unknown", stale)] : [],
+      name: "Soonstone", href: s.url, state, latencyMs: s.latency_ms,
+      detail: feed ? "" : s.detail,
+      rows: feed ? [mydayRow("Feed status", feed, feed !== "ok")] : [],
     }));
   }
 
@@ -1335,7 +1379,8 @@ function renderMyDay(data) {
   ]) {
     const site = data[key];
     cards.push(mydayTile({
-      name, href: site.url, online: site.ok, latencyMs: site.latency_ms,
+      name, href: site.url, state: mydayState(site), detail: site.detail,
+      latencyMs: site.latency_ms,
     }));
   }
 
@@ -1344,8 +1389,8 @@ function renderMyDay(data) {
     const m = data.merllm;
     const attn = m.queued_jobs > 0 || m.failed_jobs > 0;
     cards.push(mydayTile({
-      name: "merLLM", online: true,
-      cls: attn ? "myday-card myday-attention" : "myday-card myday-ok",
+      name: "merLLM", state: "up",
+      cls: attn ? "myday-card myday-attention" : null,
       rows: [
         mydayRow("Queued batch jobs", m.queued_jobs, m.queued_jobs > 0),
         mydayRow("Completed (unreviewed)", m.completed_jobs),
