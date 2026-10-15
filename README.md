@@ -242,6 +242,21 @@ Interval: 30s, timeout: 5s, retries: 3.
 | Settings | Live configuration editor (includes notification webhook, companion URLs) |
 | Help | Quick reference for all features |
 
+## Dashboard error reporting
+
+Every dashboard read goes through `api()` in `web/app.js`, and a failure is
+reported as `<status> <reason>`. The reason is the API's own text — FastAPI's
+`detail`, or the `error` key the hand-built `JSONResponse` paths use — falling
+back to the HTTP status line when the body carries neither, and capped at 160
+characters.
+
+The response body itself is not printed. When the API container is down or
+restarting, `merllm-nginx` answers instead with a full HTML error page, and
+rendering that as prose pushed the page header onto a second line while saying
+nothing the status line did not. **The whole body is written to the browser
+console** (`api <path> -> <status>`), which is where to look when the short
+reason is not enough.
+
 ## Database backup
 
 `POST /api/merllm/backup` triggers an online SQLite backup using Python's

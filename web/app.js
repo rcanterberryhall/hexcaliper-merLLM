@@ -49,10 +49,49 @@ document.querySelectorAll(".range-btn").forEach(btn => {
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
+// Callers print a rejection's `message` straight into the page, so it has to be
+// short and free of markup whatever answered. The API states a reason in JSON,
+// but when its container is down or restarting nginx answers instead with a full
+// HTML error page — 200-odd characters of markup carrying nothing the status
+// line does not already say.
+const API_REASON_MAX = 160;
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`api ${path} -> ${res.status}`, body);
+    throw new Error(_apiErrorReason(res, body));
+  }
   return res.json();
+}
+
+function _apiErrorReason(res, body) {
+  let reason = "";
+  try {
+    reason = _jsonErrorReason(JSON.parse(body));
+  } catch (_) {
+    // Not JSON. A plain-text body is usable as the reason; markup never is.
+    if (!body.includes("<")) reason = body;
+  }
+  reason = reason.replace(/\s+/g, " ").trim() || String(res.statusText || "").trim();
+  if (reason.length > API_REASON_MAX) {
+    reason = reason.slice(0, API_REASON_MAX - 1).trimEnd() + "\u2026";
+  }
+  return reason ? `${res.status} ${reason}` : String(res.status);
+}
+
+// `detail` is FastAPI's HTTPException key; `error` is this app's own
+// JSONResponse paths, including the nested `{error: {message}}` the /v1 routes
+// borrow from OpenAI. A 422 sends `detail` as one object per rejected field.
+function _jsonErrorReason(parsed) {
+  if (typeof parsed === "string") return parsed;
+  if (!parsed || typeof parsed !== "object") return "";
+  const found = parsed.detail ?? parsed.error ?? parsed.message ?? parsed.msg;
+  if (typeof found === "string") return found;
+  if (Array.isArray(found)) return found.map(_jsonErrorReason).filter(Boolean).join("; ");
+  if (found && typeof found === "object") return _jsonErrorReason(found);
+  return "";
 }
 
 async function post(path, body) {
