@@ -21,7 +21,7 @@ Additional endpoints:
   GET       /api/merllm/metrics/current  — latest system snapshot
   GET       /api/merllm/metrics/history  — time-series data
   GET       /api/merllm/diagnostics      — connectivity + container health
-  GET       /api/merllm/logs/{service}   — recent log lines
+  GET       /api/merllm/logs/{service}   — recent container or host-unit log lines
   WS        /ws/ssh               — browser SSH terminal (xterm.js)
   WS        /ws/vnc               — browser VNC viewer (noVNC)
 """
@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -43,6 +44,10 @@ logging.basicConfig(
 )
 # Suppress noisy httpx request-level logging (merLLM logs its own proxy calls)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# Same for asyncssh, which logs three INFO lines per connection: the journal
+# reader opens one on every Logs fetch of a host unit, and merllm-api's own log
+# is one of the things that tab shows.
+logging.getLogger("asyncssh").setLevel(logging.WARNING)
 
 _req_log = logging.getLogger("merllm.requests")
 log = logging.getLogger("merllm")
@@ -1574,34 +1579,103 @@ def _docker_status() -> list[dict]:
         return []
 
 
-# Services backed by Docker containers — names read from config (env-var overridable)
-_LOG_DOCKER = {
-    "lancellmot-api":   config.LOG_CONTAINER_LANCELLMOT_API,
-    "lancellmot-nginx": config.LOG_CONTAINER_LANCELLMOT_NGINX,
-    "parsival-api":     config.LOG_CONTAINER_PARSIVAL_API,
-    "parsival-nginx":   config.LOG_CONTAINER_PARSIVAL_NGINX,
-    "merllm-api":       config.LOG_CONTAINER_MERLLM_API,
+# Every service the Logs tab offers, as (reader, target). Names read from config
+# (env-var overridable); the two readers are what makes the set offerable.
+#
+# "docker" reads a container through the socket mounted read-only at
+# /var/run/docker.sock. "journal" reads a systemd unit on the host, because the
+# GPU-pinned ollama services are units and not containers — docker-compose.yml
+# calls them "GPU-pinned systemd services on host", so there is no container of
+# either name for the Docker reader to find.
+_LOG_SOURCES = {
+    "ollama-gpu0":      ("journal", config.LOG_UNIT_OLLAMA_0),
+    "ollama-gpu1":      ("journal", config.LOG_UNIT_OLLAMA_1),
+    "lancellmot-api":   ("docker",  config.LOG_CONTAINER_LANCELLMOT_API),
+    "lancellmot-nginx": ("docker",  config.LOG_CONTAINER_LANCELLMOT_NGINX),
+    "parsival-api":     ("docker",  config.LOG_CONTAINER_PARSIVAL_API),
+    "parsival-nginx":   ("docker",  config.LOG_CONTAINER_PARSIVAL_NGINX),
+    "merllm-api":       ("docker",  config.LOG_CONTAINER_MERLLM_API),
+    "merllm-nginx":     ("docker",  config.LOG_CONTAINER_MERLLM_NGINX),
 }
 
-_ALL_LOG_SERVICES = set(_LOG_DOCKER)
+_ALL_LOG_SERVICES = set(_LOG_SOURCES)
+
+# Matches the Logs tab's <input id="log-lines" min="10" max="500">. The journal
+# reader puts this count on a remote command line, so it is bounded here rather
+# than taken from the query string as given.
+_LOG_LINES_MAX = 500
+
+
+def _read_container_logs(container: str, lines: int) -> str:
+    """Tail a Docker container's logs through the mounted socket."""
+    import docker
+    client = docker.from_env()
+    handle = client.containers.get(container)
+    return handle.logs(tail=lines, timestamps=False).decode("utf-8", errors="replace")
+
+
+async def _read_unit_journal(unit: str, lines: int) -> str:
+    """Tail a host systemd unit's journal over the SSH path /ws/ssh already uses.
+
+    The host journal is not readable from inside this container: there is no
+    /var/log/journal mount and no systemd in the image to parse it with. What
+    does exist, configured for the terminal tab, is a key-authenticated account
+    on the host (SSH_USER + SSH_KEY_PATH) — and journalctl needs no sudo for an
+    account in the adm or systemd-journal group. So the units are read with the
+    credentials already present rather than behind a new mount.
+    """
+    if not config.SSH_USER:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reading the {unit} journal needs the host SSH account, "
+                   f"and SSH_USER is not configured.")
+
+    import asyncssh
+
+    command = (f"journalctl -u {shlex.quote(unit)} -n {int(lines)} "
+               f"--no-pager --output=short-iso")
+    async with asyncssh.connect(
+        config.SSH_HOST,
+        port=config.SSH_PORT,
+        username=config.SSH_USER,
+        client_keys=[config.SSH_KEY_PATH] if os.path.exists(config.SSH_KEY_PATH) else None,
+        known_hosts=None,
+        connect_timeout=5,
+    ) as conn:
+        result = await conn.run(command, check=False, timeout=20)
+
+    if result.exit_status != 0:
+        # First stderr line only: journalctl's own message, not a page of output.
+        reason = (result.stderr or "").strip().splitlines()
+        raise HTTPException(
+            status_code=502,
+            detail=reason[0] if reason else f"journalctl -u {unit} exited {result.exit_status}")
+
+    return result.stdout or ""
 
 
 @app.get("/api/merllm/logs/{service}")
 async def service_logs(service: str, lines: int = 100):
-    """Tail recent log lines from Docker containers."""
+    """Tail recent log lines from a Docker container or a host systemd unit."""
     if service not in _ALL_LOG_SERVICES:
         raise HTTPException(status_code=422,
                             detail=f"Unknown service. Valid: {sorted(_ALL_LOG_SERVICES)}")
 
-    container_name = _LOG_DOCKER[service]
+    reader, target = _LOG_SOURCES[service]
+    lines = max(1, min(lines, _LOG_LINES_MAX))
     try:
-        import docker
-        client = docker.from_env()
-        container = client.containers.get(container_name)
-        raw = container.logs(tail=lines, timestamps=False).decode("utf-8", errors="replace")
-        return {"service": service, "container": container_name, "lines": raw.splitlines()}
+        if reader == "journal":
+            raw = await _read_unit_journal(target, lines)
+        else:
+            raw = _read_container_logs(target, lines)
+    except HTTPException:
+        # Already carries the status and reason the pane should state.
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"service": service, "reader": reader, "source": target,
+            "lines": raw.splitlines()}
 
 
 

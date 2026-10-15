@@ -167,7 +167,7 @@ SCRIVENER_PUBLIC_URL  = _get("SCRIVENER_PUBLIC_URL",  "https://scrivener.hexcali
 CODEX_PUBLIC_URL      = _get("CODEX_PUBLIC_URL",      "https://codex.hexcaliper.com")
 WARDEN_PUBLIC_URL     = _get("WARDEN_PUBLIC_URL",     "https://warden.hexcaliper.com")
 
-# ── Log container name mapping ────────────────────────────────────────────────
+# ── Log source name mapping ───────────────────────────────────────────────────
 # Maps logical service names to Docker container names for the /api/merllm/logs
 # endpoint. Override if your compose project name or container names differ.
 LOG_CONTAINER_LANCELLMOT_API   = _get("LOG_CONTAINER_LANCELLMOT_API",   "hexcaliper-lancellmot-lancellmot-api-1")
@@ -175,6 +175,13 @@ LOG_CONTAINER_LANCELLMOT_NGINX = _get("LOG_CONTAINER_LANCELLMOT_NGINX", "hexcali
 LOG_CONTAINER_PARSIVAL_API     = _get("LOG_CONTAINER_PARSIVAL_API",     "hexcaliper-parsival-parsival-api-1")
 LOG_CONTAINER_PARSIVAL_NGINX   = _get("LOG_CONTAINER_PARSIVAL_NGINX",   "hexcaliper-parsival-parsival-nginx-1")
 LOG_CONTAINER_MERLLM_API       = _get("LOG_CONTAINER_MERLLM_API",       "merllm-api")
+LOG_CONTAINER_MERLLM_NGINX     = _get("LOG_CONTAINER_MERLLM_NGINX",     "merllm-nginx")
+
+# The GPU-pinned ollama services are systemd units on the host rather than
+# containers, so they are named here as units and read over SSH instead of
+# through the Docker socket. Override if the units are named differently.
+LOG_UNIT_OLLAMA_0 = _get("LOG_UNIT_OLLAMA_0", "ollama-gpu0")
+LOG_UNIT_OLLAMA_1 = _get("LOG_UNIT_OLLAMA_1", "ollama-gpu1")
 
 
 def apply_overrides(d: dict) -> None:
