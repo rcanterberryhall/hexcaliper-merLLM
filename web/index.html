@@ -236,11 +236,14 @@
       <h2>Service Logs</h2>
       <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
         <select id="log-service">
+          <option value="ollama-gpu0">ollama-gpu0</option>
+          <option value="ollama-gpu1">ollama-gpu1</option>
           <option value="lancellmot-api">lancellmot-api</option>
           <option value="lancellmot-nginx">lancellmot-nginx</option>
           <option value="parsival-api">parsival-api</option>
           <option value="parsival-nginx">parsival-nginx</option>
           <option value="merllm-api">merllm-api</option>
+          <option value="merllm-nginx">merllm-nginx</option>
         </select>
         <input id="log-lines" type="number" value="100" min="10" max="500" style="width:80px;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" />
         <button class="btn primary" onclick="fetchLogs()">Fetch</button>
@@ -622,7 +625,7 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           <tr><td><code>GET  /api/merllm/metrics/current</code></td><td class="muted">Latest system snapshot</td></tr>
           <tr><td><code>GET  /api/merllm/metrics/history</code></td><td class="muted">Time-series data for charts</td></tr>
           <tr><td><code>GET  /api/merllm/diagnostics</code></td><td class="muted">Connectivity + container health</td></tr>
-          <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines (configurable containers)</td></tr>
+          <tr><td><code>GET  /api/merllm/logs/{service}</code></td><td class="muted">Recent log lines (containers and host ollama units)</td></tr>
           <tr><td><code>GET  /api/merllm/myday</code></td><td class="muted">My Day cross-app attention summary</td></tr>
           <tr><td><code>POST /api/merllm/backup</code></td><td class="muted">Trigger SQLite online backup</td></tr>
           <tr><td><code>GET  /health</code></td><td class="muted">Docker health check / liveness</td></tr>

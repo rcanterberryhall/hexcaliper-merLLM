@@ -1059,7 +1059,8 @@ async function fetchLogs() {
   try {
     const r = await api(`/api/merllm/logs/${service}?lines=${lines}`);
     if (seq !== _logsSeq) return;
-    el.textContent = `── ${r.service} (${r.container}) — ${r.lines.length} lines ──\n`
+    const where = r.reader === "journal" ? `systemd unit ${r.source}` : `container ${r.source}`;
+    el.textContent = `── ${r.service} (${where}) — ${r.lines.length} lines ──\n`
       + (r.lines.join("\n") || "(no output)");
     el.scrollTop = el.scrollHeight;
   } catch (err) {

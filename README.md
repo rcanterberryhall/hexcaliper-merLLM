@@ -53,7 +53,7 @@ All settings are environment variables in `docker-compose.yml`. They can also be
 | `FAN_CONTROLLER_URL` | `http://host.docker.internal:8080` | URL of the iDRAC fan controller REST API |
 | `PARSIVAL_URL` | `http://host.docker.internal:8082` | Parsival nginx URL (for My Day panel) |
 | `LANCELLMOT_URL` | `http://host.docker.internal:8080` | LanceLLMot nginx URL (for My Day panel) |
-| `LOG_CONTAINER_*` | *(see below)* | Docker container name mapping for the logs endpoint |
+| `LOG_CONTAINER_*` / `LOG_UNIT_*` | *(see below)* | Container and host-unit name mapping for the logs endpoint |
 | `SSH_USER` | *(empty)* | Username for SSH terminal (leave blank to disable) |
 | `SSH_KEY_PATH` | `/data/ssh_key` | Path to SSH private key (inside container) |
 | `VNC_HOST` | `host.docker.internal` | VNC server host |
@@ -197,19 +197,24 @@ The overview dashboard subscribes to `GET /api/merllm/activity/stream` (Server-S
 
 LanceLLMot and Parsival dashboards consume this stream to show live token output without polling.
 
-## Log container name mapping
+## Log source name mapping
 
-The `/api/merllm/logs/{service}` endpoint maps logical service names to Docker container names. Override these if your compose project names or container names differ:
+The `/api/merllm/logs/{service}` endpoint maps each logical service name to a reader and a target. Override these if your compose project names, container names or unit names differ:
 
-| Variable | Default |
-|---|---|
-| `LOG_CONTAINER_LANCELLMOT_API` | `hexcaliper-lancellmot-lancellmot-api-1` |
-| `LOG_CONTAINER_LANCELLMOT_NGINX` | `hexcaliper-lancellmot-lancellmot-nginx-1` |
-| `LOG_CONTAINER_PARSIVAL_API` | `hexcaliper-parsival-parsival-api-1` |
-| `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-parsival-parsival-nginx-1` |
-| `LOG_CONTAINER_MERLLM_API` | `merllm-api` |
+| Variable | Default | Reader |
+|---|---|---|
+| `LOG_CONTAINER_LANCELLMOT_API` | `hexcaliper-lancellmot-lancellmot-api-1` | Docker |
+| `LOG_CONTAINER_LANCELLMOT_NGINX` | `hexcaliper-lancellmot-lancellmot-nginx-1` | Docker |
+| `LOG_CONTAINER_PARSIVAL_API` | `hexcaliper-parsival-parsival-api-1` | Docker |
+| `LOG_CONTAINER_PARSIVAL_NGINX` | `hexcaliper-parsival-parsival-nginx-1` | Docker |
+| `LOG_CONTAINER_MERLLM_API` | `merllm-api` | Docker |
+| `LOG_CONTAINER_MERLLM_NGINX` | `merllm-nginx` | Docker |
+| `LOG_UNIT_OLLAMA_0` | `ollama-gpu0` | journal |
+| `LOG_UNIT_OLLAMA_1` | `ollama-gpu1` | journal |
 
-The Logs tab's service dropdown offers exactly these five names, and `tests/test_logs_service_vocabulary.py` asserts the two sets stay equal. The GPU-pinned `ollama-gpu0` and `ollama-gpu1` are systemd units on the host, so this endpoint has no way to read them; their logs come from `journalctl -u ollama-gpu0` on the host.
+The Logs tab's service dropdown offers exactly these eight names, and `tests/test_logs_service_vocabulary.py` asserts the dropdown's set and the endpoint's set stay equal.
+
+The Docker reader goes through the socket mounted read-only at `/var/run/docker.sock`. The journal reader exists because the GPU-pinned ollama services are systemd units on the host rather than containers, so the Docker reader can never see them: it runs `journalctl -u <unit> --no-pager` on the host over the same SSH account the terminal tab uses (`SSH_HOST`, `SSH_USER`, `SSH_KEY_PATH`), which needs no `sudo` for an account in the host's `adm` or `systemd-journal` group. A deployment that leaves `SSH_USER` empty gets a 503 naming the unit and the missing setting; the six Docker-backed services are unaffected.
 
 ## My Day panel
 
@@ -238,7 +243,7 @@ Interval: 30s, timeout: 5s, retries: 3.
 | Overview | My Day panel, GPU state, observable scheduler status, Ollama health, per-GPU live activity (model, token stream, chunk count via SSE), priority-bucket lanes, active requests, batch-job submission + history |
 | Batch Jobs | Submit jobs, view queue, cancel/requeue; failed jobs show retry count |
 | Metrics | Time-series charts (Chart.js) for CPU, RAM, disk, GPU utilization, GPU VRAM, GPU temperature, network throughput; range selector: 1h / 6h / 24h / 7d |
-| Logs | Live log tail from any Docker container (configurable via `LOG_CONTAINER_*` env vars) |
+| Logs | Live log tail from the ecosystem's containers and the two host ollama units (configurable via `LOG_CONTAINER_*` / `LOG_UNIT_*` env vars) |
 | SSH | Browser SSH terminal (xterm.js) |
 | VNC | Browser VNC viewer (noVNC) |
 | Settings | Live configuration editor (includes notification webhook, companion URLs) |
