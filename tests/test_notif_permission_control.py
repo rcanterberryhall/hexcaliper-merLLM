@@ -136,6 +136,9 @@ def test_the_painters_dependencies_are_hoisted():
     before initialization", three times per load.
     """
     src = APP_JS.read_text()
+    assert "_renderNotifPermission()" in src, (
+        "web/app.js never calls _renderNotifPermission(), so nothing paints the "
+        "button — see the call-site test above")
     first_call = src.index("_renderNotifPermission()")
     for name in ("_notifPermissionUi", "_notifPermissionState", "_renderNotifPermission"):
         decl = re.search(r"^(?:const|let|var|function)\s+%s\b" % name, src, re.M)
