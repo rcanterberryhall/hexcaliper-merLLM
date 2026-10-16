@@ -121,7 +121,8 @@ Prompts exceeding `BATCH_MAX_PROMPT_LEN` characters are rejected with HTTP 422.
 
 **Completion notifications** — when a batch job completes (success or final failure), merLLM can notify you via:
 - **Webhook** — set `NOTIFICATION_WEBHOOK_URL` to a Slack incoming webhook, ntfy.sh topic, Gotify URL, or any endpoint accepting JSON POST. Payload includes `job_id`, `source_app`, `status`, timestamps, and a prompt preview.
-- **SSE** — the dashboard's activity stream receives a completion event in real time.
+- **SSE** — the dashboard's activity stream receives a completion event in real time, which raises an in-page toast.
+- **Desktop notification** — the dashboard also raises a browser notification for that same event, once the permission is granted with **Enable browser notifications** on the Settings tab. Browsers grant that permission only to a secure context, so the button reports that it cannot be used when the dashboard is opened over plain `http://` from another machine; reach it over `localhost` or behind an https proxy to grant it.
 
 ```bash
 curl -X POST http://localhost:11400/api/batch/submit \

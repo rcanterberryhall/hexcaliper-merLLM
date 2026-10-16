@@ -381,7 +381,7 @@
       <div class="settings-actions">
         <button class="btn primary" onclick="saveSettings()">Save</button>
         <button class="btn" onclick="loadSettings()">Reset</button>
-        <button class="btn" id="notif-perm-btn" onclick="requestNotifPermission()" style="display:none">Enable browser notifications</button>
+        <button class="btn" id="notif-perm-btn" onclick="requestNotifPermission()">Enable browser notifications</button>
         <span id="settings-msg" class="muted" style="font-size:12px;align-self:center"></span>
       </div>
     </div>
@@ -485,7 +485,13 @@
           <strong style="color:var(--text)">Notifications</strong> — when a batch job completes, merLLM
           sends a webhook POST to <code>NOTIFICATION_WEBHOOK_URL</code> (if configured) with job ID,
           source app, status, timestamps, and prompt preview. Works with Slack webhooks, ntfy.sh, Gotify,
-          or any JSON POST endpoint. The dashboard SSE stream also receives completion events in real time.<br><br>
+          or any JSON POST endpoint. The dashboard SSE stream also receives completion events in real time,
+          and raises an in-page toast plus a desktop notification once the browser has granted permission.
+          Grant it with <strong style="color:var(--text)">Enable browser notifications</strong> on the
+          Settings tab. Browsers only offer that permission to a secure context, so the button explains
+          itself rather than offering a click when the dashboard is opened over plain
+          <code>http://</code> from another machine &mdash; reach it over
+          <code>localhost</code> or an https proxy to grant it.<br><br>
           Submit a job from the <strong style="color:var(--text)">Batch Jobs</strong> tab or via the API:
         </p>
         <pre style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;margin-top:8px;overflow-x:auto">POST /api/batch/submit

@@ -16,6 +16,7 @@ function activateTab(name, rest) {
   document.getElementById("tab-" + name).classList.add("active");
   if (name === "metrics") loadMetricsCharts().catch(() => {});
   if (name === "plans")   initPlans(rest);
+  if (name === "settings") _renderNotifPermission();
 }
 
 document.querySelectorAll("nav button").forEach(btn => {
@@ -81,6 +82,7 @@ function startPolling() {
   refreshActivity();
   _startActivityStream();
   _startNotifStream();
+  _renderNotifPermission();
   // My Day panel: load once on startup, refresh every 60s
   refreshMyDay();
   setInterval(refreshMyDay, 60000);
@@ -123,21 +125,63 @@ function _showJobToast(title, body, success) {
   setTimeout(() => { toast.classList.remove("toast-visible"); setTimeout(() => toast.remove(), 400); }, 6000);
 }
 
+// Which notification state this browser is in, on this origin. "granted" is
+// tested first because a dashboard reached over localhost or an https proxy can
+// hold the permission whatever the tests below would say. An insecure context
+// is then reported ahead of "denied" because browsers pre-set `permission` to
+// "denied" off a secure context and will not prompt at all, which is a
+// different problem from an operator who clicked Block.
+function _notifPermissionState() {
+  if (!("Notification" in window)) return "unsupported";
+  if (Notification.permission === "granted") return "granted";
+  if (!window.isSecureContext) return "insecure";
+  if (Notification.permission === "denied") return "denied";
+  return "default";
+}
+
+// "default" is the only state a click can change, so it is the only one that
+// offers one. The other four say why they do not.
+//
+// A hoisted function rather than a `const`: the hash is the source of truth for
+// the current tab, so opening or reloading the dashboard on #settings paints
+// this button from `activateTab` during top-level execution, well above this
+// line. A `const` is in its temporal dead zone there, and the ReferenceError
+// would abort the rest of app.js — taking startPolling() with it.
+function _notifPermissionUi() {
+  return {
+    unsupported: { label: "Desktop notifications unsupported",
+                   title: "This browser does not implement the Notification API." },
+    granted:     { label: "Browser notifications enabled",
+                   title: "A finished batch job raises a desktop notification." },
+    insecure:    { label: "Notifications need https or localhost",
+                   title: "Browsers grant notification permission only to a secure context, and this page was opened over plain http." },
+    denied:      { label: "Notifications blocked for this site",
+                   title: "Permission was refused. Allow notifications for this site in the browser's own settings." },
+    default:     { label: "Enable browser notifications", offer: true,
+                   title: "Ask the browser to raise a desktop notification when a batch job finishes." },
+  };
+}
+
+// Paint the Settings button from the permission as it stands: on load, when the
+// Settings tab is opened, and after a request resolves. This is the only place
+// the button's id is read.
+function _renderNotifPermission() {
+  const btn = document.getElementById("notif-perm-btn");
+  if (!btn) return;
+  const ui = _notifPermissionUi()[_notifPermissionState()];
+  btn.textContent = ui.label;
+  btn.title = ui.title;
+  btn.disabled = !ui.offer;
+}
+
 async function requestNotifPermission() {
-  if (!("Notification" in window)) {
-    alert("This browser does not support desktop notifications.");
-    return;
+  try {
+    await Notification.requestPermission();
+  } catch (_) {
+    // A browser that refuses to prompt, or implements only the callback form,
+    // leaves the permission where it was; the repaint states whatever that is.
   }
-  const result = await Notification.requestPermission();
-  const btn = document.getElementById("notif-permission-btn");
-  if (btn) {
-    if (result === "granted") {
-      btn.textContent = "Browser notifications enabled";
-      btn.disabled = true;
-    } else {
-      btn.textContent = "Permission denied — try browser settings";
-    }
-  }
+  _renderNotifPermission();
 }
 
 function _startActivityStream() {
