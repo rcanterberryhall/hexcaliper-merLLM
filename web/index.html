@@ -592,9 +592,11 @@ POST /api/batch/&lt;id&gt;/requeue</pre>
           The VNC tab proxies a WebSocket connection to the configured VNC server. To use it:<br><br>
           1. Start a VNC server on the host (e.g. TigerVNC or x11vnc).<br>
           2. Set <code>VNC_HOST</code> and <code>VNC_PORT</code> in settings if different from defaults
-             (<code>host.docker.internal:5900</code>).<br>
-          3. noVNC's <code>rfb.js</code> must be available — either served from the host or loaded via CDN.
-             Without it the viewer shows a placeholder message.<br><br>
+             (<code>host.docker.internal:5900</code>).<br><br>
+          noVNC is bundled into the nginx image at build time &mdash; release v1.5.0, both the
+          <code>core/</code> modules and the <code>vendor/pako</code> ones its decoders import &mdash; so
+          there is nothing to install for the viewer. If any of them are missing the tab reports a
+          load error rather than connecting.<br><br>
           merLLM acts only as a WebSocket-to-TCP proxy; it does not start or manage the VNC server.
         </p>
       </div>
